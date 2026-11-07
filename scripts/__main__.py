@@ -209,6 +209,14 @@ def cmd_test(args) -> None:
     dev(args.root).pytest(*test_files())
 
 
+def cmd_memory(args) -> None:
+    # draco's bombs in a container with a memory limit, where the kernel kills
+    # what touches too much. `in_image` sets the limit, which the build just
+    # before this in `check` doesn't have to fit in: this reuses it
+    build = dev(args.root)
+    run(build.python, ROOT / "tests" / "draco_memory_limit.py", cwd=ROOT / "tests")
+
+
 def cmd_asan(args) -> None:
     build = Build(args.root, "asan").install(PYTHON, sanitize="address,undefined")
     # wall-clock bounds measure the sanitizer, not the code
@@ -630,7 +638,7 @@ def cmd_generate(args) -> None:
 # the gate, which should take minutes after a small change: the distribution
 # packages (`distro --run`, two more builds and suites) are checked when the
 # packaging changes, and the sdist's own build (`sdist`) in release CI
-STAGES = ["test", "static", "asan", "tsan", "fuzz", "atheris"]
+STAGES = ["test", "memory", "static", "asan", "tsan", "fuzz", "atheris"]
 
 
 def cmd_check(args) -> None:
@@ -697,6 +705,8 @@ def in_image(args) -> None:
     # docker's default seccomp profile refuses: only those runs drop seccomp,
     # still unprivileged, as the caller's uid, with no added capabilities
     seccomp = ["--security-opt", "seccomp=unconfined"] if args.command in SANITIZED else []
+    # no swap to page out to, as the limit is what `memory` is testing
+    limit = ["--memory", "2g", "--memory-swap", "2g"] if args.command == "memory" else []
     docker = [
         tool("docker"),
         "run",
@@ -704,6 +714,7 @@ def in_image(args) -> None:
         "--init",
         *docker_cores(),
         *seccomp,
+        *limit,
         # Docker's default open-file limit is about 2**31, and sanitizers
         # close every descriptor up to it before starting llvm-symbolizer:
         # each symbolized line, every NEW_FUNC libFuzzer prints included,

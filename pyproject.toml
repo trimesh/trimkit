@@ -86,7 +86,7 @@ config-settings = { strict = "true", pgo = "use" }
 before-test = "python -m pip install --require-hashes --no-deps -r {project}/requirements.txt"
 # wall-clock bounds are the local gate's: a busy runner mustn't block a release on one
 # (double quotes: cmd.exe, on Windows, doesn't know single ones)
-test-command = 'pytest {project}/tests -x -q -m "not timing"'
+test-command = 'pytest {project}/tests -q -m "not timing"'
 # metadata, then check_wheel.py: abi3audit, licenses, naming and sizes, with
 # both tools installed by hash rather than cibuildwheel's own abi3audit
 audit-requires = ["--require-hashes", "--no-deps", "-r", "audit.txt"]

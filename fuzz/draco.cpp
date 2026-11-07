@@ -2,24 +2,31 @@
 // points and whose attributes can be read for every point, the same reads
 // `draco_decode` makes. Draco asking for absurd amounts of memory is a
 // decompression bomb, not a bug (a valid buffer of a few bytes can decode to
-// millions of faces, and draco_decode has no size limit, as its docstring
-// says), so `uv run scripts fuzz` runs this with out-of-memory reports ignored.
+// millions of faces): it refuses what doesn't fit, by throwing, and
+// `uv run scripts fuzz` ignores out-of-memory reports for what does.
 #include <draco/compression/decode.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <vector>
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     draco::DecoderBuffer buffer;
     buffer.Init(reinterpret_cast<const char*>(data), size);
     draco::Decoder decoder;
-    auto decoded = decoder.DecodeMeshFromBuffer(&buffer);
-    if (!decoded.ok()) {
+    std::unique_ptr<draco::Mesh> mesh;
+    try {
+        auto decoded = decoder.DecodeMeshFromBuffer(&buffer);
+        if (!decoded.ok()) {
+            return 0;
+        }
+        mesh = std::move(decoded).value();
+    } catch (const std::bad_alloc&) {
         return 0;
     }
-    const auto mesh = std::move(decoded).value();
     const std::uint32_t points = mesh->num_points();
     for (std::uint32_t f = 0; f < mesh->num_faces(); f++) {
         for (const auto& p : mesh->face(draco::FaceIndex(f))) {

@@ -1,0 +1,77 @@
+kind: fix
+upstream: not yet reported to draco.
+
+A buffer of a few KB declares counts that draco sizes allocations from, and on
+Linux those succeed whether or not the memory is there, so std::vector's
+zero-fill ends in the kernel's SIGKILL rather than std::bad_alloc: nothing to
+catch, and a whole process lost to 3.6 KB of input. Now draco compares what it
+is about to allocate with what's available, once the sizes are known and before
+any of it is allocated, and throws std::bad_alloc, which is Python's MemoryError.
+This isn't a size limit: anything that fits decodes. See
+src/config/draco/available_memory.h.
+
+The two places everything else follows from: DecodePointAttributes, where every
+attribute's size is known, and edgebreaker's DecodeConnectivity, which sizes its
+tables by num_faces. Sequential faces need no check, as draco already refuses
+more faces than the remaining bytes hold.
+
+Measured 2026-11-07, sequential, one float32 attribute, in a 2 GiB container
+(docker run --memory 2g --memory-swap 2g), before this patch:
+  100,000,000 points in 3,637 bytes:   1559 MiB touched, then ValueError
+  1,000,000,000 points in 3,638 bytes: SIGKILL, exit 137, after 1 second
+
+Covered by: tests/test_draco.py, and tests/draco_memory_limit.py, which
+`uv run scripts memory` runs in such a container.
+
+--- a/src/draco/compression/point_cloud/point_cloud_decoder.cc
++++ b/src/draco/compression/point_cloud/point_cloud_decoder.cc
+@@ -14,6 +14,7 @@
+ //
+ #include "draco/compression/point_cloud/point_cloud_decoder.h"
+ 
++#include "draco/available_memory.h"
+ #include "draco/metadata/metadata_decoder.h"
+ 
+ namespace draco {
+@@ -165,6 +166,16 @@
+     }
+   }
+ 
++  // trimkit (vendor/patches/draco-decode-memory-check.patch): every attribute's
++  // size is known and none is allocated yet. Twice each: the values and the
++  // portable copy or caller's copy of them.
++  const uint64_t num_points = point_cloud_->num_points();
++  uint64_t attribute_bytes = num_points * sizeof(PointIndex);
++  for (int32_t i = 0; i < point_cloud_->num_attributes(); ++i) {
++    attribute_bytes += 2 * num_points * point_cloud_->attribute(i)->byte_stride();
++  }
++  RefuseOverAvailableMemory(attribute_bytes);
++
+   // Decode the actual attributes using the created attribute decoders.
+   if (!DecodeAllAttributes()) {
+     return false;
+--- a/src/draco/compression/mesh/mesh_edgebreaker_decoder_impl.cc
++++ b/src/draco/compression/mesh/mesh_edgebreaker_decoder_impl.cc
+@@ -18,6 +18,7 @@
+ #include <cstdint>
+ 
+ #include "draco/compression/attributes/sequential_attribute_decoders_controller.h"
++#include "draco/available_memory.h"
+ #include "draco/compression/mesh/mesh_edgebreaker_decoder.h"
+ #include "draco/compression/mesh/mesh_edgebreaker_traversal_predictive_decoder.h"
+ #include "draco/compression/mesh/mesh_edgebreaker_traversal_valence_decoder.h"
+@@ -376,6 +377,14 @@
+   if (corner_table_ == nullptr) {
+     return false;
+   }
++  // trimkit (vendor/patches/draco-decode-memory-check.patch): a corner table per
++  // face and vertex, for the mesh and for each attribute's own connectivity.
++  RefuseOverAvailableMemory(
++      (44 * static_cast<uint64_t>(num_faces) +
++       4 * (static_cast<uint64_t>(num_encoded_vertices_) +
++            num_encoded_split_symbols)) *
++      (1 + static_cast<uint64_t>(num_attribute_data)));
++
+   processed_corner_ids_.clear();
+   processed_corner_ids_.reserve(num_faces);
+   processed_connectivity_corners_.clear();

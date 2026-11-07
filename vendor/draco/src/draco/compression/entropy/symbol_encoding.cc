@@ -28,7 +28,8 @@ constexpr int32_t kMaxTagSymbolBitLength = 32;
 constexpr int kMaxRawEncodingBitLength = 18;
 constexpr int kDefaultSymbolCodingCompressionLevel = 7;
 
-typedef uint64_t TaggedBitLengthFrequencies[kMaxTagSymbolBitLength];
+// One per bit length, up to and including kMaxTagSymbolBitLength.
+typedef uint64_t TaggedBitLengthFrequencies[kMaxTagSymbolBitLength + 1];
 
 void SetSymbolEncodingMethod(Options* options, SymbolCodingMethod method) {
   options->SetInt("symbol_encoding_method", method);
@@ -134,16 +135,20 @@ bool EncodeSymbols(const uint32_t* symbols, int num_values, int num_components,
   const int64_t tagged_scheme_total_bits =
       ApproximateTaggedSchemeBits(bit_lengths, num_components);
 
-  // Approximate number of bits needed for storing the symbols using the raw
-  // scheme.
-  int num_unique_symbols = 0;
-  const int64_t raw_scheme_total_bits = ApproximateRawSchemeBits(
-      symbols, num_values, max_value, &num_unique_symbols);
-
   // The maximum bit length of a single entry value that we can encode using
   // the raw scheme.
   const int max_value_bit_length =
       MostSignificantBit(std::max(1u, max_value)) + 1;
+
+  // Approximate number of bits needed for storing the symbols using the raw
+  // scheme, which counts every value up to max_value: only for values the raw
+  // scheme can encode, as anything longer is tagged whatever the estimate.
+  int num_unique_symbols = 0;
+  int64_t raw_scheme_total_bits = 0;
+  if (max_value_bit_length <= kMaxRawEncodingBitLength) {
+    raw_scheme_total_bits = ApproximateRawSchemeBits(
+        symbols, num_values, max_value, &num_unique_symbols);
+  }
 
   int method = -1;
   if (options != nullptr && options->IsOptionSet("symbol_encoding_method")) {
@@ -201,7 +206,7 @@ bool EncodeTaggedSymbols(const uint32_t* symbols, int num_values,
 
   // Create encoder for encoding the bit tags.
   SymbolEncoderT<5> tag_encoder;
-  tag_encoder.Create(frequencies, kMaxTagSymbolBitLength, target_buffer);
+  tag_encoder.Create(frequencies, kMaxTagSymbolBitLength + 1, target_buffer);
 
   // Start encoding bit tags.
   tag_encoder.StartEncoding(target_buffer);

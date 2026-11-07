@@ -131,13 +131,17 @@ include = ["vendor/dragonbox/include/dragonbox"]
 repo = "google/draco"
 ref = "main"
 commit = "d429de84b52a860705507da0884764c5d8321423"
-tree_sha256 = "2a123677b3cfe5d780371f81e3f3e43e452ca93642f44ca6a813c5f83a29becd"
+tree_sha256 = "362692e25a4b395e58349688eb0bb4edd6571d7d9f1942748e4d70680e5161b4"
 spdx = "Apache-2.0"
 # its LICENSE is the bare Apache text: this is the notice its sources carry
 copyright = "Copyright 2016 The Draco Authors"
 keep = ["LICENSE"]
 sources = ["vendor/draco/src/draco/**/*.cc"]
 include = ["vendor/draco/src", "src/config"]
+
+[upstream.draco.patches]
+"draco-decode-memory-check.patch" = "4508b3d8fcba4a9f227fa2c4e4abbbb151254799a57754c8d7dfb6598ed6d449"
+"draco-symbol-encoding.patch" = "9692ab64c89e8611ae66f7190cad92d4f6cb0a5fb898c68cf906c2de74c6ebad"
 
 [upstream.tinybvh]
 repo = "jbikker/tinybvh"

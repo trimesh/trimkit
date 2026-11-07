@@ -5,10 +5,11 @@
 // unique id stored in the extension JSON. Only glTF accessor component types
 // are accepted.
 //
-// Like any decompressor, decoding has no size limit: draco sizes its
-// allocations from counts the buffer declares, and a valid buffer of a few
-// bytes can really decode to millions of faces (rANS codes a near-certain
-// symbol in almost no bits), so a hostile one can ask for gigabytes.
+// Decoding has no size limit: draco sizes its allocations from counts the
+// buffer declares, and a valid buffer of a few bytes can really decode to
+// millions of points (rANS codes a near-certain symbol in almost no bits). What
+// doesn't fit in the memory available is a MemoryError, before any of it is
+// allocated (config/draco/available_memory.h), not the kernel's SIGKILL.
 
 #include "common.hpp"
 
@@ -100,6 +101,22 @@ struct Attribute {
     std::size_t components = 1;
 };
 
+// a step here is float32's own precision at the top of an extent: draco takes
+// up to 30, which keeps nothing more and costs about what lossless does
+constexpr std::int64_t MOST_QUANTIZATION_BITS = 24;
+
+// draco wraps each integer attribute's values within their range, in int32:
+// for a range past this its encoder ignores that it failed, and writes a buffer
+// its own decoder refuses
+constexpr std::int64_t MOST_INTEGER_RANGE = std::numeric_limits<std::int32_t>::max() - 1;
+
+template <typename T>
+bool range_fits(const void* data, std::size_t size) {
+    const auto* values = static_cast<const T*>(data);
+    const auto [lowest, highest] = std::minmax_element(values, values + size);
+    return std::int64_t{*highest} - std::int64_t{*lowest} <= MOST_INTEGER_RANGE;
+}
+
 // draco reads and writes its little-endian format by copying raw bytes, with
 // no byte order of its own: on a big-endian machine every value would come
 // out swapped, so it refuses there before reading anything
@@ -120,8 +137,9 @@ nb::bytes draco_encode(const trimkit::Array<std::int64_t, -1, 3>& faces_argument
                        const trimkit::AnyArguments& attributes, const trimkit::Array<std::int64_t, -1>& kinds_argument,
                        const std::optional<trimkit::Number<std::int64_t>>& bits_argument) {
     refuse_big_endian();
-    if (bits_argument && (*bits_argument < 0 || *bits_argument > 30)) {
-        trimkit::value_error("quantization_bits must be from 0, lossless, to 30");
+    if (bits_argument && (*bits_argument < 0 || *bits_argument > MOST_QUANTIZATION_BITS)) {
+        trimkit::value_error("quantization_bits must be from 0, lossless, to " +
+                             std::to_string(MOST_QUANTIZATION_BITS));
     }
     const trimkit::In<std::int64_t, -1> kind_numbers = trimkit::read(kinds_argument, "kinds");
     // validate every attribute while we hold the GIL
@@ -180,6 +198,13 @@ nb::bytes draco_encode(const trimkit::Array<std::int64_t, -1, 3>& faces_argument
         draco::ExpertEncoder encoder(mesh);
         for (std::size_t i = 0; i < inputs.size() && status.ok(); i++) {
             const Attribute& a = inputs[i];
+            const std::size_t values = count * a.components;
+            if ((a.type == draco::DT_INT32 && !range_fits<std::int32_t>(a.array.data(), values)) ||
+                (a.type == draco::DT_UINT32 && !range_fits<std::uint32_t>(a.array.data(), values))) {
+                status = draco::Status(draco::Status::DRACO_ERROR,
+                                       "attributes[" + std::to_string(i) + "] has a range of integers over 2**31 - 2");
+                break;
+            }
             const auto stride = static_cast<std::int64_t>(a.components * a.array.itemsize());
             draco::GeometryAttribute g;
             g.Init(a.kind, nullptr, static_cast<std::uint8_t>(a.components), a.type,
@@ -309,14 +334,16 @@ faces : (f, 3) int64
 attributes : sequence of (n,) or (n, c) arrays
   One array per glTF attribute, each a glTF component type. Draco
   attribute i is attributes[i], which is what the extension's
-  `attributes` JSON maps each glTF name to.
+  `attributes` JSON maps each glTF name to. Integers must fit int32, with
+  `max - min` at most `2**31 - 2`.
 kinds : (k,) int64
   Each attribute's `DracoKind`: POSITION, NORMAL, TEXCOORD, COLOR or
   GENERIC for anything else.
 quantization_bits : int, optional
   What every float attribute is rounded onto, across its extent: a position
   moves at most `extent * 2**-(bits + 1)`, so this is how much precision
-  survives. 0 stores them losslessly, up to 30. By default each kind's own:
+  survives. 0 stores them losslessly, up to 24, where a step is float32's
+  own precision at the top of the extent. By default each kind's own:
   POSITION 14, NORMAL 10, TEXCOORD 12 and COLOR 10 bits, GENERIC lossless.
   Other attributes are never rounded.
 
@@ -356,9 +383,9 @@ attributes : tuple of (n,) or (n, c) arrays
 
 Notes
 -----
-Like any decompressor it has no size limit: a buffer of a few
-bytes can declare, or really hold, millions of faces. Decode only
-buffers whose decoded size you would accept.
+It has no size limit: a buffer of a few bytes can really hold
+millions of points. What it declares beyond the memory available
+raises MemoryError before any of it is allocated.
 
 Examples
 --------

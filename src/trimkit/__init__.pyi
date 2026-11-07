@@ -29,7 +29,7 @@ True
 
 Notes
 -----
-Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float dbeabee, jk-jeon/dragonbox beeeef9, google/draco d429de8, jbikker/tinybvh c9be310 +patches, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1, svgpath (ours).
+Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float dbeabee, jk-jeon/dragonbox beeeef9, google/draco d429de8 +patches, jbikker/tinybvh c9be310 +patches, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1, svgpath (ours).
 """
 
 from collections.abc import Sequence

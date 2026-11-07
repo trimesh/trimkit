@@ -14,6 +14,7 @@
 //
 #include "draco/compression/point_cloud/point_cloud_decoder.h"
 
+#include "draco/available_memory.h"
 #include "draco/metadata/metadata_decoder.h"
 
 namespace draco {
@@ -164,6 +165,16 @@ bool PointCloudDecoder::DecodePointAttributes() {
       attribute_to_decoder_map_[att_id] = i;
     }
   }
+
+  // trimkit (vendor/patches/draco-decode-memory-check.patch): every attribute's
+  // size is known and none is allocated yet. Twice each: the values and the
+  // portable copy or caller's copy of them.
+  const uint64_t num_points = point_cloud_->num_points();
+  uint64_t attribute_bytes = num_points * sizeof(PointIndex);
+  for (int32_t i = 0; i < point_cloud_->num_attributes(); ++i) {
+    attribute_bytes += 2 * num_points * point_cloud_->attribute(i)->byte_stride();
+  }
+  RefuseOverAvailableMemory(attribute_bytes);
 
   // Decode the actual attributes using the created attribute decoders.
   if (!DecodeAllAttributes()) {

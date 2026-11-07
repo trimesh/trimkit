@@ -72,14 +72,16 @@ def draco_encode(faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 3), or
     attributes : sequence of (n,) or (n, c) arrays
       One array per glTF attribute, each a glTF component type. Draco
       attribute i is attributes[i], which is what the extension's
-      `attributes` JSON maps each glTF name to.
+      `attributes` JSON maps each glTF name to. Integers must fit int32, with
+      `max - min` at most `2**31 - 2`.
     kinds : (k,) int64
       Each attribute's `DracoKind`: POSITION, NORMAL, TEXCOORD, COLOR or
       GENERIC for anything else.
     quantization_bits : int, optional
       What every float attribute is rounded onto, across its extent: a position
       moves at most `extent * 2**-(bits + 1)`, so this is how much precision
-      survives. 0 stores them losslessly, up to 30. By default each kind's own:
+      survives. 0 stores them losslessly, up to 24, where a step is float32's
+      own precision at the top of the extent. By default each kind's own:
       POSITION 14, NORMAL 10, TEXCOORD 12 and COLOR 10 bits, GENERIC lossless.
       Other attributes are never rounded.
 
@@ -122,9 +124,9 @@ def draco_decode(buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), ord
 
     Notes
     -----
-    Like any decompressor it has no size limit: a buffer of a few
-    bytes can declare, or really hold, millions of faces. Decode only
-    buffers whose decoded size you would accept.
+    It has no size limit: a buffer of a few bytes can really hold
+    millions of points. What it declares beyond the memory available
+    raises MemoryError before any of it is allocated.
 
     Examples
     --------

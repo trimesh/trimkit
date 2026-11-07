@@ -3,6 +3,7 @@ Small numpy-only fixtures and predicates shared by the tests.
 """
 
 import itertools
+import struct
 import sys
 import threading
 import time
@@ -22,6 +23,49 @@ def runs_here(name: str) -> None:
     """
     if name.startswith("exchange.draco_") and not LITTLE_ENDIAN:
         pytest.skip("draco refuses big-endian machines, as test_draco_refuses_only_big_endian asserts")
+
+
+def _varint(number: int) -> bytes:
+    out = bytearray()
+    while number > 0x7F:
+        out.append(number & 0x7F | 0x80)
+        number >>= 7
+    out.append(number)
+    return bytes(out)
+
+
+def draco_points_bomb(points: int) -> bytes:
+    """
+    A buffer of a few KB whose one triangle declares `points` points, each with
+    16 float32 components: draco's sizes come from this, not from what follows.
+    """
+    import trimkit
+
+    count = 300
+    faces = np.arange(count, dtype=np.int64).reshape((-1, 3))
+    kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
+    value = np.zeros((count, 16), np.float32)
+    valid = trimkit.exchange.draco_encode(faces, [value], kind, quantization_bits=0)
+    # after the header and its two counts: raw connectivity, as uint16 indices
+    start = 11 + len(_varint(count // 3)) + len(_varint(count))
+    assert valid[start] == 1
+    attributes = valid[start + 1 + count * 2 :]
+    return valid[:11] + _varint(1) + _varint(points) + b"\x01" + struct.pack("<3I", 0, 1, 2) + attributes
+
+
+def draco_faces_bomb() -> bytes:
+    """
+    An edgebreaker header alone, declaring all the faces and attributes it may.
+    """
+    faces = 1_400_000_000
+    return (
+        b"DRACO\x02\x02\x01\x01\x00\x00\x00"
+        + _varint(faces // 2)
+        + _varint(faces)
+        + b"\xff"
+        + _varint(faces)
+        + _varint(0)
+    )
 
 
 def sphere(rows: int = 20, cols: int = 40) -> tuple[np.ndarray, np.ndarray]:

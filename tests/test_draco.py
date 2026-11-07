@@ -1,6 +1,8 @@
+import time
+
 import numpy as np
 import pytest
-from helpers import LITTLE_ENDIAN, runs_here
+from helpers import LITTLE_ENDIAN, draco_faces_bomb, draco_points_bomb, runs_here
 
 import trimkit
 
@@ -139,7 +141,7 @@ def test_attribute_without_components_refused():
         )
 
 
-@pytest.mark.parametrize("bits", [0, 1, 8, 14, 22, 30])
+@pytest.mark.parametrize("bits", [0, 1, 8, 14, 22, 24])
 @pytest.mark.parametrize("name", ["POSITION", "TEXCOORD", "COLOR", "GENERIC"])
 def test_quantization_bits_bound_the_error(name, bits):
     # the one thing that decides how much precision survives: at any bits, no
@@ -167,7 +169,69 @@ def test_quantization_bits_only_touch_floats():
     assert np.array_equal(trimkit.exchange.draco_decode(buffer, np.zeros(1, np.int64))[1][0], value)
 
 
-@pytest.mark.parametrize("bad", [-1, 31])
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.array([-(2**31), -2] * 3, np.int32),
+        np.array([1, 2**31 - 1] * 3, np.int32),
+        # 8 GiB of table to count these, before draco-symbol-encoding.patch
+        np.array([0, 2**31 - 2] * 3, np.uint32),
+        np.random.default_rng(0).integers(0, 2**31 - 1, 498, dtype=np.int64).astype(np.uint32),
+    ],
+)
+def test_integers_of_the_widest_range_round_trip(value):
+    runs_here("exchange.draco_encode")
+    faces = np.arange(len(value), dtype=np.int64).reshape((-1, 3))
+    kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
+    buffer = trimkit.exchange.draco_encode(faces, [value], kind)
+    assert np.array_equal(trimkit.exchange.draco_decode(buffer, np.zeros(1, np.int64))[1][0], value)
+
+
+RANGE_TOO_WIDE = "attributes\\[0\\] has a range of integers over 2\\*\\*31 - 2"
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        # the largest symbol there is, which draco read as -1 and wrote through null
+        (np.array([0, -(2**31)] * 3, np.int32), RANGE_TOO_WIDE),
+        (np.array([-(2**31), 2**31 - 1] * 3, np.int32), RANGE_TOO_WIDE),
+        # one past the widest: draco would write this, then refuse to read it
+        (np.array([0, 2**31 - 1] * 3, np.uint32), RANGE_TOO_WIDE),
+        # a narrow range, past what int32 holds
+        (np.array([2**31, 2**31 + 5] * 3, np.uint32), "Failed to encode point attributes"),
+    ],
+)
+def test_integers_draco_cannot_store_refused(value, message):
+    runs_here("exchange.draco_encode")
+    faces = np.arange(6, dtype=np.int64).reshape((-1, 3))
+    kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
+    with pytest.raises(ValueError, match="draco failed to encode: " + message):
+        trimkit.exchange.draco_encode(faces, [value], kind)
+
+
+@pytest.mark.timing
+def test_wide_integers_cost_no_table():
+    # 8 GiB and 3.6 s here, before draco-symbol-encoding.patch
+    runs_here("exchange.draco_encode")
+    kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
+    value = np.random.default_rng(0).integers(0, 2**31 - 1, 498, dtype=np.int64).astype(np.uint32)
+    faces = np.arange(498, dtype=np.int64).reshape((-1, 3))
+    start = time.perf_counter()
+    trimkit.exchange.draco_encode(faces, [value], kind)
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize("bomb", [lambda: draco_points_bomb(2**32 - 1), draco_faces_bomb])
+def test_bomb_is_a_memory_error_before_any_is_allocated(bomb):
+    # asks for hundreds of GiB: refused, not zero-filled until the kernel kills us
+    runs_here("exchange.draco_decode")
+    buffer = bomb()
+    with pytest.raises(MemoryError):
+        trimkit.exchange.draco_decode(buffer, np.zeros(0, np.int64))
+
+
+@pytest.mark.parametrize("bad", [-1, 25, 30])
 def test_quantization_bits_refused(bad):
     faces = np.zeros((1, 3), np.int64)
     kind = np.array([trimkit.exchange.DracoKind.POSITION], np.int64)

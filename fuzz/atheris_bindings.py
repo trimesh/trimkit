@@ -280,7 +280,7 @@ def one(data: atheris.FuzzedDataProvider) -> None:
 def test_one_input(raw: bytes) -> None:
     data = atheris.FuzzedDataProvider(raw)
     # refusing bad input with an exception is the correct outcome
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, MemoryError):
         one(data)
 
 

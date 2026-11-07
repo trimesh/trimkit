@@ -4,12 +4,12 @@
 //
 // How a call runs: the caller times ranges of 1, 2, 4, ... items until one
 // takes PROBE_NS, so the cost of an item is measured, never guessed. A job
-// with more than ALONE_NS left is published in a slot and workers are woken,
-// one per HELPER_NS left; everyone then takes ranges of about GRAIN_NS of
-// items from one atomic counter. The caller always takes ranges too, until
-// none are left, so a call never depends on a worker running at all: a
-// worker only makes it faster. Then the caller closes the slot and waits for
-// the workers inside a range, and only those.
+// with more than ALONE_NS left is published in a slot, with workers started up
+// to one per HELPER_NS left and every sleeping one woken; everyone then takes
+// ranges of about GRAIN_NS of items from one atomic counter. The caller always
+// takes ranges too, until none are left, so a call never depends on a worker
+// running at all: a worker only makes it faster. Then the caller closes the
+// slot and waits for the workers inside a range, and only those.
 //
 // The state, and the transitions tests/test_scheduler.py checks in every
 // interleaving (each a function of the same name below):
@@ -71,7 +71,7 @@ namespace trimkit::parallel {
 constexpr double PROBE_NS = 20'000;              // probing ranges double until one takes this
 constexpr double GRAIN_NS = 50'000;              // then each range takes about this
 constexpr double ALONE_NS = 300'000;             // less left than this: the caller finishes alone
-constexpr double HELPER_NS = 100'000;            // one worker woken per this much left
+constexpr double HELPER_NS = 100'000;            // one worker wanted per this much left
 constexpr std::int64_t CALLER_SPIN_NS = 20'000;  // the caller spins this long for workers, then sleeps
 constexpr std::int64_t WORKER_SPIN_NS = 50'000;  // a worker spins this long for more work, then sleeps
 // A sleeping worker costs no CPU and only the stack pages it touched, so a
@@ -115,7 +115,6 @@ struct Pool {
     std::atomic<std::uint32_t> live{0};              // workers started and not yet exited
     std::atomic<std::uint32_t> wanted{0};            // how many workers the last publish wanted
     std::atomic<std::uint32_t> cap{0};               // the most workers: CPUs this process may use, less 1
-    std::atomic<bool> fork_handled{false};
 };
 
 // the extension's one pool: atomics only, shared by every caller
@@ -129,7 +128,7 @@ inline std::int64_t now_ns() {
 }
 
 inline void relax() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     __builtin_ia32_pause();
 #elif defined(__aarch64__) || defined(_M_ARM64)
     __builtin_arm_yield();
@@ -146,8 +145,14 @@ inline void park(std::atomic<std::uint32_t>& word, std::uint32_t expected, std::
     void* address = static_cast<void*>(&word);
 #if defined(_WIN32)
     WaitOnAddress(address, &expected, sizeof(expected), timeout_ms);
-#elif defined(__linux__)
-    timespec timeout{static_cast<time_t>(timeout_ms / 1000), static_cast<long>(timeout_ms % 1000) * 1'000'000};
+#elif defined(__linux__) && defined(SYS_futex)
+    // what SYS_futex reads, on every machine that has it: not `timespec`, whose
+    // time_t a 32-bit build may have made 64 bits
+    struct FutexTimeout {
+        long seconds;
+        long nanoseconds;
+    };
+    FutexTimeout timeout{static_cast<long>(timeout_ms / 1000), static_cast<long>(timeout_ms % 1000) * 1'000'000};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): futex has no wrapper
     syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected, &timeout, nullptr, 0);
 #elif defined(__APPLE__)
@@ -167,7 +172,7 @@ inline void unpark(std::atomic<std::uint32_t>& word) {
     void* address = static_cast<void*>(&word);
 #if defined(_WIN32)
     WakeByAddressAll(address);
-#elif defined(__linux__)
+#elif defined(__linux__) && defined(SYS_futex)
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): futex has no wrapper
     syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
 #elif defined(__APPLE__)
@@ -280,13 +285,9 @@ inline void child_after_fork() {
     pool.wanted.store(0, std::memory_order_relaxed);
 }
 
-inline void handle_forks() {
 #if !defined(_WIN32)
-    if (!pool.fork_handled.exchange(true, std::memory_order_relaxed)) {
-        pthread_atfork(nullptr, nullptr, child_after_fork);
-    }
+inline const int FORK_HANDLER = pthread_atfork(nullptr, nullptr, child_after_fork);
 #endif
-}
 
 // a free slot holding `job`, or none when every slot is busy: then the
 // caller runs alone
@@ -301,7 +302,6 @@ inline Slot* try_publish(Job& job) {
         if (!slot.word.compare_exchange_strong(word, word + EPOCH + 1, std::memory_order_relaxed)) {
             continue;
         }
-        handle_forks();
         slot.job.store(&job, std::memory_order_relaxed);
         // publishes the job pointer and the job to any worker seeing OPEN
         slot.word.fetch_or(OPEN, std::memory_order_release);
