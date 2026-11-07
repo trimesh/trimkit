@@ -1,7 +1,7 @@
 # The toolchain behind every `uv run scripts` command but `lock` and `wheel`,
 # so they run identically on any machine and in CI. Built by
 # `uv run scripts image` (and automatically by those commands) from the
-# repository root, see .dockerignore: every input is pinned by digest,
+# repository root, see Dockerfile.dockerignore: every input is pinned by digest,
 # snapshot date or the hash-locked uv.lock.
 FROM debian:trixie@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
 

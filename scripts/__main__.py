@@ -362,7 +362,8 @@ def cmd_tidy(args) -> None:
     sources = compile_commands(args.root)
     ours = [re.escape(str(dev(args.root).source / d.relative_to(ROOT))) for d in MANIFEST.directories]
     header_filter = f"--header-filter=^({'|'.join(ours)})/"
-    run(tool("clang-tidy"), "--quiet", header_filter, "-p", dev(args.root).build_dir, *sources)
+    config = f"--config-file={ROOT / 'scripts' / 'clang-tidy.yaml'}"
+    run(tool("clang-tidy"), "--quiet", config, header_filter, "-p", dev(args.root).build_dir, *sources)
 
 
 def cmd_cppcheck(args) -> None:
@@ -391,13 +392,16 @@ def cpp_files() -> list[Path]:
     return [p for d in directories for p in builder.tracked_under(d) if p.suffix in (".cpp", ".hpp")]
 
 
+# how our C++ is laid out, for the image's clang-format
+CLANG_FORMAT_STYLE = f"--style=file:{ROOT / 'scripts' / 'clang-format.yaml'}"
+
+
 def cmd_format(args) -> None:
-    # our C++ as .clang-format says, with the image's clang-format
-    run(tool("clang-format"), "-i", *cpp_files())
+    run(tool("clang-format"), CLANG_FORMAT_STYLE, "-i", *cpp_files())
 
 
 def cmd_clang_format(args) -> None:
-    run(tool("clang-format"), "--dry-run", "-Werror", *cpp_files())
+    run(tool("clang-format"), CLANG_FORMAT_STYLE, "--dry-run", "-Werror", *cpp_files())
 
 
 def cmd_ruff(args) -> None:

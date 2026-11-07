@@ -152,7 +152,7 @@ spec a distribution's maintainer commits, into `build/distro/`.
 ```
 uv run scripts check       # the gate: build, tests, static checks, sanitizers, fuzzers
 uv run scripts update      # every upstream and dependency to its newest
-uv run scripts format      # our C++, as the committed .clang-format says
+uv run scripts format      # our C++, as scripts/clang-format.yaml says
 uv run scripts generate    # regenerate the stubs and this README's generated block
 uv run scripts wheel       # this platform's release wheels
 uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
