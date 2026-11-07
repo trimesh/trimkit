@@ -56,8 +56,8 @@
 [toolchain]
 # clang, with its lld, llvm-ar or llvm-lib and llvm-profdata of the same LLVM,
 # which ThinLTO's bitcode and PGO's profiles need: the dev image's Debian 19,
-# musllinux's 20, manylinux's 21 and the Windows runners' LLVM
-llvm = [19, 21]
+# musllinux's 20, manylinux's 21 and the Windows runners' LLVM: x64's 20, arm64's 22
+llvm = [19, 22]
 # Xcode's clang on macOS, with Xcode's own linker, libtool and llvm-profdata
 apple_clang = [16, 17]
 

@@ -600,8 +600,10 @@ HARDENING = {
         ("-Wl,--gc-sections", "-Wl,-z,relro,-z,now,-z,noexecstack"),
     ),
     "macos": Flags((*SECTIONS, *FORTIFY), ("-Wl,-dead_strip",)),
-    # control flow guard, and the linker's dead-code stripping
-    "windows": Flags((*SECTIONS, "-mguard=cf"), ("-mguard=cf", "-Wl,/guard:cf", "-Wl,/OPT:REF")),
+    # control flow guard, and the linker's dead-code stripping. clang's driver
+    # takes -mguard=cf only for MinGW and /guard:cf only as clang-cl, so with an
+    # msvc target this names what both become; ThinLTO carries it in the bitcode
+    "windows": Flags((*SECTIONS, "-Xclang", "-cfguard"), ("-Wl,/guard:cf", "-Wl,/OPT:REF")),
 }
 # x86's control-flow enforcement: branch targets, and Windows' shadow stacks
 HARDENING_X86 = {
