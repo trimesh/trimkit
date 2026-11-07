@@ -39,15 +39,16 @@
 #include <exception>
 
 #if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
 #include <process.h>
-#include <windows.h>
 #pragma comment(lib, "synchronization")
+// the three calls we make, rather than windows.h, whose macros (FAR, near, far
+// and hundreds more) would reach every source through this header
+extern "C" {
+__declspec(dllimport) int __stdcall WaitOnAddress(volatile void* address, void* expected, std::size_t size,
+                                                  unsigned long timeout_ms);
+__declspec(dllimport) void __stdcall WakeByAddressAll(void* address);
+__declspec(dllimport) int __stdcall CloseHandle(void* handle);
+}
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -201,13 +202,14 @@ inline bool start_worker_thread() {
         worker_main(argument);
         return 0;
     };
+    constexpr unsigned STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000;
     const std::uintptr_t handle = _beginthreadex(nullptr, static_cast<unsigned>(WORKER_STACK), entry, nullptr,
                                                  STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (handle == 0) {
         return false;
     }
     CloseHandle(
-        reinterpret_cast<HANDLE>(handle));  // NOLINT(performance-no-int-to-ptr): the API returns a handle as an integer
+        reinterpret_cast<void*>(handle));  // NOLINT(performance-no-int-to-ptr): the API returns a handle as an integer
     return true;
 #else
     pthread_attr_t attributes;
