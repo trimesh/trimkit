@@ -1,0 +1,292 @@
+# The one hand-edited build manifest: every upstream compiled into the wheel
+# and every part of the one extension built from them. scripts/builder.py turns
+# it into each build's ninja file, and every other script reads it rather than
+# keeping its own list.
+#
+# [upstream.NAME], vendored under vendor/NAME/ at its own paths by `uv run scripts fetch`:
+#   repo, ref, commit  the repository, the ref `fetch --latest` follows, and the pin
+#   host               where `repo` lives, if not "github.com"
+#   tree_sha256        one hash of everything vendored for it, patches applied,
+#                      which `fetch` writes and `check` verifies
+#   spdx, copyright    its license, and the notice when its LICENSE has none
+#   keep               upstream paths to keep, its licenses at least. Everything
+#                      else it has is deleted unless the build reaches it: scripts/vendor.py
+#   license_from       a source whose leading comment is its only license text
+#   patches            { "NAME.patch" = sha256 } our changes, applied in order:
+#                      unified diffs in vendor/patches/, each starting
+#                      `kind: fix` (a bug or UB upstream) or `kind: perf` and
+#                      why, every hunk matching exactly; `fetch` writes the hashes
+# and how it is built, all of it quietly (vendored warnings aren't ours to fix):
+#   include            header directories; system headers unless `own`
+#   system             a header of it as the sources include it (`Eigen/Core`):
+#                      a build may take it from the system's copy instead
+#                      (`-Csystem=NAME,...`), never with patches
+#   system_directory   where distributions put that header, under a directory
+#                      the compiler searches (`eigen3`), if not right there
+#   distro             { DISTRIBUTION = package } each one's package of that copy
+#   requires           upstreams whose headers and defines its sources compile
+#                      with, which every part compiling it must list too
+#   sources            globs of files compiled into a static library
+#   defines            { NAME = why } compile definitions for it and its users
+#   no_sanitize        { check = why } sanitizer checks off for its sources
+#   own                our own work: no repo, never fetched or hashed
+# vendor/ holds exactly these upstreams and vendor/patches/, nothing else.
+#
+# [part.NAME], a part of the one extension: src/NAME.cpp, whose bind_NAME adds
+# its functions and classes to the flat module:
+#   upstreams          what it compiles in
+#   fuzz               libFuzzer harnesses fuzz/HARNESS.cpp built against it
+#   seeds              a program fuzz/SEEDS.cpp writing seeds for harness NAME
+#
+# [extension], the one extension, the package `trimkit` itself:
+#   budget             the most bytes it may be stripped in a wheel, about
+#                      twice its size, to catch an unstripped build
+#   upstreams          what every part compiles against
+#
+# [distribution.NAME], what `uv run scripts distro` writes packaging for:
+#   images             { machine = image } where to build it, by the digest of that
+#                      one platform's manifest
+#   requires           what building and testing need, besides `distro` packages
+#
+# [toolchain], the compilers our own builds (`-Cstrict=true`) accept: inclusive
+# [oldest, newest] major versions, the ones the gate and the release's wheels
+# have passed with, so an untried toolchain stops a release instead of shipping.
+# Anyone else building the sdist is held only to the oldest.
+
+[toolchain]
+# clang, with its lld, llvm-ar or llvm-lib and llvm-profdata of the same LLVM,
+# which ThinLTO's bitcode and PGO's profiles need: the dev image's Debian 19,
+# musllinux's 20, manylinux's 21 and the Windows runners' LLVM
+llvm = [19, 21]
+# Xcode's clang on macOS, with Xcode's own linker, libtool and llvm-profdata
+apple_clang = [16, 17]
+
+[upstream.earcut]
+repo = "mapbox/earcut.hpp"
+ref = "master"
+commit = "2fbafada15dbe5350c606426e17111b91a964e55"
+tree_sha256 = "a529ed6018a5e667cf3c460ff98bd9c342aa7df9133b21888fc2e53f23c32753"
+spdx = "ISC"
+keep = ["LICENSE"]
+include = ["vendor/earcut/include/mapbox"]
+
+[upstream.earcut.patches]
+"earcut-convex-ring.patch" = "af23660024500d344abc69ab6f30a6be86c2f67805e06ef92397de604b8bcae7"
+"earcut-hole-bridge-blocks.patch" = "87b185b8480af4bfad2d317153c7a9dfb58f323bfabd6dd5b4d6941809acb8a8"
+
+[upstream.vhacd]
+repo = "kmammou/v-hacd"
+ref = "master"
+commit = "f900e42361491f525262d4825e758845e4969897"
+tree_sha256 = "6d37071fe771f42f5e9a8ff6cc597c665d178be493f78eb72622d2a550946d31"
+spdx = "BSD-3-Clause"
+keep = ["LICENSE"]
+include = ["vendor/vhacd/include"]
+
+[upstream.vhacd.patches]
+"vhacd-atomic-hull-counter.patch" = "67ed17f039adedaef0a000edc896e8dafc41cf4953cc1c7ed86a63b1bb92c300"
+"vhacd-empty-volume.patch" = "8db53c1a9d074b9eae4ed91ed526ff0360e09373dd4cd8bfd9ca2526fd60a587"
+
+[upstream.xatlas]
+repo = "jpcy/xatlas"
+ref = "master"
+commit = "f700c7790aaa030e794b52ba7791a05c085faf0c"
+tree_sha256 = "f635e4b7c8047db322a495a1dfcd721df95eb9647c03f6f9f67b4fd06f6bc4ca"
+spdx = "MIT"
+# upstream ships no LICENSE file: the MIT text is the leading comment of the source
+license_from = "source/xatlas/xatlas.cpp"
+sources = ["vendor/xatlas/source/xatlas/xatlas.cpp"]
+include = ["vendor/xatlas/source/xatlas"]
+no_sanitize = { function = "OpenNL calls destructors through a mismatched function pointer type (nlDeleteMatrix): undefined, benign on every ABI" }
+
+[upstream.xatlas.patches]
+"xatlas-lost-wakeup.patch" = "8eb34e5bed571d67468f9475c70a01645e111e325370a317ae337f29c3c3d4fe"
+
+[upstream.fast_float]
+repo = "fastfloat/fast_float"
+ref = "main"
+commit = "dbeabeeb3e6791cb96994c2a7a084c36e62ccfb2"
+tree_sha256 = "50f84a5645597c4d40baa578f83765c70fb624f50b5ca8bb7fa954f40a832054"
+spdx = "MIT OR Apache-2.0 OR BSL-1.0"
+keep = ["LICENSE-MIT"]
+include = ["vendor/fast_float/include"]
+system = "fast_float/fast_float.h"
+distro = { debian = "libfast-float-dev", fedora = "fast_float-devel" }
+
+[upstream.dragonbox]
+repo = "jk-jeon/dragonbox"
+ref = "master"
+commit = "beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44"
+tree_sha256 = "4963cb9d45ee81e59ea4efb2141c66668967d6ac71c1f8bd3521ac48f1d5b638"
+spdx = "Apache-2.0 WITH LLVM-exception OR BSL-1.0"
+# its LICENSE files are the bare license texts: this is the notice its header carries
+copyright = "Copyright 2020-2025 Junekey Jeon"
+# the shortest round-trip double formatting svg_string writes numbers with,
+# header-only: std::to_chars's would bring libstdc++'s every floating-point
+# path into the module where that is static (128 KB on manylinux_2_28)
+keep = ["LICENSE-Apache2-LLVM", "LICENSE-Boost"]
+include = ["vendor/dragonbox/include/dragonbox"]
+
+[upstream.draco]
+repo = "google/draco"
+ref = "main"
+commit = "d429de84b52a860705507da0884764c5d8321423"
+tree_sha256 = "2a123677b3cfe5d780371f81e3f3e43e452ca93642f44ca6a813c5f83a29becd"
+spdx = "Apache-2.0"
+# its LICENSE is the bare Apache text: this is the notice its sources carry
+copyright = "Copyright 2016 The Draco Authors"
+keep = ["LICENSE"]
+sources = ["vendor/draco/src/draco/**/*.cc"]
+include = ["vendor/draco/src", "src/config"]
+
+[upstream.tinybvh]
+repo = "jbikker/tinybvh"
+ref = "main"
+commit = "c9be3103cc9693b456b0a0353927c11cac7d710f"
+tree_sha256 = "2371ee6ac9f3d5baae897b7986e72c7e5d7c7eb90491cc7fa81c3c780c4c54ac"
+spdx = "MIT"
+keep = ["LICENSE"]
+# the implementation unit is a two-line file of ours that defines
+# TINYBVH_IMPLEMENTATION, compiled quietly like the header it includes
+sources = ["src/tinybvh.cpp"]
+include = ["vendor/tinybvh"]
+
+[upstream.tinybvh.defines]
+TINYBVH_NO_SIMD = "its x86 kernels need AVX2, which a portable wheel can't assume; one code path answers alike everywhere"
+WATERTIGHT_TRITEST = "costs 2-7%, and rays at the vertices and edges of a closed mesh no longer escape it (12.8% did)"
+NO_VOXEL_SUPPORT = "a feature we don't use"
+NO_CUSTOM_GEOMETRY = "a feature we don't use"
+NO_THREADED_BUILDS = "build on the calling thread: threaded builds gained 1-8% (1M faces 205 vs 207 ms, 2026-11-01) and overflowed musl's 128 KB thread stacks in BuildHQ (SIGSEGV), which no dlopen'ed module can raise"
+
+[upstream.tinybvh.patches]
+"tinybvh-flat-node-bins.patch" = "fede891c586822c339923c731d913c12500a76ae7a6d11d9c21b48c3ae999469"
+
+[upstream.meshoptimizer]
+repo = "zeux/meshoptimizer"
+ref = "v1.3"
+commit = "9e1f07b159d3cb777f1c67ed31fc11fd117986f4"
+tree_sha256 = "488aba68059ba92d2aab5d022d7f7209ee75a1829e831276bd79dff1c0bace8a"
+spdx = "MIT"
+# only the simplifier: it needs nothing else from the library
+keep = ["LICENSE.md", "src/simplifier.cpp"]
+sources = ["vendor/meshoptimizer/src/simplifier.cpp"]
+include = ["vendor/meshoptimizer/src"]
+
+# collision and distance between meshes: coal's BVH traversal and GJK/EPA,
+# only what our binding reaches. The one Boost.Math constant and Boost.Assert
+# macro it uses are shims of ours in src/config/coal, with the headers its
+# CMake would generate
+[upstream.coal]
+repo = "coal-library/coal"
+ref = "devel"
+commit = "83cdaa6addd580c11dadd2299476e6f08aece2f4"
+tree_sha256 = "c07397b6a43a369b730aa4c85b2bf044e3b9a525e19d9abca15cbdcd978c0ade"
+spdx = "BSD-3-Clause"
+# src/distance/triangle_triangle.cpp defines a ShapeShapeDistancer specialization no header is named after
+keep = ["LICENSE", "src/distance/triangle_triangle.cpp"]
+requires = ["eigen"]
+sources = ["vendor/coal/src/**/*.cpp"]
+no_sanitize = { vptr = "convex support dispatches by casting a ConvexBase to empty derived tag types (SmallConvex, LargeConvex): a downcast to a type the object isn't, undefined but benign on every ABI, as the tags add no members or virtuals" }
+include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/third_party", "src/config/coal"]
+
+[upstream.coal.patches]
+"coal-bvh-bvh-performance.patch" = "f32a0b89a130c98ccc6a457925ab99aa6215206fc02d1c019b4d743a5ae48da8"
+
+# coal's linear algebra, header only: only the headers coal and our binding
+# reach on some wheel target. MPL-2.0, which binds only its own files, kept
+# unmodified and shipped as source in the sdist
+[upstream.eigen]
+host = "gitlab.com"
+repo = "libeigen/eigen"
+ref = "master"
+commit = "f6db5ea201198eb747bd9e34f7a3d8dfc4da308e"
+tree_sha256 = "32d85596bef0f51f6483911663f0eb8798c01289b1e9f94310f7cc2527140e13"
+spdx = "MPL-2.0"
+copyright = "Copyright the Eigen authors"
+keep = ["COPYING.MPL2", "COPYING.APACHE", "COPYING.BSD"]
+include = ["vendor/eigen"]
+system = "Eigen/Core"
+system_directory = "eigen3"
+distro = { debian = "libeigen3-dev", fedora = "eigen3-devel" }
+
+[upstream.eigen.defines]
+EIGEN_MPL2_ONLY = "refuse to compile any part of Eigen under a license other than MPL-2.0"
+
+# nanobind, compiled from these sources into the one extension
+# (src/nb_combined.cpp, its documented build without CMake), with its
+# headers, its macOS list of the C API and the stub generator: whole, as its
+# macros need a real Python to scan, and it is small
+[upstream.nanobind]
+repo = "wjakob/nanobind"
+ref = "v3.1.0"
+commit = "68480a9e6883bb1bf65e1925423321e2a89d07f9"
+tree_sha256 = "1d17298c75ff02d56b7f5a2b35f86aad9e69d3b919da69168b752fabc1f93168"
+spdx = "BSD-3-Clause"
+keep = ["LICENSE", "cmake/darwin-ld-cpython.sym", "include", "src"]
+
+# the hash map nanobind's runtime uses, at the submodule commit nanobind
+# v3.1.0 pins as `ext/robin_map`
+[upstream.robin_map]
+repo = "Tessil/robin-map"
+ref = "4ec1bf19c6a96125ea22062f38c2cf5b958e448e"
+commit = "4ec1bf19c6a96125ea22062f38c2cf5b958e448e"
+tree_sha256 = "1cd1a20397a4c42ed19541e0c12e9acd33afdeceb9e9e112b7cf0ea3cbfaf77a"
+spdx = "MIT"
+keep = ["LICENSE", "include"]
+include = ["vendor/robin_map/include"]
+system = "tsl/robin_map.h"
+distro = { debian = "robin-map-dev", fedora = "robin-map-devel" }
+
+[upstream.svgpath]
+own = true
+spdx = "MIT"
+include = ["vendor/svgpath"]
+
+
+[extension]
+budget = 4_400_000
+upstreams = ["nanobind", "robin_map"]
+
+[part.bvh]
+upstreams = ["tinybvh"]
+fuzz = ["bvh", "parallel"]
+
+[part.earcut]
+upstreams = ["earcut"]
+fuzz = ["earcut"]
+
+[part.vhacd]
+upstreams = ["vhacd"]
+fuzz = ["vhacd"]
+
+[part.xatlas]
+upstreams = ["xatlas"]
+fuzz = ["xatlas"]
+
+[part.draco]
+upstreams = ["draco"]
+fuzz = ["draco", "draco_roundtrip"]
+# our binding only writes sequential buffers, but most exporters write edgebreaker
+seeds = "draco_seeds"
+
+[part.svg]
+upstreams = ["svgpath", "fast_float", "dragonbox"]
+fuzz = ["svgpath", "svgpath_format"]
+
+[part.meshoptimizer]
+upstreams = ["meshoptimizer"]
+fuzz = ["meshoptimizer"]
+
+[part.collision]
+upstreams = ["coal", "eigen"]
+fuzz = ["collision"]
+
+# debian:trixie
+[distribution.debian]
+images = { x86_64 = "debian@sha256:e2914ec98e08b24b4cee3cefcb9f90dfb5519f8d215a2ccf0c9a49b10b6e43de", aarch64 = "debian@sha256:39f862f398f8ea1a2ffee9bbe02c649be6779244bd6a834c4f71155172f801f2" }
+requires = ["clang", "lld", "llvm", "ninja-build", "python3-all-dev", "pybuild-plugin-pyproject", "python3-numpy", "python3-pytest", "python3-hypothesis", "python3-lark", "python3-svg.path"]
+
+# fedora:43
+[distribution.fedora]
+images = { x86_64 = "fedora@sha256:3a515a26e06ffe17847b46f2f71a45140180ba2e39206d9c83fde648f0767cad", aarch64 = "fedora@sha256:be722e68838737842052f993e5815e9877b1b3a3a48ab6bc908951fb4f14d5c9" }
+requires = ["clang", "lld", "llvm", "ninja-build", "python3-devel", "python3-numpy", "python3-pytest", "python3-hypothesis", "python3-lark", "python3-svg-path"]

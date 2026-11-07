@@ -1,0 +1,34 @@
+kind: fix
+upstream: not yet reported to V-HACD (which its author considers deprecated).
+
+`VoxelHull::m_voxelHullCount` is a plain static that every decomposition
+increments, so two decompositions running at once race on it, which is
+undefined. Nothing reads its value, so an atomic makes it race-free without a
+lock.
+
+Reproduced 2026-11-01 with clang -fsanitize=thread: two threads each
+decomposing a cube on their own instance (resolution 20,000, no worker pool):
+  pristine:  WARNING: ThreadSanitizer: data race
+  patched:   clean
+Covered by: tests/test_threads.py (vhacd.decompose on 8 threads), which
+`uv run scripts tsan` runs under TSan.
+
+--- a/include/VHACD.h
++++ b/include/VHACD.h
+@@ -5965,12 +5965,14 @@
+     std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
+     std::vector<VHACD::Vertex>                  m_vertices;
+     std::vector<VHACD::Triangle>                m_indices;
+-    static uint32_t                             m_voxelHullCount;
++    // trimkit (vendor/patches/vhacd-atomic-hull-counter.patch): atomic, as concurrent
++    // decompositions all increment it (a data race under TSan); its value is never read
++    static std::atomic<uint32_t>                m_voxelHullCount;
+     IVHACD::Parameters                          m_params;
+     VHACDCallbacks*                             m_callbacks{ nullptr };
+ };
+ 
+-uint32_t VoxelHull::m_voxelHullCount = 0;
++std::atomic<uint32_t> VoxelHull::m_voxelHullCount{0};
+ 
+ VoxelHull::VoxelHull(const VoxelHull& parent,
+                      SplitAxis axis,

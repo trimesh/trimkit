@@ -1,0 +1,23 @@
+.venv/
+build/
+dist/
+wheelhouse/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+# editor droppings
+\#*\#
+.\#*
+*~
+# local Claude Code settings
+.claude/settings.local.json
+# build products outside build/, and fuzzer and profiler droppings
+*.so
+*.pyd
+*.egg-info/
+crash-*
+oom-*
+timeout-*
+leak-*
+*.profraw

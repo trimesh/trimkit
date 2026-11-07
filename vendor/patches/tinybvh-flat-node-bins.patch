@@ -1,0 +1,35 @@
+kind: fix
+upstream: not yet reported to tinybvh.
+
+BuildHQ, the spatial-split builder trimkit uses from 100,000 triangles, bins
+each axis by `binCount / extent` with no guard for a node flat on that axis:
+the extent is 0, every offset is 0, and 0 * inf is NaN, cast to int, which is
+undefined (x86 happens to give INT_MIN, then clamped to bin 0). Any planar
+region makes flat nodes. The plain builder already guards this with
+`extent > minDim`, and this does exactly what it does.
+
+Reproduced 2026-11-01 with clang -fsanitize=undefined, BuildHQ on a flat
+320 x 320 grid (204,800 triangles):
+  pristine:  tiny_bvh_base.h:3126:70: runtime error: -nan is outside the
+             range of representable values of type 'int'
+  patched:   builds cleanly
+Covered by: tests/test_bvh.py::test_flat_mesh_with_spatial_splits, which
+`uv run scripts asan` runs under UBSan.
+
+--- a/tiny_bvh_base.h
++++ b/tiny_bvh_base.h
+@@ -3212,7 +3212,13 @@
+ 				// find optimal object split
+ 				BinBox binBox[3][MAXHQBINS];
+ 				Index count[3][MAXHQBINS];
+-				const Vec3 rpd3 = Vec3( Vec3( (Float)binCount ) / (node.aabbMax - node.aabbMin) ), nmin3 = node.aabbMin;
++				// trimkit (vendor/patches/tinybvh-flat-node-bins.patch): no bins on an axis the node
++				// is flat on, as the plain builder does; otherwise 0 * inf = NaN is cast to int
++				const Vec3 extent3 = node.aabbMax - node.aabbMin;
++				const Vec3 rpd3 = Vec3(
++					extent3.x > minDim.x ? ((Float)binCount / extent3.x) : 0,
++					extent3.y > minDim.y ? ((Float)binCount / extent3.y) : 0,
++					extent3.z > minDim.z ? ((Float)binCount / extent3.z) : 0 ), nmin3 = node.aabbMin;
+ 				// horizontal binning for large nodes: one slice of the fragment range per task.
+ 				const uint32_t slices = TaskCount( threadedBuild && node.triCount >= (Index)MT_HQ_BIN_THRESHOLD, node.triCount, MT_HQ_SLICE_PRIMS, MT_HQ_MAX_SLICES );
+ 				if (slices > 1 && !sliceBox)

@@ -1,0 +1,158 @@
+kind: perf
+upstream: not yet reported to earcut.hpp or earcut.js (both have this index);
+  applies after earcut-convex-ring.patch.
+
+findHoleBridge bridges holes in one at a time, scanning a block index whose
+blocks each walked their run of the ring from `blockHead` to `blockStop` along
+`next`. Every hole spliced into a run lands inside an earlier block's walk, so
+the walks lengthen with every hole merged: quadratic in the number of holes
+(10,000 random holes walked 2e8 nodes). Each block now records its own K nodes
+and walks only those. A merged hole's edges are indexed as blocks of their own,
+so every edge is still visited: once, instead of again for every later hole.
+
+Measured 2026-11-01 in the trimkit-dev image (g++ 14.2 -O3, i7-12700K, one
+pinned core), best of 7, earcut-convex-ring.patch alone vs with this:
+  10,000 holes, 100 x 100 grid   1785 ms  ->  170 ms
+  10,000 holes, random cells     9838 ms  ->  537 ms
+  10,000 holes, one row          1982 ms  ->  606 ms
+  rings without holes            unchanged
+Correctness: identical triangles to pristine over 1,425,929 differential fuzz
+runs (601 s) and 716 hard inputs, clean under ASan and UBSan. A smaller fix
+(splitting a block's run at each splice) is as fast but resolves equal-x ties
+differently, so it belongs upstream rather than here.
+Covered by: tests/test_earcut.py::test_many_holes_are_not_quadratic (10,000
+holes under a time bound), fuzz/earcut.cpp (up to 144 holes).
+
+--- a/include/mapbox/earcut.hpp
++++ b/include/mapbox/earcut.hpp
+@@ -117,8 +117,6 @@
+     void buildBlockIndex(std::size_t maxNodes, std::size_t numHoles);
+     void indexSegment(Node* head, Node* stop);
+     void growBlock(Node* head, Node* tail);
+-    Node* liveBlockHead(std::size_t b);
+-    Node* liveBlockStop(std::size_t b);
+     bool sectorContainsSector(const Node* m, const Node* p);
+     void indexCurve(Node* start);
+     Node* sortLinked(Node* list);
+@@ -235,8 +233,9 @@
+     // chosen bridge can differ from the un-indexed code — a different but equally valid result.
+     static constexpr int32_t K = 16; // edges per block
+     std::vector<double> blockBBox;   // [minX,minY,maxX,maxY] per block
+-    std::vector<Node*> blockHead;    // first node of each block's segment
+-    std::vector<Node*> blockStop;    // node just past each block's segment (exclusive walk bound)
++    // trimkit (vendor/patches/earcut-hole-bridge-blocks.patch): each block's own nodes, so its
++    // walk never runs on through holes spliced in later (quadratic in the number of holes)
++    std::vector<Node*> blockNodes;   // the K nodes whose edges each block owns, null-padded
+     std::size_t numBlocks = 0;
+     // true only while eliminateHoles merges holes, so removeNode keeps the block index live (growBlock)
+     bool indexActive = false;
+@@ -645,10 +644,12 @@
+     for (std::size_t b = 0, g = 0; b < numBlocks; b++, g += 4) {
+         if (hy < blockBBox[g + 1] || hy > blockBBox[g + 3] || blockBBox[g] > hx || blockBBox[g + 2] <= qx) continue;
+ 
+-        // ensure the walk's exclusive bound is live so we don't overrun into other blocks
+-        const Node* stop = liveBlockStop(b);
+-        p = liveBlockHead(b);
+-        do {
++        // trimkit (vendor/patches/earcut-hole-bridge-blocks.patch):
++        // only the block's own K nodes: holes spliced into its run later are
++        // indexed as blocks of their own, so walking on into them is wasted
++        for (int32_t k = 0; k < K; k++) {
++            p = blockNodes[b * K + k];
++            if (!p) break;
+             if (p->prev->next == p) { // skip nodes removed by filterPoints (stale in the index)
+                 if (equals(hole, p->next))
+                     return p->next;
+@@ -661,8 +662,7 @@
+                     }
+                 }
+             }
+-            p = p->next;
+-        } while (p != stop);
++        }
+     }
+ 
+     if (!m) return 0;
+@@ -682,9 +682,9 @@
+         if (blockBBox[g + 2] < mx || blockBBox[g] > hx || blockBBox[g + 3] < tminY || blockBBox[g + 1] > tmaxY)
+             continue;
+ 
+-        const Node* stop = liveBlockStop(b);
+-        p = liveBlockHead(b);
+-        do {
++        for (int32_t k = 0; k < K; k++) {
++            p = blockNodes[b * K + k];
++            if (!p) break;
+             if (p->prev->next == p && hx >= p->x && p->x >= mx && hx != p->x && // skip dead nodes
+                 pointInTriangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, p->x, p->y)) {
+                 const double tanCur = std::abs(hy - p->y) / (hx - p->x); // tangential
+@@ -698,8 +698,7 @@
+                     tanMin = tanCur;
+                 }
+             }
+-            p = p->next;
+-        } while (p != stop);
++        }
+     }
+ 
+     return m;
+@@ -712,10 +711,7 @@
+     // trailing block per appended segment (outer ring + one per hole)
+     const std::size_t maxBlocks = (maxNodes + 2 * numHoles + K - 1) / K + numHoles + 2;
+     if (blockBBox.size() < maxBlocks * 4) blockBBox.resize(maxBlocks * 4);
+-    if (blockHead.size() < maxBlocks) {
+-        blockHead.resize(maxBlocks);
+-        blockStop.resize(maxBlocks);
+-    }
++    if (blockNodes.size() < maxBlocks * K) blockNodes.resize(maxBlocks * K);
+     numBlocks = 0;
+ }
+ 
+@@ -726,10 +722,10 @@
+     Node* p = head;
+     do {
+         const std::size_t b = numBlocks++;
+-        blockHead[b] = p;
+         double bMinX = p->x, bMinY = p->y, bMaxX = p->x, bMaxY = p->y;
+         int32_t k = 0;
+         do {
++            blockNodes[b * K + k] = p;      // the node owning edge p->c
+             Node* c = p->next;              // edge p->c; bbox must bound both endpoints
+             p->z = static_cast<int32_t>(b); // reuse z as the owning block during eliminateHoles (see growBlock)
+             if (c->x < bMinX) bMinX = c->x;
+@@ -738,7 +734,7 @@
+             if (c->y > bMaxY) bMaxY = c->y;
+             p = c;
+         } while (++k < K && p != stop);
+-        blockStop[b] = p;
++        for (int32_t rest = k; rest < K; rest++) blockNodes[b * K + rest] = nullptr;
+         const std::size_t g = b * 4;
+         blockBBox[g] = bMinX;
+         blockBBox[g + 1] = bMinY;
+@@ -757,26 +753,6 @@
+     if (tail->y < blockBBox[g + 1]) blockBBox[g + 1] = tail->y;
+     if (tail->x > blockBBox[g + 2]) blockBBox[g + 2] = tail->x;
+     if (tail->y > blockBBox[g + 3]) blockBBox[g + 3] = tail->y;
+-}
+-
+-// the block's head node can be removed by filterPoints during merges; advance it to the next live
+-// node so the walk doesn't start on (and immediately terminate at) a dead node. For the single
+-// full-ring seed block (head == stop) the same forward advance keeps them equal, so the do-while
+-// still laps the whole ring instead of collapsing to an empty walk.
+-template <typename N>
+-typename Earcut<N>::Node* Earcut<N>::liveBlockHead(std::size_t b) {
+-    Node* head = blockHead[b];
+-    while (head->prev->next != head) head = head->next;
+-    blockHead[b] = head;
+-    return head;
+-}
+-
+-template <typename N>
+-typename Earcut<N>::Node* Earcut<N>::liveBlockStop(std::size_t b) {
+-    Node* stop = blockStop[b];
+-    while (stop->prev->next != stop) stop = stop->next;
+-    blockStop[b] = stop;
+-    return stop;
+ }
+ 
+ // whether sector in vertex m contains sector in vertex p in the same coordinates

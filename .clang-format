@@ -1,0 +1,20 @@
+# Our C++ only: src/, fuzz/ and vendor/svgpath (`uv run scripts format`, checked by
+# `static`). The clang-format is the pinned image's, so everyone formats alike.
+Language: Cpp
+Standard: c++17
+BasedOnStyle: Google
+IndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit: 120
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+# include order is ours to keep: some headers set macros others read
+SortIncludes: Never
+IncludeBlocks: Preserve
+# comments stay as written, tools' markers never split from what they mark
+ReflowComments: false
+CommentPragmas: "NOLINT|cppcheck-suppress"
+# docstrings are raw strings: never touched
+RawStringFormats: []

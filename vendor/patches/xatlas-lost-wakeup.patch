@@ -1,0 +1,29 @@
+kind: fix
+upstream: not yet reported to xatlas (whose last code change was in 2022).
+
+Lost wakeup: the task scheduler sets a worker's `wakeup` flag and notifies its
+condition variable without holding the worker's mutex, so a worker that has
+just checked the flag and is about to block can miss the notify and sleep
+forever, hanging `join()` or a task. Workers hold that mutex while they run
+tasks, so taking it to set the flag would deadlock nested tasks. Instead a
+worker re-checks the flag every millisecond, bounding any lost wakeup to 1 ms;
+the cost is an idle worker waking 1,000 times a second.
+
+Evidence: found by fuzz/xatlas.cpp as rare multi-second hangs (2026-10). It is
+a timing race, so it can't be reproduced on demand: the mechanism is the
+unlocked flag-and-notify in the code below.
+Covered by: fuzz/xatlas.cpp, whose -timeout catches a hang.
+
+--- a/source/xatlas/xatlas.cpp
++++ b/source/xatlas/xatlas.cpp
+@@ -3270,7 +3270,9 @@
+ 		m_threadIndex = threadIndex;
+ 		std::unique_lock<std::mutex> lock(worker->mutex);
+ 		for (;;) {
+-			worker->cv.wait(lock, [=]{ return worker->wakeup.load(); });
++			// trimkit (vendor/patches/xatlas-lost-wakeup.patch): the flag is set and notified without
++			// this mutex, so a wakeup can be lost; re-checking every millisecond bounds the wait
++			worker->cv.wait_for(lock, std::chrono::milliseconds(1), [=]{ return worker->wakeup.load(); });
+ 			worker->wakeup = false;
+ 			for (;;) {
+ 				if (scheduler->m_shutdown)

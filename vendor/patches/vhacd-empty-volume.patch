@@ -1,0 +1,31 @@
+kind: fix
+upstream: not yet reported to V-HACD (which its author considers deprecated).
+
+Voxelizing welds vertices at 1/1000 of the mesh's scale and drops the
+triangles that collapse, then divides by the extent of what is left: when
+nothing is left that is 0 / 0, and the NaN is cast to size_t, which is
+undefined. Treat it like the existing no-points case: an empty volume.
+
+Reproduced 2026-11-01 with clang -fsanitize=undefined: a tetrahedron 1e-7
+across plus one unused vertex at (1, 1, 1), which sets the mesh's scale:
+  pristine:  VHACD.h:5119:53: runtime error: -nan is outside the range of
+             representable values of type 'unsigned long'
+  patched:   clean, 0 hulls
+Covered by: tests/test_vhacd.py::test_everything_welded_away (that input,
+run under UBSan by `uv run scripts asan`), fuzz/vhacd.cpp.
+
+--- a/include/VHACD.h
++++ b/include/VHACD.h
+@@ -5108,6 +5108,12 @@
+     m_bounds = BoundsAABB(points);
+ 
+     VHACD::Vect3 d = m_bounds.GetSize();
++    // trimkit (vendor/patches/vhacd-empty-volume.patch): nothing left after welding
++    // dropped every collapsed triangle is an empty volume, not 0 / 0 cast to size_t
++    if (!(d.MaxCoeff() > 0.0))
++    {
++        return;
++    }
+     double r;
+     // Equal comparison is important here to avoid taking the last branch when d[0] == d[1] with d[2] being the smallest
+     // dimension. That would lead to dimensions in i and j to be a lot bigger than expected and make the amount of
