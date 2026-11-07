@@ -138,7 +138,8 @@ def build(config: builder.Config) -> builder.Target:
     """
     target = builder.Target.current(config)
     builder.write(target)
-    subprocess.run([str(ninja_executable()), "-C", str(config.build_dir)], check=True)
+    # every failure in one run, rather than the first few
+    subprocess.run([str(ninja_executable()), "-k", "0", "-C", str(config.build_dir)], check=True)
     return target
 
 

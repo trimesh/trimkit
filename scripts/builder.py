@@ -554,8 +554,10 @@ def language(platform: Platform) -> Flags:
         # clang here targets 64-bit unless told; 32-bit Python needs the other
         target = ("--target=i686-pc-windows-msvc",) if platform.machine == "i686" else ()
         # the C and C++ runtimes linked in: a clean Windows has no msvcp140.dll,
-        # and nothing C++ crosses the extension's boundary, as on musl
-        return Flags((*exact, *target, "-fms-runtime-lib=static"), (*target, "-fms-runtime-lib=static"))
+        # and nothing C++ crosses the extension's boundary, as on musl. WIN32 is
+        # what CMake defines on Windows and clang doesn't: coal's alloca.h tests it
+        runtime = "-fms-runtime-lib=static"
+        return Flags((*exact, *target, runtime, "-DWIN32"), (*target, runtime))
     if platform.machine == "i686":
         # doubles in SSE2 registers, IEEE binary64 as on every other machine,
         # not the x87's 80-bit registers, whose extra precision changes answers
