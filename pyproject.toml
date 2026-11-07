@@ -85,7 +85,8 @@ config-settings = { strict = "true", pgo = "use" }
 # the test dependencies by hash too, then the wheel under test
 before-test = "python -m pip install --require-hashes --no-deps -r {project}/requirements.txt"
 # wall-clock bounds are the local gate's: a busy runner mustn't block a release on one
-test-command = "pytest {project}/tests -x -q -m 'not timing'"
+# (double quotes: cmd.exe, on Windows, doesn't know single ones)
+test-command = 'pytest {project}/tests -x -q -m "not timing"'
 # metadata, then check_wheel.py: abi3audit, licenses, naming and sizes, with
 # both tools installed by hash rather than cibuildwheel's own abi3audit
 audit-requires = ["--require-hashes", "--no-deps", "-r", "audit.txt"]
@@ -99,6 +100,18 @@ before-all = "dnf install -y clang lld llvm"
 [[tool.cibuildwheel.overrides]]
 select = "*-musllinux*"
 before-all = "apk add clang lld llvm compiler-rt"
+
+# LLVM's Windows release has profile runtimes for its own machine alone, so
+# the x64 runner can't link 32-bit training: built and tested all the same
+[[tool.cibuildwheel.overrides]]
+select = "*-win32"
+before-build = "python -m pip install --require-hashes --no-deps -r {project}/requirements.txt"
+config-settings = { strict = "true" }
+
+[tool.cibuildwheel.windows]
+# nothing to bundle: the extension links its C and C++ runtimes in, and needs
+# only Windows and python3.dll
+repair-wheel-command = ""
 
 [tool.cibuildwheel.macos]
 # numpy's own oldest on arm64: an API newer than this is a compile error

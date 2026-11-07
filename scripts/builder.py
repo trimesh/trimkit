@@ -553,7 +553,9 @@ def language(platform: Platform) -> Flags:
     if platform.os == "windows":
         # clang here targets 64-bit unless told; 32-bit Python needs the other
         target = ("--target=i686-pc-windows-msvc",) if platform.machine == "i686" else ()
-        return Flags((*exact, *target, "-fms-runtime-lib=dll"), (*target, "-fms-runtime-lib=dll"))
+        # the C and C++ runtimes linked in: a clean Windows has no msvcp140.dll,
+        # and nothing C++ crosses the extension's boundary, as on musl
+        return Flags((*exact, *target, "-fms-runtime-lib=static"), (*target, "-fms-runtime-lib=static"))
     if platform.machine == "i686":
         # doubles in SSE2 registers, IEEE binary64 as on every other machine,
         # not the x87's 80-bit registers, whose extra precision changes answers
@@ -674,7 +676,9 @@ def python_link(target: Target) -> Flags:
     if target.platform.os == "macos":
         return Flags(link=(f"-Wl,@{NANOBIND / 'cmake' / 'darwin-ld-cpython.sym'}",))
     if target.platform.os == "windows":
-        return Flags(link=(str(target.python.library),))
+        # named, and searchable: pyconfig.h asks for it again by bare name
+        library = target.python.library
+        return Flags(link=(str(library), f"-Wl,/LIBPATH:{library.parent}"))
     return NONE
 
 

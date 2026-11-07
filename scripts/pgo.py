@@ -1,6 +1,7 @@
 """
 The first stage of a profile-guided build, run by cibuildwheel as
-`before-build` on every platform, in the build environment (`sys.executable`):
+`before-build` on every platform but 32-bit Windows (pyproject.toml), in the
+build environment (`sys.executable`):
 
 1. install the build requirements and test dependencies from
    requirements.txt, by hash
