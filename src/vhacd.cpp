@@ -9,15 +9,12 @@
 #define ENABLE_VHACD_IMPLEMENTATION 1
 #include <VHACD.h>
 
-#include <nanobind/stl/tuple.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <memory>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -63,13 +60,17 @@ struct Release {
     void operator()(VHACD::IVHACD* vhacd) const { vhacd->Release(); }
 };
 
-using Hulls = std::tuple<trimkit::Out<double>, trimkit::Out<std::int64_t>, trimkit::Out<std::int64_t>,
-                         trimkit::Out<std::int64_t>>;
+// one hull at exactly its size, its faces indexing its own vertices
+struct Hull {
+    std::vector<double> vertices;
+    std::vector<std::int64_t> faces;
+};
 
-Hulls decompose(const trimkit::Array<double, -1, 3>& vertices_argument,
-                const trimkit::Array<std::int64_t, -1, 3>& faces_argument, trimkit::Number<std::uint32_t> maximum_hulls,
-                trimkit::Number<std::uint32_t> maximum_vertices, trimkit::Number<std::uint32_t> resolution,
-                trimkit::Number<double> maximum_error) {
+trimkit::MeshOuts decompose(const trimkit::Array<double, -1, 3>& vertices_argument,
+                            const trimkit::Array<std::int64_t, -1, 3>& faces_argument,
+                            trimkit::Number<std::uint32_t> maximum_hulls,
+                            trimkit::Number<std::uint32_t> maximum_vertices, trimkit::Number<std::uint32_t> resolution,
+                            trimkit::Number<double> maximum_error) {
     const trimkit::In<double, -1, 3> vertices = trimkit::read(vertices_argument, "vertices");
     check_parameters(maximum_hulls, maximum_vertices, resolution, maximum_error);
     // everything else stays V-HACD's own default, its thread pool included
@@ -83,9 +84,7 @@ Hulls decompose(const trimkit::Array<double, -1, 3>& vertices_argument,
     const std::vector<std::uint32_t> triangles =
         trimkit::read_indices<std::uint32_t>(faces_argument, "faces", vertex_count);
 
-    // the hulls, then the outputs at exactly their size: every hull's
-    // vertices one after another, its faces indexing them per hull
-    std::vector<VHACD::IVHACD::ConvexHull> hulls;
+    std::vector<Hull> hulls;
     bool interrupted = false;
     // a decomposition needs a volume: skip input V-HACD can't handle
     if (!triangles.empty() && vertex_count > 3) {
@@ -97,44 +96,34 @@ Hulls decompose(const trimkit::Array<double, -1, 3>& vertices_argument,
                        static_cast<std::uint32_t>(triangles.size() / 3), parameters);
         interrupted = progress.interrupt.interrupted();
         hulls.resize(interrupted ? 0 : vhacd->GetNConvexHulls());
+        VHACD::IVHACD::ConvexHull computed;
         for (std::uint32_t h = 0; h < hulls.size(); h++) {
-            vhacd->GetConvexHull(h, hulls[h]);
+            vhacd->GetConvexHull(h, computed);
+            hulls[h].vertices.resize(3 * computed.m_points.size());
+            for (std::size_t i = 0; i < computed.m_points.size(); i++) {
+                hulls[h].vertices[(3 * i) + 0] = computed.m_points[i].mX;
+                hulls[h].vertices[(3 * i) + 1] = computed.m_points[i].mY;
+                hulls[h].vertices[(3 * i) + 2] = computed.m_points[i].mZ;
+            }
+            hulls[h].faces.resize(3 * computed.m_triangles.size());
+            for (std::size_t i = 0; i < computed.m_triangles.size(); i++) {
+                hulls[h].faces[(3 * i) + 0] = computed.m_triangles[i].mI0;
+                hulls[h].faces[(3 * i) + 1] = computed.m_triangles[i].mI1;
+                hulls[h].faces[(3 * i) + 2] = computed.m_triangles[i].mI2;
+            }
         }
     }
     if (interrupted) {
         throw nb::python_error();
     }
-    std::vector<std::int64_t> vertex_offsets(hulls.size() + 1, 0);
-    std::vector<std::int64_t> face_offsets(hulls.size() + 1, 0);
-    for (std::size_t h = 0; h < hulls.size(); h++) {
-        vertex_offsets[h + 1] = vertex_offsets[h] + static_cast<std::int64_t>(hulls[h].m_points.size());
-        face_offsets[h + 1] = face_offsets[h] + static_cast<std::int64_t>(hulls[h].m_triangles.size());
+    nb::list meshes;
+    for (Hull& hull : hulls) {
+        const std::size_t vertex_rows = hull.vertices.size() / 3;
+        const std::size_t face_rows = hull.faces.size() / 3;
+        meshes.append(nb::make_tuple(trimkit::to_numpy(std::move(hull.vertices), {vertex_rows, 3}),
+                                     trimkit::to_numpy(std::move(hull.faces), {face_rows, 3})));
     }
-    const auto point_count = static_cast<std::size_t>(vertex_offsets.back());
-    const auto triangle_count = static_cast<std::size_t>(face_offsets.back());
-    std::vector<double> points(3 * point_count);
-    std::vector<std::int64_t> indices(3 * triangle_count);
-    for (std::size_t h = 0; h < hulls.size(); h++) {
-        double* point = points.data() + (3 * vertex_offsets[h]);
-        for (const VHACD::Vertex& vertex : hulls[h].m_points) {
-            point[0] = vertex.mX;
-            point[1] = vertex.mY;
-            point[2] = vertex.mZ;
-            point += 3;
-        }
-        std::int64_t* face = indices.data() + (3 * face_offsets[h]);
-        for (const VHACD::Triangle& triangle : hulls[h].m_triangles) {
-            face[0] = triangle.mI0;
-            face[1] = triangle.mI1;
-            face[2] = triangle.mI2;
-            face += 3;
-        }
-    }
-    const std::size_t offset_count = vertex_offsets.size();
-    return {trimkit::to_numpy(std::move(points), {point_count, 3}),
-            trimkit::to_numpy(std::move(indices), {triangle_count, 3}),
-            trimkit::to_numpy(std::move(vertex_offsets), {offset_count}),
-            trimkit::to_numpy(std::move(face_offsets), {offset_count})};
+    return meshes;
 }
 
 }  // namespace
@@ -163,14 +152,9 @@ maximum_error : float
 
 Returns
 -------
-vertices : (N, 3) float64
-  Every hull's vertices, stacked.
-faces : (F, 3) int64
-  Every hull's triangles, indexing that hull's own vertices.
-vertex_offsets : (h + 1,) int64
-  Where each hull's vertices start in `vertices`.
-face_offsets : (h + 1,) int64
-  Where each hull's faces start in `faces`.
+hulls : list of Mesh
+  One closed convex (vertices, faces) per hull, as `RayScene` and
+  `CollisionScene` take them: empty for input with no volume.
 
 Examples
 --------
@@ -179,7 +163,8 @@ Examples
 >>> cube = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)])
 >>> faces = np.array([[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1],
 ...                   [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]], dtype=np.int64)
->>> vertices, faces, vertex_offsets, face_offsets = trimkit.decompose(cube, faces, maximum_hulls=1)
->>> vertex_offsets.tolist(), face_offsets.tolist()
-([0, 8], [0, 12]))");
+>>> hulls = trimkit.decompose(cube, faces, maximum_hulls=1)
+>>> vertices, faces = hulls[0]
+>>> len(hulls), len(vertices), len(faces)
+(1, 8, 12))");
 }

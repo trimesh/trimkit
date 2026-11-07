@@ -5,10 +5,10 @@ trimkit.toml, into README.md, between the `<!-- api:start -->` and
 
 The stubs are generated from the compiled extension by `nanobind.stubgen`, so
 the C++ bindings stay the one description of the API: this only reformats
-them, as a table of every public name with its docstring's summary and the
-call its numpydoc `Examples` section makes, then a table of the enums with
-their members. Every callable's docstring must have `Parameters` matching
-its signature, a `Returns` section and an `Examples` section, or rendering
+them, as one table of every public name with its docstring's summary over the
+call its numpydoc `Examples` section makes, or an enum's members. Every
+callable's docstring must have `Parameters` matching its signature, a `Returns`
+section and an `Examples` section assigning exactly those names, or rendering
 fails.
 
 `write` rewrites the README block (`uv run scripts generate`), and `check`
@@ -30,8 +30,8 @@ START, END = "<!-- api:start -->", "<!-- api:end -->"
 
 def returns(doc: str, name: str) -> str:
     """
-    The result names from a numpydoc `Returns` section, as `name` or
-    `(a, b, c)`: every documented callable must name what it returns.
+    The result names from a numpydoc `Returns` section, as `a, b, c`: every
+    documented callable must name what it returns.
     """
     match = re.search(r"Returns\n-+\n(.*?)(\n\S[^\n]*\n-+\n|\Z)", doc, re.S)
     if match is None:
@@ -39,7 +39,7 @@ def returns(doc: str, name: str) -> str:
     names = re.findall(r"^(\w+) :", match[1], re.M)
     if not names:
         raise ValueError(f"{name}: its Returns section names nothing")
-    return names[0] if len(names) == 1 else "(" + ", ".join(names) + ")"
+    return ", ".join(names)
 
 
 def check_parameters(function: ast.FunctionDef, doc: str, name: str) -> None:
@@ -58,11 +58,14 @@ def check_parameters(function: ast.FunctionDef, doc: str, name: str) -> None:
 def check_documented(
     function: ast.FunctionDef, name: str, constructor: bool, documentation: str | None = None
 ) -> None:
-    # Parameters match the signature, and all but a constructor name what they return
+    # Parameters match the signature, and all but a constructor name what they
+    # return, which their example assigns: doctests run it, so the names can't drift
     doc = (documentation if constructor else ast.get_docstring(function)) or ""
     check_parameters(function, doc, name)
     if not constructor:
-        returns(doc, name)
+        documented = returns(doc, name)
+        if not example(doc, name).startswith(f"{documented} = "):
+            raise ValueError(f"{name}: its example must assign `{documented} = `, what Returns names")
 
 
 def first_line(doc: str | None) -> str:
@@ -72,8 +75,8 @@ def first_line(doc: str | None) -> str:
 
 def example(doc: str, name: str) -> str:
     """
-    The call an `Examples` section makes: its last `>>>` line calling `name`
-    (a method or property by its own name), else its last naming it. Every
+    The call an `Examples` section makes: its first `>>>` line calling `name`
+    (a method or property by its own name), else its first naming it. Every
     public callable has one.
     """
     match = re.search(r"Examples\n-+\n(.*)", doc, re.S)
@@ -84,7 +87,7 @@ def example(doc: str, name: str) -> str:
     ]
     if not named:
         raise ValueError(f"{name}: its docstring has no Examples section calling it")
-    return named[-1]
+    return named[0]
 
 
 def attributes(doc: str) -> dict[str, str]:
@@ -100,12 +103,12 @@ def attributes(doc: str) -> dict[str, str]:
     return found
 
 
-def row(name: str, summary: str, call: str) -> str:
-    return f"| `trimkit.{name}` | {summary} | {f'`{call}`' if call else ''} |"
+def row(name: str, summary: str, detail: str) -> str:
+    return f"| `{name}` | {summary}<br>`{detail}` |"
 
 
 def rows(path, prefix: str) -> list[str]:
-    # one row per callable, method and described name a stub file holds
+    # one row per callable, method, enum and described name a stub file holds
     tree = ast.parse(path.read_text())
     module = ast.get_docstring(tree) or ""
     lines = []
@@ -114,9 +117,11 @@ def rows(path, prefix: str) -> list[str]:
             doc = ast.get_docstring(node) or ""
             check_documented(node, node.name, False)
             lines.append(row(prefix + node.name, first_line(doc), example(doc, node.name)))
-        elif isinstance(node, ast.ClassDef) and not any(
-            ast.unparse(b).endswith("IntEnum") for b in node.bases
-        ):
+        elif isinstance(node, ast.ClassDef) and any(ast.unparse(b).endswith("IntEnum") for b in node.bases):
+            members = [n.targets[0].id for n in node.body if isinstance(n, ast.Assign)]
+            members += [n.target.id for n in node.body if isinstance(n, ast.AnnAssign)]
+            lines.append(row(prefix + node.name, first_line(ast.get_docstring(node)), ", ".join(members)))
+        elif isinstance(node, ast.ClassDef):
             doc = ast.get_docstring(node) or ""
             init = next(
                 (n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None
@@ -128,29 +133,20 @@ def rows(path, prefix: str) -> list[str]:
                 if isinstance(method, ast.FunctionDef) and not method.name.startswith("_"):
                     name = f"{node.name}.{method.name}"
                     method_doc = ast.get_docstring(method) or ""
-                    if not any(ast.unparse(d) == "property" for d in method.decorator_list):
-                        check_documented(method, name, False)
+                    check_documented(method, name, False)
                     lines.append(row(prefix + name, first_line(method_doc), example(method_doc, name)))
     # names that are no callable, which the module's Attributes section describes:
-    # all but the submodule and the enums, which have a table of their own
+    # all but the submodule and the classes already above
+    classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
     for name, text in attributes(module).items():
-        if name != "exchange" and not name.endswith("Kind"):
+        if name != "exchange" and name not in classes:
             lines.append(row(prefix + name, text, example(module, name)))
     return lines
 
 
 def render() -> str:
-    lines = ["| `trimkit.X` | what it is | example |", "|---|---|---|"]
+    lines = ["| `trimkit.` | what it is |", "|---|---|"]
     lines += rows(STUBS / "__init__.pyi", "") + rows(STUBS / "exchange.pyi", "exchange.")
-    lines += ["", "| `trimkit.exchange.X` | what it is | members |", "|---|---|---|"]
-    for node in ast.parse((STUBS / "exchange.pyi").read_text()).body:
-        if isinstance(node, ast.ClassDef) and any(ast.unparse(b).endswith("IntEnum") for b in node.bases):
-            members = [n.targets[0].id for n in node.body if isinstance(n, ast.Assign)]
-            members += [n.target.id for n in node.body if isinstance(n, ast.AnnAssign)]
-            names = ", ".join(f"`{m}`" for m in members)
-            lines.append(
-                f"| `trimkit.exchange.{node.name}` | {first_line(ast.get_docstring(node))} | {names} |"
-            )
     return "\n".join(lines) + "\n"
 
 

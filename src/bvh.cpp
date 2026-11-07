@@ -850,7 +850,8 @@ Examples
 >>> import trimkit
 >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> trimkit.RayScene([(triangle, faces)]).boxes().bounds.tolist()
+>>> boxes = trimkit.RayScene([(triangle, faces)]).boxes()
+>>> boxes.bounds.tolist()
 [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]])")
         .def("intersect_first", &RayScene::intersect_first, nb::arg("origins"), nb::arg("directions"),
              nb::arg("instance_matrices").none() = nb::none(), nb::arg("instance_index").none() = nb::none(),
@@ -885,8 +886,8 @@ Examples
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
 >>> scene = trimkit.RayScene([(triangle, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
->>> instances, hit, distances = scene.intersect_first(origins, directions)
->>> instances.tolist(), hit.tolist(), distances.tolist()
+>>> instances, faces, distances = scene.intersect_first(origins, directions)
+>>> instances.tolist(), faces.tolist(), distances.tolist()
 ([0], [0], [1.0]))")
         .def("intersect_all", &RayScene::intersect_all, nb::arg("origins"), nb::arg("directions"),
              nb::arg("instance_matrices").none() = nb::none(), nb::arg("instance_index").none() = nb::none(),
@@ -925,7 +926,7 @@ Examples
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
 >>> scene = trimkit.RayScene([(triangle, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
->>> rays, instances, hit, distances = scene.intersect_all(origins, directions)
+>>> rays, instances, faces, distances = scene.intersect_all(origins, directions)
 >>> rays.tolist(), distances.tolist()
 ([0], [1.0]))")
         .def("intersect_any", &RayScene::intersect_any, nb::arg("origins"), nb::arg("directions"),
@@ -957,7 +958,8 @@ Examples
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
 >>> scene = trimkit.RayScene([(triangle, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
->>> scene.intersect_any(origins, directions).tolist()
+>>> hits = scene.intersect_any(origins, directions)
+>>> hits.tolist()
 [True])");
 
     nb::class_<Boxes>(m, "Boxes",
@@ -974,8 +976,8 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
->>> len(boxes)
+>>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+>>> len(tree)
 2)")
         .def(nb::init<const BoundsArg&>(), nb::arg("boxes"))
         .def("__len__", &Boxes::size, R"(How many boxes it holds.
@@ -997,8 +999,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
->>> boxes.bounds.tolist()
+>>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+>>> bounds = tree.bounds
+>>> bounds.tolist()
 [[0.0, 0.0], [3.0, 3.0]])")
         .def("boxes", &Boxes::boxes,
              R"(Every box, exactly as given.
@@ -1012,8 +1015,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
->>> boxes.boxes().shape
+>>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+>>> boxes = tree.boxes()
+>>> boxes.shape
 (2, 2, 2))")
         .def("intersect", &Boxes::intersect, nb::arg("queries"),
              R"(Every box overlapping each query box, touching included.
@@ -1033,7 +1037,8 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
->>> boxes.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
+>>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+>>> pairs = tree.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]]))
+>>> pairs.tolist()
 [[0, 0], [0, 1]])");
 }

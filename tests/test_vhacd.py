@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from helpers import box, is_closed, volume
+from helpers import box, is_closed, leaves, volume
 
 import trimkit
 
@@ -13,15 +13,14 @@ def l_shape():
     return np.vstack([a[0], b[0]]), np.vstack([a[1], b[1] + len(a[0])])
 
 
-def check_hulls(mesh, vertices, faces, vertex_offsets, face_offsets):
-    # every hull is a closed convex surface wound outward, and together they
-    # cover the mesh's volume
-    assert vertex_offsets[0] == face_offsets[0] == 0
-    assert vertex_offsets[-1] == len(vertices) and face_offsets[-1] == len(faces)
+def check_hulls(mesh, hulls):
+    # a list of (vertices, faces) tuples: every hull is a closed convex surface
+    # wound outward, and together they cover the mesh's volume
+    assert type(hulls) is list
     total = 0.0
-    for hull in range(len(vertex_offsets) - 1):
-        v = vertices[vertex_offsets[hull] : vertex_offsets[hull + 1]]
-        f = faces[face_offsets[hull] : face_offsets[hull + 1]]
+    for hull in hulls:
+        assert type(hull) is tuple
+        v, f = hull
         assert f.min() >= 0 and f.max() < len(v)
         assert is_closed(f)
         # convex and outward: every vertex is behind every face plane
@@ -34,9 +33,22 @@ def check_hulls(mesh, vertices, faces, vertex_offsets, face_offsets):
 
 @pytest.mark.parametrize("mesh", [box(), l_shape()])
 def test_hulls_closed_convex_covering(mesh):
-    result = trimkit.decompose(*mesh, resolution=100_000)
-    assert len(result[2]) >= 2
-    check_hulls(mesh, *result)
+    check_hulls(mesh, trimkit.decompose(*mesh, resolution=100_000))
+
+
+def test_how_many_hulls():
+    assert [(len(v), len(f)) for v, f in trimkit.decompose(*box(), resolution=100_000)] == [(8, 12)]
+    assert len(trimkit.decompose(*l_shape(), resolution=100_000)) >= 2
+
+
+def test_hulls_go_straight_into_the_scenes():
+    # a hull is a Mesh, so the result is what the scenes take
+    hulls = trimkit.decompose(*box(), resolution=100_000)
+    origins, directions = np.array([[0.5, 0.5, 5.0]]), np.array([[0.0, 0.0, -1.0]])
+    instances, _, distances = trimkit.RayScene(hulls).intersect_first(origins, directions)
+    assert instances.tolist() == [0]
+    assert distances == pytest.approx([4.0])
+    assert trimkit.CollisionScene(hulls, convex=True).boxes().bounds.tolist() == [[0, 0, 0], [1, 1, 1]]
 
 
 def test_threads_change_nothing():
@@ -44,7 +56,7 @@ def test_threads_change_nothing():
     mesh = l_shape()
     first = trimkit.decompose(*mesh, resolution=50_000)
     for _ in range(3):
-        for a, b in zip(trimkit.decompose(*mesh, resolution=50_000), first, strict=True):
+        for a, b in zip(leaves(trimkit.decompose(*mesh, resolution=50_000)), leaves(first), strict=True):
             assert np.array_equal(a, b)
 
 
@@ -52,15 +64,15 @@ def test_a_coarser_error_is_no_more_hulls():
     mesh = l_shape()
     fine = trimkit.decompose(*mesh, resolution=50_000, maximum_error=0.1)
     coarse = trimkit.decompose(*mesh, resolution=50_000, maximum_error=10.0)
-    check_hulls(mesh, *coarse)
-    assert len(coarse[2]) <= len(fine[2])
+    check_hulls(mesh, coarse)
+    assert len(coarse) <= len(fine)
 
 
 def test_caps_hold():
     mesh = l_shape()
-    _, _, vertex_offsets, _ = trimkit.decompose(*mesh, resolution=50_000, maximum_hulls=1, maximum_vertices=8)
-    assert len(vertex_offsets) - 1 == 1
-    assert np.diff(vertex_offsets).max() <= 8
+    hulls = trimkit.decompose(*mesh, resolution=50_000, maximum_hulls=1, maximum_vertices=8)
+    assert len(hulls) == 1
+    assert len(hulls[0][0]) <= 8
 
 
 def test_bad_input():
@@ -80,11 +92,7 @@ def test_bad_input():
         with pytest.raises(ValueError):
             trimkit.decompose(vertices, faces, **bad)
     # empty input decomposes to nothing rather than crashing
-    vertices, faces, vertex_offsets, face_offsets = trimkit.decompose(
-        np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
-    )
-    assert len(vertices) == len(faces) == 0
-    assert vertex_offsets.tolist() == face_offsets.tolist() == [0]
+    assert trimkit.decompose(np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)) == []
 
 
 def test_everything_welded_away():
@@ -93,5 +101,4 @@ def test_everything_welded_away():
     # cast the NaN to size_t (vendor/patches/vhacd-empty-volume.patch)
     vertices = np.array([[0, 0, 0], [1e-7, 0, 0], [0, 1e-7, 0], [0, 0, 1e-7], [1, 1, 1]], dtype=np.float64)
     faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
-    _, _, vertex_offsets, _ = trimkit.decompose(vertices, faces)
-    assert len(vertex_offsets) - 1 == 0
+    assert trimkit.decompose(vertices, faces) == []

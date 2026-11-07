@@ -368,7 +368,7 @@ Examples
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
 >>> kinds = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
 >>> buffer = np.frombuffer(trimkit.exchange.draco_encode(faces, [triangle.astype(np.float32)], kinds), np.uint8)
->>> decoded, (positions,) = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
->>> decoded.tolist(), positions.tolist()
+>>> faces, attributes = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
+>>> faces.tolist(), attributes[0].tolist()
 ([[0, 1, 2]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))");
 }

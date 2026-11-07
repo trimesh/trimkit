@@ -173,7 +173,7 @@ def leaves(result) -> list:
     """
     Every array, bytes, str, int or float in a result, in a fixed order.
     """
-    if isinstance(result, tuple):
+    if isinstance(result, (tuple, list)):
         return [a for r in result for a in leaves(r)]
     assert isinstance(result, (np.ndarray, bytes, str, int, float)), type(result)
     return [result]

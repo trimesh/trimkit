@@ -11,8 +11,9 @@ Attributes
 __version__ : str
   This package's version.
 Mesh : TypeAlias
-  A triangle mesh as the scenes take it: a (vertices, faces) tuple of (n, 3)
-  float64 vertices and (m, 3) int64 triangle indices into them.
+  A triangle mesh as the scenes take it and `decompose` returns it: a
+  (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle
+  indices into them.
 exchange : module
   Reading and writing data formats: draco and SVG paths.
 
@@ -111,7 +112,8 @@ class RayScene:
         >>> import trimkit
         >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
-        >>> trimkit.RayScene([(triangle, faces)]).boxes().bounds.tolist()
+        >>> boxes = trimkit.RayScene([(triangle, faces)]).boxes()
+        >>> boxes.bounds.tolist()
         [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]
         """
 
@@ -148,8 +150,8 @@ class RayScene:
         >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
         >>> scene = trimkit.RayScene([(triangle, faces)])
         >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
-        >>> instances, hit, distances = scene.intersect_first(origins, directions)
-        >>> instances.tolist(), hit.tolist(), distances.tolist()
+        >>> instances, faces, distances = scene.intersect_first(origins, directions)
+        >>> instances.tolist(), faces.tolist(), distances.tolist()
         ([0], [0], [1.0])
         """
 
@@ -190,7 +192,7 @@ class RayScene:
         >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
         >>> scene = trimkit.RayScene([(triangle, faces)])
         >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
-        >>> rays, instances, hit, distances = scene.intersect_all(origins, directions)
+        >>> rays, instances, faces, distances = scene.intersect_all(origins, directions)
         >>> rays.tolist(), distances.tolist()
         ([0], [1.0])
         """
@@ -224,7 +226,8 @@ class RayScene:
         >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
         >>> scene = trimkit.RayScene([(triangle, faces)])
         >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
-        >>> scene.intersect_any(origins, directions).tolist()
+        >>> hits = scene.intersect_any(origins, directions)
+        >>> hits.tolist()
         [True]
         """
 
@@ -243,8 +246,8 @@ class Boxes:
     --------
     >>> import numpy as np
     >>> import trimkit
-    >>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
-    >>> len(boxes)
+    >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+    >>> len(tree)
     2
     """
 
@@ -275,8 +278,9 @@ class Boxes:
         --------
         >>> import numpy as np
         >>> import trimkit
-        >>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
-        >>> boxes.bounds.tolist()
+        >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+        >>> bounds = tree.bounds
+        >>> bounds.tolist()
         [[0.0, 0.0], [3.0, 3.0]]
         """
 
@@ -293,8 +297,9 @@ class Boxes:
         --------
         >>> import numpy as np
         >>> import trimkit
-        >>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
-        >>> boxes.boxes().shape
+        >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+        >>> boxes = tree.boxes()
+        >>> boxes.shape
         (2, 2, 2)
         """
 
@@ -317,8 +322,9 @@ class Boxes:
         --------
         >>> import numpy as np
         >>> import trimkit
-        >>> boxes = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
-        >>> boxes.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
+        >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+        >>> pairs = tree.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]]))
+        >>> pairs.tolist()
         [[0, 0], [0, 1]]
         """
 
@@ -351,7 +357,7 @@ def triangulate(exterior: Annotated[NDArray[numpy.float64], dict(shape=(None, 2)
     [[2, 3, 0], [2, 0, 1]]
     """
 
-def decompose(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], *, maximum_hulls: int | numpy.integer = 64, maximum_vertices: int | numpy.integer = 64, resolution: int | numpy.integer = 400000, maximum_error: float | numpy.floating = 1.0) -> tuple[NDArray[numpy.float64], NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.int64]]:
+def decompose(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], *, maximum_hulls: int | numpy.integer = 64, maximum_vertices: int | numpy.integer = 64, resolution: int | numpy.integer = 400000, maximum_error: float | numpy.floating = 1.0) -> list[Mesh]:
     """
     Decompose a closed triangle mesh into approximately convex hulls.
 
@@ -374,14 +380,9 @@ def decompose(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), 
 
     Returns
     -------
-    vertices : (N, 3) float64
-      Every hull's vertices, stacked.
-    faces : (F, 3) int64
-      Every hull's triangles, indexing that hull's own vertices.
-    vertex_offsets : (h + 1,) int64
-      Where each hull's vertices start in `vertices`.
-    face_offsets : (h + 1,) int64
-      Where each hull's faces start in `faces`.
+    hulls : list of Mesh
+      One closed convex (vertices, faces) per hull, as `RayScene` and
+      `CollisionScene` take them: empty for input with no volume.
 
     Examples
     --------
@@ -390,9 +391,10 @@ def decompose(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), 
     >>> cube = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)])
     >>> faces = np.array([[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1],
     ...                   [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]], dtype=np.int64)
-    >>> vertices, faces, vertex_offsets, face_offsets = trimkit.decompose(cube, faces, maximum_hulls=1)
-    >>> vertex_offsets.tolist(), face_offsets.tolist()
-    ([0, 8], [0, 12])
+    >>> hulls = trimkit.decompose(cube, faces, maximum_hulls=1)
+    >>> vertices, faces = hulls[0]
+    >>> len(hulls), len(vertices), len(faces)
+    (1, 8, 12)
     """
 
 def parametrize(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 3), order='C', device='cpu', writable=False)]) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
@@ -421,7 +423,7 @@ def parametrize(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3)
     >>> import trimkit
     >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
-    >>> vertex_sources, chart_faces, uv = trimkit.parametrize(triangle, faces)
+    >>> vertex_sources, faces, uv = trimkit.parametrize(triangle, faces)
     >>> vertex_sources.tolist(), uv.shape
     ([0, 1, 2], (3, 2))
     """
@@ -463,8 +465,8 @@ def simplify(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), o
     >>> import trimkit
     >>> tetrahedron = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     >>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
-    >>> kept_vertices, kept, vertex_sources = trimkit.simplify(tetrahedron, faces, 4)
-    >>> len(kept), bool((kept_vertices == tetrahedron[vertex_sources]).all())
+    >>> vertices, faces, vertex_sources = trimkit.simplify(tetrahedron, faces, 4)
+    >>> len(faces), bool((vertices == tetrahedron[vertex_sources]).all())
     (4, True)
     """
 
@@ -553,7 +555,8 @@ class CollisionScene:
         >>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
         >>> scene = trimkit.CollisionScene([(tetrahedron, faces)], convex=True)
         >>> placed = np.tile(np.eye(4), (2, 1, 1))
-        >>> scene.boxes().bounds.tolist()
+        >>> boxes = scene.boxes()
+        >>> boxes.bounds.tolist()
         [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
         """
 
@@ -590,7 +593,8 @@ class CollisionScene:
         >>> scene = trimkit.CollisionScene([(tetrahedron, faces)], convex=True)
         >>> placed = np.tile(np.eye(4), (2, 1, 1))
         >>> placed[1, 0, 3] = 0.5
-        >>> scene.collides(placed, np.zeros(2, dtype=np.int64)).tolist()
+        >>> pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))
+        >>> pairs.tolist()
         [[0, 1]]
         """
 

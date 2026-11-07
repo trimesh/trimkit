@@ -377,14 +377,15 @@ def test_arrays_are_never_converted(name):
 
 def _results(result) -> list:
     # what a call answers, comparable: its arrays, bytes, strings and numbers
-    if isinstance(result, tuple):
+    if isinstance(result, (tuple, list)):
         return [r for item in result for r in _results(item)]
     if isinstance(result, trimkit.Boxes):
         return [result.boxes()]
     # what a scene holds, so its constructor's layouts are compared too
     if isinstance(result, (trimkit.RayScene, trimkit.CollisionScene)):
         return [result.boxes().boxes()]
-    return [result] if isinstance(result, (np.ndarray, bytes, str, int, float)) else []
+    assert isinstance(result, (np.ndarray, bytes, str, int, float)), type(result)
+    return [result]
 
 
 @pytest.mark.parametrize("name", API)
@@ -789,7 +790,7 @@ def test_numpy_scalars_are_python_scalars(name):
             with pytest.raises(TypeError):
                 call(scalar)
             continue
-        for got, same in zip(call(scalar), expected, strict=True):
+        for got, same in zip(_results(call(scalar)), _results(expected), strict=True):
             assert np.array_equal(got, same, equal_nan=True) if isinstance(got, np.ndarray) else got == same
 
 

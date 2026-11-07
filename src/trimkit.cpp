@@ -20,8 +20,9 @@ Attributes
 __version__ : str
   This package's version.
 Mesh : TypeAlias
-  A triangle mesh as the scenes take it: a (vertices, faces) tuple of (n, 3)
-  float64 vertices and (m, 3) int64 triangle indices into them.
+  A triangle mesh as the scenes take it and `decompose` returns it: a
+  (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle
+  indices into them.
 exchange : module
   Reading and writing data formats: draco and SVG paths.
 
@@ -56,11 +57,7 @@ SvgKind : enum.IntEnum
   What drew an SvgSegment, its `kind` field.
 SvgSegment : numpy.dtype
   One drawing command of an SVG path, as `svg_parse` returns them and
-  `svg_string` takes them: its `kind` (an `SvgKind`), whether it
-  `closes` its subpath, its `points` (vertex indices: start, a curve's
-  first control point or an arc's center, a cubic's second control point
-  or the point halfway along an arc, end; -1 where unused), and an arc's
-  `radius`, `rotation` and `angles`.
+  `svg_string` takes them.
 
 Examples
 --------

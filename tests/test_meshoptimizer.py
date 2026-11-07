@@ -69,11 +69,11 @@ def test_any_position_and_scale(offset, extent):
 def test_nothing_to_do():
     vertices, faces = box()
     # a target above the input keeps it, a soup has no shared edges to collapse
-    _, kept, _ = trimkit.simplify(vertices, faces, 1000)
-    assert len(kept) == len(faces)
+    _, kept_faces, _ = trimkit.simplify(vertices, faces, 1000)
+    assert len(kept_faces) == len(faces)
     soup = vertices[faces].reshape((-1, 3))
-    _, kept, _ = trimkit.simplify(soup, np.arange(len(soup), dtype=np.int64).reshape((-1, 3)), 1)
-    assert len(kept) == len(faces)
+    _, kept_faces, _ = trimkit.simplify(soup, np.arange(len(soup), dtype=np.int64).reshape((-1, 3)), 1)
+    assert len(kept_faces) == len(faces)
 
 
 def test_bad_input():

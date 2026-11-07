@@ -129,7 +129,7 @@ Examples
 >>> import trimkit
 >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> vertex_sources, chart_faces, uv = trimkit.parametrize(triangle, faces)
+>>> vertex_sources, faces, uv = trimkit.parametrize(triangle, faces)
 >>> vertex_sources.tolist(), uv.shape
 ([0, 1, 2], (3, 2)))");
 }

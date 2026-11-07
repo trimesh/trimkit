@@ -178,6 +178,7 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("M 0 0 L 1 1 Z"))
+>>> path = trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("M 0 0 L 1 1 Z"))
+>>> path
 'M0 0 L1 1 Z')");
 }

@@ -107,13 +107,7 @@ def vhacd_new(mesh, **kwargs):
     import trimkit
 
     kwargs = {_VHACD_NAMES[k]: v for k, v in kwargs.items() if k in _VHACD_NAMES}
-    vertices, faces, vertex_offsets, face_offsets = trimkit.decompose(mesh.vertices, mesh.faces, **kwargs)
-    return [
-        {"vertices": v, "faces": f}
-        for v, f in zip(
-            np.split(vertices, vertex_offsets[1:-1]), np.split(faces, face_offsets[1:-1]), strict=True
-        )
-    ]
+    return [{"vertices": v, "faces": f} for v, f in trimkit.decompose(mesh.vertices, mesh.faces, **kwargs)]
 
 
 def _covered(hulls, points, tol):

@@ -700,7 +700,8 @@ Examples
 >>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
 >>> scene = trimkit.CollisionScene([(tetrahedron, faces)], convex=True)
 >>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> scene.boxes().bounds.tolist()
+>>> boxes = scene.boxes()
+>>> boxes.bounds.tolist()
 [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])")
         .def("collides", &CollisionScene::collides, nb::arg("instance_matrices").none() = nb::none(),
              nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),
@@ -736,7 +737,8 @@ Examples
 >>> scene = trimkit.CollisionScene([(tetrahedron, faces)], convex=True)
 >>> placed = np.tile(np.eye(4), (2, 1, 1))
 >>> placed[1, 0, 3] = 0.5
->>> scene.collides(placed, np.zeros(2, dtype=np.int64)).tolist()
+>>> pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))
+>>> pairs.tolist()
 [[0, 1]])")
         .def("distances", &CollisionScene::distances, nb::arg("instance_matrices").none() = nb::none(),
              nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),

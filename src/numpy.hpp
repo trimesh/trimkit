@@ -316,6 +316,8 @@ struct MeshArgument {
 
 // how a sequence of meshes reads in a signature: `Sequence[Mesh]`
 using Meshes = nb::typed<nb::sequence, MeshArgument>;
+// and a list of fresh meshes as a result: `list[Mesh]`
+using MeshOuts = nb::typed<nb::list, MeshArgument>;
 
 // a mesh as read: its vertices in place, its faces as a library's indices
 template <typename Index>

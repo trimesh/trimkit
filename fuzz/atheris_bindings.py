@@ -48,8 +48,8 @@ def indices(data: atheris.FuzzedDataProvider, count: int) -> np.ndarray:
 
 
 def check(result) -> None:
-    # every array, however deeply nested in tuples, is fresh: writable and C-contiguous
-    if isinstance(result, tuple):
+    # every array, however deeply nested, is fresh: writable and C-contiguous
+    if isinstance(result, (tuple, list)):
         for item in result:
             check(item)
     elif isinstance(result, np.ndarray):
@@ -106,6 +106,8 @@ def case_vhacd(data: atheris.FuzzedDataProvider):
         maximum_error=data.ConsumeFloat(),
         maximum_vertices=data.ConsumeIntInRange(0, 64),
     )
+    for hull_vertices, hull_faces in result:
+        assert hull_faces.max(initial=-1) < len(hull_vertices)
     return result
 
 

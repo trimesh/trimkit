@@ -9,11 +9,7 @@ SvgKind : enum.IntEnum
   What drew an SvgSegment, its `kind` field.
 SvgSegment : numpy.dtype
   One drawing command of an SVG path, as `svg_parse` returns them and
-  `svg_string` takes them: its `kind` (an `SvgKind`), whether it
-  `closes` its subpath, its `points` (vertex indices: start, a curve's
-  first control point or an arc's center, a cubic's second control point
-  or the point halfway along an arc, end; -1 where unused), and an arc's
-  `radius`, `rotation` and `angles`.
+  `svg_string` takes them.
 
 Examples
 --------
@@ -138,8 +134,8 @@ def draco_decode(buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), ord
     >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
     >>> kinds = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
     >>> buffer = np.frombuffer(trimkit.exchange.draco_encode(faces, [triangle.astype(np.float32)], kinds), np.uint8)
-    >>> decoded, (positions,) = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
-    >>> decoded.tolist(), positions.tolist()
+    >>> faces, attributes = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
+    >>> faces.tolist(), attributes[0].tolist()
     ([[0, 1, 2]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     """
 
@@ -242,6 +238,7 @@ def svg_string(vertices: numpy.typing.NDArray[numpy.float64], segments: numpy.ty
     --------
     >>> import numpy as np
     >>> import trimkit
-    >>> trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("M 0 0 L 1 1 Z"))
+    >>> path = trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("M 0 0 L 1 1 Z"))
+    >>> path
     'M0 0 L1 1 Z'
     """
