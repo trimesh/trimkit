@@ -825,9 +825,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> scene = trimkit.RayScene([(triangle, faces)])
+>>> scene = trimkit.RayScene([(vertices, faces)])
 >>> len(scene)
 1)")
         .def(nb::init<const trimkit::Meshes&>(), nb::arg("meshes"))
@@ -860,9 +860,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> boxes = trimkit.RayScene([(triangle, faces)]).boxes()
+>>> boxes = trimkit.RayScene([(vertices, faces)]).boxes()
 >>> boxes.bounds.tolist()
 [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]])")
         .def("intersect_first", &RayScene::intersect_first, nb::arg("origins"), nb::arg("directions"),
@@ -894,9 +894,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> scene = trimkit.RayScene([(triangle, faces)])
+>>> scene = trimkit.RayScene([(vertices, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
 >>> instances, faces, distances = scene.intersect_first(origins, directions)
 >>> instances.tolist(), faces.tolist(), distances.tolist()
@@ -934,9 +934,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> scene = trimkit.RayScene([(triangle, faces)])
+>>> scene = trimkit.RayScene([(vertices, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
 >>> rays, instances, faces, distances = scene.intersect_all(origins, directions)
 >>> rays.tolist(), distances.tolist()
@@ -966,9 +966,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
->>> scene = trimkit.RayScene([(triangle, faces)])
+>>> scene = trimkit.RayScene([(vertices, faces)])
 >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
 >>> hits = scene.intersect_any(origins, directions)
 >>> hits.tolist()

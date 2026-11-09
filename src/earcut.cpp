@@ -124,8 +124,8 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> square = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
->>> vertices, faces = trimkit.triangulate(square)
+>>> exterior = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+>>> vertices, faces = trimkit.triangulate(exterior)
 >>> faces.tolist()
 [[2, 3, 0], [2, 0, 1]])");
 }

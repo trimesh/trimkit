@@ -160,10 +160,10 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> cube = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)])
+>>> vertices = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)])
 >>> faces = np.array([[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1],
 ...                   [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]], dtype=np.int64)
->>> hulls = trimkit.decompose(cube, faces, maximum_hulls=1)
+>>> hulls = trimkit.decompose(vertices, faces, maximum_hulls=1)
 >>> vertices, faces = hulls[0]
 >>> len(hulls), len(vertices), len(faces)
 (1, 8, 12))");

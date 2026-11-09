@@ -135,9 +135,9 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> tetrahedron = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 >>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> vertices, faces, vertex_sources = trimkit.simplify(tetrahedron, faces, 4)
->>> len(faces), bool((vertices == tetrahedron[vertex_sources]).all())
-(4, True))");
+>>> vertices, faces, vertex_sources = trimkit.simplify(vertices, faces, 4)
+>>> len(faces), sorted(vertex_sources.tolist())
+(4, [0, 1, 2, 3]))");
 }

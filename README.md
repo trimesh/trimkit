@@ -1,47 +1,44 @@
 # trimkit
 
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, that have mature iterative solutions. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-header. Install with:
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, that have mature iterative solutions. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
 
 ```
 pip install trimkit
 ```
 
-It is small (~1MB wheels!), fast, and has simple and strict numpy-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't and shouldn't be `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as `vertices: NDArray2D[np.float64], faces: NDArray2D[np.int64]` arrays.
+It's small (~1MB wheels!), fast, and has simple and strict numpy-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as numpy arrays of `(n, 3) float64` vertices and `(m, 3) int64` faces.
 
-This offers lowest common denominator interfaces to [coal](https://github.com/coal-library/coal) for collision detection, [tinybvh](https://github.com/jbikker/tinybvh) for ray checks and AABB queries, [earcut.hpp](https://github.com/mapbox/earcut.hpp) for polygon tessellation, [VHACD](https://github.com/kmammou/v-hacd) for convex decomposition, [meshoptimizer](https://github.com/zeux/meshoptimizer) for mesh simplification, [xatlas](https://github.com/jpcy/xatlas) for UV atlases, [draco](https://github.com/google/draco) for buffer compression, and a handrolled SVG path string to buffer parser.
+Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`, and the geometry implementations used here are also mostly stable. `trimkit` offers lowest common denominator interfaces to [coal](https://github.com/coal-library/coal) for collision detection, [tinybvh](https://github.com/jbikker/tinybvh) for ray checks and AABB queries, [earcut.hpp](https://github.com/mapbox/earcut.hpp) for polygon tessellation, [VHACD](https://github.com/kmammou/v-hacd) for convex decomposition, [meshoptimizer](https://github.com/zeux/meshoptimizer) for mesh simplification, [xatlas](https://github.com/jpcy/xatlas) for UV atlases, [draco](https://github.com/google/draco) for buffer compression, and a hand rolled SVG path string to buffer parser.
 
-Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`, and the geometry implementations used here are also mostly stable.
+There's been many bindings to mostly the same underlying implementations of polygon tessellation ([a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/)), embree ([a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/)), FCL ([a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl)), quadric edge collapse ([a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/)), VHACD ([a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/)), and draco ([a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/)) over the years. It would be nice to stop having to rotate when a binding stops releasing and there's a new Python to support.
 
-I've cycled through many bindings to mostly the same underlying implementations of polygon tessellation ([a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/)), embree ([a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/)), FCL ([a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl)), quadric edge collapse ([a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/)), VHACD ([a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/)), and draco ([a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/)) over the years, and am looking for a way to stop having to rotate every time there's a new Python release and the maintainer (or me) hasn't released a specific wheel for it. 
+Most of the underlying geometry implementations in this package are mature and familiar to trimesh users. Less familiar options are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser, which is simple enough to just do here. `tinybvh` looks well written, benchmarks look good, packaging embree is quite rough, and it provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of FCL that has more accurate convex distances compared to `python-fcl`. `meshoptimizer` is easier to package than `open3d` or `fast-simplification`, small, and it never moves vertices.
 
-Most of the underlying geometry implementations in this package are mature, and familiar to trimesh users. Less familiar options are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser, which is simple enough to just do here. `tinybvh` looks well written, benchmarks look good, packaging embree is quite rough, and it provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of FCL which has more accurate convex distances compared to `python-fcl`. `meshoptimizer` is easier to package, and it never moves vertices.
-
-The weekly Github Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to batten down the hatches.
+The weekly GitHub Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to lint, fuzz, and lock down in one place.
 
 ## Packaging
 
-This uses a Python script to construct a `ninja` build file from our declarative `TOML`, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us avoid `cmake`.
+This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`.
 
-This builds wheels for `abi3` on `>= 312`, for Windows, Mac, and Linux. Linux has 4 (`glibc`/`MUSL`,`x86_64`/`arm`), Mac has 2 (`x86_64`/`arm`), and Windows has 3 (`x86_64`/`arm`/`x86`), making the total number of wheels per release 9.
+This builds `abi3` wheels on `python >= 312`, for Windows, Mac, and Linux. Linux has 4 (`glibc`/`MUSL`,`x86_64`/`aarch64`),  Mac has 2 (`x86_64`/`arm`), and Windows has 3 (`x86_64`/`arm`/`x86`), or 9 wheels per release.
 
-We release `sdist` packages that are tested on free-thread builds, and will release `abi3t` wheels when `nanobind` supports it cleanly. As a policy there will never be per-Python releases; this is an `abi3` packaging effort.
+This releases an `sdist` that is tested on free-threaded builds, and will release `abi3t` wheels when `nanobind` supports it cleanly. As a policy there will never be per-Python releases; this is an `abi3` packaging effort.
 
 
 ## API Choices
 
-This does not and will never load meshes, parse XML, or support anything that isn't a pure data operation. For example it parses SVG path strings into numpy arrays fast; it does not parse the XML holding the path strings. It sits below `trimesh` or similar library in the ecosystem.
+This does not and will never load meshes, parse XML, or support anything that isn't a pure data operation. For example it parses SVG path strings into numpy arrays fast; it does not parse the XML holding the path strings. It sits below `trimesh` or similar libraries in the Python ecosystem.
 
-- Functions take numpy arrays, and do not play precision games, and are uniformity biased: everything comes in and goes out as `float64` or `int64`.
-- Generic names: functions (non-exchange) are intended to be doors to the question class, not implementation specific. For example VHACD is the convex decomposition algorithm, but the function is called `decompose`. And if someone vibes the perfect header-only convex decomposition algorithm; we would add an `engine: None | EngineKind = None` argument.
-- Honest about work: why not merge `CollisionScene` and `RayScene`? Well they both have work to construct their acceleration structures, and are different under the hood, and are different classes of question.
-- Scene instancing is per-query, NOT saved in scene state. This is a hot take: but rather than the usual "scene.set_instances" or whatever, queries are like `CollisionScene.distance(instance_index, instance_matrices`). And the object should and does cache the acceleration structure if instances are always the same internally, but the user is responsible for passing them in. 
-
+- Functions take numpy arrays, don't play precision games, and are biased toward uniformity: everything comes in and goes out as `float64` or `int64`.
+- Generic names: functions (outside `trimkit.exchange`) are intended to be doors to the question class, not implementation specific. For example VHACD is the convex decomposition algorithm, but the function is called `decompose`. And if someone vibes the perfect header-only convex decomposition algorithm, we would add an `engine: None | EngineKind = None` argument.
+- Honest about work in constructors: why not merge `CollisionScene` and `RayScene`? Well they both have potentially expensive acceleration structures, are different under the hood, and are different classes of question.
+- Scene instancing is per-query, NOT saved in scene state. Rather than the usual stateful "scene.set_instances", queries are  `CollisionScene.distances(instance_matrices, instance_index)`. The caller passes instances on every query; the scene holds only the per-mesh acceleration structures.
 
 ## AI Preferences
 
 - The build system, lints, packaging, hardening, optimizing: AI go wild. Generally try to make it faster, smaller, more tested, cleaner.
 - API: never expand without permission.
-- Geometry: these algorithms were mostly written by domain experts and have been run by millions of users. The standard of proof is extremely high to make any changes. Start with multiple failing tests, an absolutely solid root-cause, a THIN fix that doesn't require new subsystems, and is justified from multiple angles and multiple cases, including performance data. And present the case coherently to a user: do not make changes to this without an explicit go-ahead, with success criteria established before implementing including failing tests; and a plan on how the change is going to be 50 lines or less to hot geometry code. 
+- Geometry: these algorithms were mostly written by domain experts and have been run by millions of users. The standard of proof is extremely high for any change. Start with multiple failing tests, an absolutely solid root causea THIN fix that doesn't require new subsystems, and is justified from multiple angles and multiple cases, including performance data. And present the case coherently to a user: do not make changes to this without an explicit go-ahead, with success criteria established before implementing including failing tests; and a plan on how the change is going to be 50 lines or less to hot geometry code. 
 
 ## // Claude Slop
 
@@ -52,8 +49,8 @@ Everything below this line is LLM output.
 
 | `trimkit.` | what it is |
 |---|---|
-| `RayScene` | Meshes, each built once into a double precision BVH, and the only thing rays are cast against.<br>`scene = trimkit.RayScene([(triangle, faces)])` |
-| `RayScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = trimkit.RayScene([(triangle, faces)]).boxes()` |
+| `RayScene` | Meshes, each built once into a double precision BVH, and the only thing rays are cast against.<br>`scene = trimkit.RayScene([(vertices, faces)])` |
+| `RayScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = trimkit.RayScene([(vertices, faces)]).boxes()` |
 | `RayScene.intersect_first` | The nearest triangle each ray hits, from either side.<br>`instances, faces, distances = scene.intersect_first(origins, directions)` |
 | `RayScene.intersect_all` | Every triangle each ray hits, from either side.<br>`rays, instances, faces, distances = scene.intersect_all(origins, directions)` |
 | `RayScene.intersect_any` | Whether each ray hits anything, stopping at the first triangle found.<br>`hits = scene.intersect_any(origins, directions)` |
@@ -61,18 +58,18 @@ Everything below this line is LLM output.
 | `Boxes.bounds` | The box around every box.<br>`bounds = tree.bounds` |
 | `Boxes.boxes` | Every box, exactly as given.<br>`boxes = tree.boxes()` |
 | `Boxes.intersect` | Every box overlapping each query box, touching included.<br>`pairs = tree.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]]))` |
-| `triangulate` | Triangulate a polygon with holes.<br>`vertices, faces = trimkit.triangulate(square)` |
-| `decompose` | Decompose a closed triangle mesh into approximately convex hulls.<br>`hulls = trimkit.decompose(cube, faces, maximum_hulls=1)` |
-| `parametrize` | Cut a mesh into charts and pack them into a UV atlas.<br>`vertex_sources, faces, uv = trimkit.parametrize(triangle, faces)` |
-| `simplify` | Collapse edges by quadric error until at most `face_count` faces remain.<br>`vertices, faces, vertex_sources = trimkit.simplify(tetrahedron, faces, 4)` |
-| `CollisionScene` | Meshes to place and query against each other. A scene never changes: each query names its own instances, so threads may share one.<br>`scene = trimkit.CollisionScene([(tetrahedron, faces)], convex=True)` |
+| `triangulate` | Triangulate a polygon with holes.<br>`vertices, faces = trimkit.triangulate(exterior)` |
+| `decompose` | Decompose a closed triangle mesh into approximately convex hulls.<br>`hulls = trimkit.decompose(vertices, faces, maximum_hulls=1)` |
+| `parametrize` | Cut a mesh into charts and pack them into a UV atlas.<br>`vertex_sources, faces, uv = trimkit.parametrize(vertices, faces)` |
+| `simplify` | Collapse edges by quadric error until at most `face_count` faces remain.<br>`vertices, faces, vertex_sources = trimkit.simplify(vertices, faces, 4)` |
+| `CollisionScene` | Meshes to place and query against each other. A scene never changes: each query names its own instances, so threads may share one.<br>`scene = trimkit.CollisionScene([(vertices, faces)], convex=True)` |
 | `CollisionScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = scene.boxes()` |
 | `CollisionScene.collides` | The pairs of instances that touch.<br>`pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))` |
 | `CollisionScene.distances` | The distance between each pair of instances, and where it is.<br>`distances, points, normals = scene.distances(placed, np.zeros(2, dtype=np.int64))` |
 | `__version__` | This package's version.<br>`isinstance(trimkit.__version__, str)` |
 | `Mesh` | A triangle mesh as the scenes take it and `decompose` returns it: a (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle indices into them.<br>`mesh: trimkit.Mesh = (np.zeros((3, 3)), np.array([[0, 1, 2]], dtype=np.int64))` |
 | `exchange.DracoKind` | What a draco attribute holds, as `draco_encode` takes it.<br>`POSITION, NORMAL, TEXCOORD, COLOR, GENERIC` |
-| `exchange.draco_encode` | Compress a glTF triangle primitive, keeping vertex order.<br>`buffer = trimkit.exchange.draco_encode(faces, [triangle.astype(np.float32)], kinds)` |
+| `exchange.draco_encode` | Compress a glTF triangle primitive, keeping vertex order.<br>`buffer = trimkit.exchange.draco_encode(faces, [vertices.astype(np.float32)], kinds)` |
 | `exchange.draco_decode` | Decompress a glTF draco buffer, decoding it once.<br>`faces, attributes = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))` |
 | `exchange.SvgKind` | What drew an SvgSegment, its `kind` field.<br>`LINE, QUADRATIC, CUBIC, ARC` |
 | `exchange.svg_parse` | Parse SVG path data into vertices and one segment per drawing command.<br>`vertices, segments = trimkit.exchange.svg_parse("M 0 0 L 1 1")` |

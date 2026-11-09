@@ -94,10 +94,10 @@ def draco_encode(faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 3), or
     --------
     >>> import numpy as np
     >>> import trimkit
-    >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
     >>> kinds = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-    >>> buffer = trimkit.exchange.draco_encode(faces, [triangle.astype(np.float32)], kinds)
+    >>> buffer = trimkit.exchange.draco_encode(faces, [vertices.astype(np.float32)], kinds)
     >>> type(buffer).__name__
     'bytes'
     """
@@ -132,10 +132,10 @@ def draco_decode(buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), ord
     --------
     >>> import numpy as np
     >>> import trimkit
-    >>> triangle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
     >>> kinds = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-    >>> buffer = np.frombuffer(trimkit.exchange.draco_encode(faces, [triangle.astype(np.float32)], kinds), np.uint8)
+    >>> buffer = np.frombuffer(trimkit.exchange.draco_encode(faces, [vertices.astype(np.float32)], kinds), np.uint8)
     >>> faces, attributes = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
     >>> faces.tolist(), attributes[0].tolist()
     ([[0, 1, 2]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
