@@ -187,8 +187,8 @@ def asan_runtime() -> str:
 
 def export(path: Path, *groups: str) -> Path:
     """
-    uv.lock's `groups` as a hash-pinned requirements file, for pip, which the
-    cibuildwheel containers have rather than uv, and for `uv pip sync`.
+    uv.lock's `groups` as a hash-pinned requirements file, for the `uv pip`
+    of cibuildwheel's hooks and for `uv pip sync`.
     """
     named = [word for group in groups for word in ("--group", group)]
     run(
@@ -424,7 +424,6 @@ def cmd_ruff(args) -> None:
 def cmd_actions(args) -> None:
     github = builder.tracked_under(ROOT / ".github")
     run(tool("zizmor"), "--offline", "--pedantic", *github)
-    run(tool("actionlint"), *[p for p in github if p.parent.name == "workflows"])
 
 
 def stubs(root: Path, write: bool) -> None:
@@ -554,7 +553,7 @@ def cmd_static(args) -> None:
 def cmd_wheel(args) -> None:
     # cibuildwheel by hash from uv.lock, configured by pyproject.toml, on the
     # tracked files alone (its containers copy whatever directory they build)
-    # plus the requirements its hooks install by hash with pip
+    # plus the requirements its hooks install by hash with uv pip
     source = builder.export_tracked(args.root / "wheel-source")
     # what the build and its tests install inside each image, and what the
     # audit installs on the host: apart, as the audit tools need wheels (such

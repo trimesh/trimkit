@@ -12,7 +12,7 @@ This offers lowest common denominator interfaces to [coal](https://github.com/co
 
 Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`, and the geometry implementations used here are also mostly stable.
 
-I've cycled through many bindings of polygon tessellation [a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/), embree [a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/), FCL [a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl), quadric edge collapse [a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/), VHACD [a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/), and draco [a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/) over the years, and am looking for a way to stop having to rotate every time there's a new Python release and the maintainer (or me) hasn't released a specific wheel for it. 
+I've cycled through many bindings to mostly the same underlying implementations of polygon tessellation ([a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/)), embree ([a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/)), FCL ([a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl)), quadric edge collapse ([a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/)), VHACD ([a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/)), and draco ([a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/)) over the years, and am looking for a way to stop having to rotate every time there's a new Python release and the maintainer (or me) hasn't released a specific wheel for it. 
 
 Most of the underlying geometry implementations in this package are mature, and familiar to trimesh users. Less familiar options are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser, which is simple enough to just do here. `tinybvh` looks well written, benchmarks look good, packaging embree is quite rough, and it provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of FCL which has more accurate convex distances compared to `python-fcl`. `meshoptimizer` is easier to package, and it never moves vertices.
 
@@ -205,8 +205,8 @@ Every input that reaches a wheel, and what pins it:
   cooldown (`exclude-newer`); builds install them with `--require-hashes` from
   requirements exported from the lock, and cibuildwheel itself comes from it.
 - The image: base by digest, Debian packages by snapshot date, uv by digest, and
-  actionlint and the TSan CPython by sha256. Every check runs from the image's
-  own environment: nothing on the host can steer it.
+  the TSan CPython by sha256. Every check runs from the image's own
+  environment: nothing on the host can steer it.
 - CI: actions pinned by commit; cibuildwheel pins its Linux images by digest and
   its macOS and Windows Pythons by sha256. Dependabot moves pins with the same
   cooldown.

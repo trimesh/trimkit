@@ -16,7 +16,8 @@ build environment (`sys.executable`):
 The profiles only steer the optimizer: they can't change what the code
 computes, and the finished wheel is tested in full on its own afterwards.
 
-Standard library only: the manylinux and musllinux images have pip, not uv.
+Standard library only, with uv's pip: cibuildwheel's environments have no pip
+(pyproject.toml), and uv is on PATH in its Linux images and on every host.
 """
 
 import shutil
@@ -37,7 +38,7 @@ def run(*args: str, cwd: Path = ROOT) -> None:
 def main() -> None:
     config = Config(DEFAULT_BUILD_DIR, pgo="use")
     tools = Tools.current(Platform.current(), load())
-    pip = [sys.executable, "-m", "pip", "install", "-q"]
+    pip = ["uv", "pip", "install", "-q", "--python", sys.executable]
     run(*pip, "--require-hashes", "--no-deps", "-r", str(ROOT / "requirements.txt"))
     shutil.rmtree(config.profiles, ignore_errors=True)
     run(*pip, "--no-build-isolation", "--no-deps", "-C", "pgo=generate", ".")
@@ -50,7 +51,7 @@ def main() -> None:
     if not raw:
         sys.exit(f"the training wrote no profiles to {config.profiles}")
     run(str(tools.profiler), "merge", "-o", str(config.profile), *raw)
-    run(sys.executable, "-m", "pip", "uninstall", "-q", "-y", "trimkit")
+    run("uv", "pip", "uninstall", "-q", "--python", sys.executable, "trimkit")
 
 
 if __name__ == "__main__":

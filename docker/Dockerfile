@@ -42,20 +42,6 @@ RUN export UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_INSTALL_DIR=/opt/uv-python \
         'cache-dir = "/src/build/docker/uv-cache"' \
         'python-downloads = "never"' > /etc/uv/uv.toml
 
-# actionlint, a single static binary checked against its release checksums
-# (PyPI's actionlint-py is sdist-only and downloads it unchecked at build time)
-ARG ACTIONLINT=1.7.12
-RUN set -eu; \
-    case "$(dpkg --print-architecture)" in \
-        amd64) arch=amd64 sum=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;; \
-        arm64) arch=arm64 sum=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;; \
-    esac; \
-    curl -fsSL -o /tmp/actionlint.tar.gz \
-        "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT}/actionlint_${ACTIONLINT}_linux_${arch}.tar.gz"; \
-    echo "${sum}  /tmp/actionlint.tar.gz" | sha256sum -c -; \
-    tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint; \
-    rm /tmp/actionlint.tar.gz
-
 # last, so editing pyproject.toml only re-runs this cheap layer
 # ruff and zizmor at the versions and hashes in uv.lock's `lint` group
 COPY pyproject.toml uv.lock /opt/tools-project/

@@ -71,8 +71,12 @@ skip = ["*_ppc64le", "*_s390x", "*_armv7l", "*_riscv64"]
 archs = ["auto"]
 # no build isolation: the build requirement (ninja) comes from
 # requirements.txt, by hash, installed by `before-build` rather than resolved
-# fresh from PyPI
-build-frontend = { name = "build", args = ["--no-isolation"] }
+# fresh from PyPI. uv makes every environment, with no pip in them: pip's
+# environments need virtualenv.pyz, an anonymous GitHub download GitHub throttles
+build-frontend = { name = "build[uv]", args = ["--no-isolation"] }
+# the Linux images ship their own uv, not the 0.13.7 [tool.uv] requires, so no
+# uv in a build reads that config: every install here is by hash anyway
+environment = { UV_NO_CONFIG = "1" }
 # profile-guided: train an instrumented build on the tests, then build with
 # its profiles. pgo.py also installs requirements.txt by hash
 before-build = "python scripts/pgo.py"
@@ -83,7 +87,7 @@ musllinux-aarch64-image = "musllinux_1_2"
 # release wheels fail on any warning in our sources
 config-settings = { strict = "true", pgo = "use" }
 # the test dependencies by hash too, then the wheel under test
-before-test = "python -m pip install --require-hashes --no-deps -r {project}/requirements.txt"
+before-test = "uv pip install --require-hashes --no-deps -r {project}/requirements.txt"
 # wall-clock bounds are the local gate's: a busy runner mustn't block a release on one
 # (double quotes: cmd.exe, on Windows, doesn't know single ones)
 test-command = 'pytest {project}/tests -q -m "not timing"'
@@ -105,7 +109,7 @@ before-all = "apk add clang lld llvm compiler-rt"
 # the x64 runner can't link 32-bit training: built and tested all the same
 [[tool.cibuildwheel.overrides]]
 select = "*-win32"
-before-build = "python -m pip install --require-hashes --no-deps -r {project}/requirements.txt"
+before-build = "uv pip install --require-hashes --no-deps -r {project}/requirements.txt"
 config-settings = { strict = "true" }
 
 [tool.cibuildwheel.windows]
@@ -115,7 +119,8 @@ repair-wheel-command = ""
 
 [tool.cibuildwheel.macos]
 # numpy's own oldest on arm64: an API newer than this is a compile error
-environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+# (and the base table's, which this one replaces)
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0", UV_NO_CONFIG = "1" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
