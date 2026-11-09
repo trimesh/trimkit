@@ -330,6 +330,9 @@ static inline const char* segment_refusal(const double* vertices, std::size_t ve
     if (segment->closes != 0 && segment->points[3] != subpath_start) {
         return "a closing line must end on its subpath's first vertex";
     }
+    if (segment->closes != 0 && segment->points[0] == subpath_start) {
+        return "a closing line must close something, not start on its subpath's first vertex";
+    }
     // every number `format` writes is one `parse` reads back: within the bound
     if (segment->kind == ARC &&
         (!(std::abs(segment->radius[0]) <= COORDINATE_LIMIT) || !(std::abs(segment->radius[1]) <= COORDINATE_LIMIT) ||
@@ -439,6 +442,11 @@ static inline std::size_t parse(const char* text, std::size_t size, Path* out) {
                 command = relative ? 'l' : 'L';
                 break;
             case 'Z': {
+                // the pen is on the first vertex only before anything is
+                // drawn, after a moveto or a close: then there's nothing to close
+                if (pen.vertex < 0 || pen.vertex == pen.start_vertex) {
+                    break;
+                }
                 // back to the subpath's first vertex, shared rather than repeated
                 const std::int64_t start = pen_vertex(&pen);
                 Segment segment = make_segment(LINE, start, -1, -1, pen.start_vertex);

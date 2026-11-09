@@ -30,6 +30,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -47,6 +48,17 @@ using Points = trimkit::In<double, -1, 3>;
 using FacesArg = trimkit::Array<std::int64_t, -1, 3>;
 using BoundsArg = trimkit::Array<double, -1, 2, -1>;
 using Bounds = trimkit::In<double, -1, 2, -1>;
+
+// tinybvh's nodes come through the extension's one door for allocation
+// (src/trimkit.cpp), rather than the aligned malloc it would otherwise call
+std::unique_ptr<tinybvh::BVH_Double> new_bvh() {
+    auto bvh = std::make_unique<tinybvh::BVH_Double>();
+    bvh->context.malloc = [](std::size_t size, void* /*unused*/) -> void* {
+        return ::operator new(size, std::align_val_t{64});
+    };
+    bvh->context.free = [](void* block, void* /*unused*/) { ::operator delete(block, std::align_val_t{64}); };
+    return bvh;
+}
 
 // A watertight triangle test needs conservative traversal: the slab test
 // rounds on the order of an ulp of the coordinates, so without padding a ray
@@ -197,7 +209,7 @@ public:
             extent = std::max({extent, std::abs(bounds.lowest[axis]), std::abs(bounds.highest[axis])});
         }
         if (!faces_.empty()) {
-            bvh_ = std::make_unique<tinybvh::BVH_Double>();
+            bvh_ = new_bvh();
             // spatial splits trace 20-27% faster from about 300k triangles, for
             // 40% more build time, but gain nothing below 50k at 4x the build
             const std::size_t count = faces_.size() / 3;
@@ -501,7 +513,7 @@ private:
             top->direct = meshes_[static_cast<std::size_t>(top->instances[0].blasIdx)].get();
         } else if (!top->instances.empty()) {
             const nb::gil_scoped_release release;
-            top->tlas = std::make_unique<tinybvh::BVH_Double>();
+            top->tlas = new_bvh();
             // tinybvh takes the meshes' array non-const, though it only reads it
             tinybvh::BVH_Double** meshes =
                 const_cast<tinybvh::BVH_Double**>(blas_.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
@@ -694,7 +706,7 @@ private:
         }
         // an empty build is an error to tinybvh: no boxes, no BVH
         if (!boxes_.empty()) {
-            bvh_ = std::make_unique<tinybvh::BVH_Double>();
+            bvh_ = new_bvh();
             bvh_->BuildAABB(boxes_.data(), boxes_.size() / 2);
         }
     }

@@ -39,68 +39,107 @@ import trimkit
 API = public_api()
 
 
-@functools.cache
-def slow_calls():
-    # an input slow enough to see a background thread run, for each function
-    big_vertices, big_faces = sphere(60, 120)
-    n = 2_000_000
-    big = [np.random.default_rng(0).random((n, 3)).astype(np.float32)]
-    big_indices = np.arange(3 * (n // 3), dtype=np.int64).reshape((-1, 3))
-    kind = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-    big_buffer = trimkit.exchange.draco_encode(big_indices, big, kind) if LITTLE_ENDIAN else b""
+# Inputs slow enough to see a background thread run. Each is built for the one
+# test that uses it and goes when that test does: cached, they held 900 MiB for
+# the rest of the session, which is what a 32-bit process ran out of.
+def _big_mesh():
+    return sphere(60, 120)
+
+
+def _big_rays():
     placed = np.tile(np.eye(4), (8, 1, 1))
     placed[:, 0, 3] = np.arange(8) * 3.0
-    d = "M0 0 " + "c1 2 3 4 5 6 a 3 2 30 1 0 4 4 " * 1_000_000
-    big_segments = trimkit.exchange.svg_parse(d)
-    big_rays = np.random.default_rng(0).normal(size=(2, 2_000_000, 3))
-    corners = np.random.default_rng(0).uniform(-100, 100, (1_000_000, 3))
-    big_boxes = np.stack([corners, corners + 1.0], axis=1)
-    mesh = (big_vertices, big_faces)
+    return _big_mesh(), np.random.default_rng(0).normal(size=(2, 2_000_000, 3)), placed
+
+
+def _big_corners():
+    return np.random.default_rng(0).uniform(-100, 100, (1_000_000, 3))
+
+
+def _big_boxes():
+    corners = _big_corners()
+    return np.stack([corners, corners + 1.0], axis=1)
+
+
+def _many_instances():
+    # a million instances: their boxes build into a Boxes as big as _big_boxes
+    many = np.tile(np.eye(4), (1_000_000, 1, 1))
+    many[:, :3, 3] = _big_corners()
+    return many, np.zeros(len(many), np.int64)
+
+
+def _near_spheres():
     # two big spheres a hair apart, the one pair tested many times: every test
     # descends both hierarchies to the leaves nearest the gap
     near = np.tile(np.eye(4), (2, 1, 1))
     near[1, 0, 3] = 2.0001
-    near_pairs = np.tile(np.array([[0, 1]], dtype=np.int64), (2_000, 1))
-    fine = sphere(200, 400)
-    # a million instances: their boxes build into a Boxes as big as big_boxes
-    many = np.tile(np.eye(4), (1_000_000, 1, 1))
-    many[:, :3, 3] = corners
-    one_mesh = np.zeros(len(many), np.int64)
-    return {
-        "RayScene": lambda: len(trimkit.RayScene([sphere(500, 1000)])),
-        "RayScene.boxes": lambda: trimkit.RayScene([box()]).boxes(many, one_mesh).boxes(),
-        "RayScene.intersect_first": lambda: trimkit.RayScene([mesh]).intersect_first(
-            *big_rays, placed, np.zeros(8, dtype=np.int64)
-        ),
-        "RayScene.intersect_all": lambda: trimkit.RayScene([mesh]).intersect_all(*big_rays),
-        "RayScene.intersect_any": lambda: trimkit.RayScene([mesh]).intersect_any(*big_rays),
-        "Boxes": lambda: len(trimkit.Boxes(big_boxes)),
-        "Boxes.bounds": lambda: trimkit.Boxes(big_boxes).bounds,
-        "Boxes.boxes": lambda: trimkit.Boxes(big_boxes).boxes(),
-        "Boxes.intersect": lambda: trimkit.Boxes(big_boxes).intersect(big_boxes),
-        "CollisionScene.boxes": lambda: trimkit.CollisionScene([box()]).boxes(many, one_mesh).boxes(),
-        "CollisionScene": lambda: trimkit.CollisionScene([fine]).collides(
-            near, np.zeros(2, np.int64), pairs=near_pairs
-        ),
-        "CollisionScene.collides": lambda: trimkit.CollisionScene([fine]).collides(
-            near, np.zeros(2, np.int64), pairs=near_pairs
-        ),
-        "CollisionScene.distances": lambda: trimkit.CollisionScene([fine]).distances(
-            near, np.zeros(2, np.int64), pairs=near_pairs[:200]
-        ),
-        "triangulate": lambda: trimkit.triangulate(circle(2_000_000)),
-        "exchange.svg_parse": lambda: trimkit.exchange.svg_parse(d),
-        "exchange.svg_string": lambda: trimkit.exchange.svg_string(*big_segments),
-        "decompose": lambda: trimkit.decompose(*mesh, resolution=50_000),
-        "parametrize": lambda: trimkit.parametrize(*mesh),
-        "simplify": lambda: trimkit.simplify(*sphere(400, 800), 1000),
-        "exchange.draco_encode": lambda: trimkit.exchange.draco_encode(
-            big_indices, big, np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-        ),
-        "exchange.draco_decode": lambda: trimkit.exchange.draco_decode(
-            big_buffer, np.array([0], dtype=np.int64)
-        ),
-    }
+    return sphere(200, 400), near, np.tile(np.array([[0, 1]], dtype=np.int64), (2_000, 1))
+
+
+def _big_path():
+    return "M0 0 " + "c1 2 3 4 5 6 a 3 2 30 1 0 4 4 " * 1_000_000
+
+
+def _big_draco():
+    n = 2_000_000
+    position = [np.random.default_rng(0).random((n, 3)).astype(np.float32)]
+    faces = np.arange(3 * (n // 3), dtype=np.int64).reshape((-1, 3))
+    return faces, position, np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
+
+
+def _big_buffer():
+    return trimkit.exchange.draco_encode(*_big_draco()) if LITTLE_ENDIAN else b""
+
+
+# each name's input and what it calls on that input
+_SLOW_CALLS = {
+    "RayScene": (lambda: sphere(500, 1000), lambda mesh: len(trimkit.RayScene([mesh]))),
+    "RayScene.boxes": (_many_instances, lambda i: trimkit.RayScene([box()]).boxes(*i).boxes()),
+    "RayScene.intersect_first": (
+        _big_rays,
+        lambda i: trimkit.RayScene([i[0]]).intersect_first(*i[1], i[2], np.zeros(8, dtype=np.int64)),
+    ),
+    "RayScene.intersect_all": (_big_rays, lambda i: trimkit.RayScene([i[0]]).intersect_all(*i[1])),
+    "RayScene.intersect_any": (_big_rays, lambda i: trimkit.RayScene([i[0]]).intersect_any(*i[1])),
+    "Boxes": (_big_boxes, lambda b: len(trimkit.Boxes(b))),
+    "Boxes.bounds": (_big_boxes, lambda b: trimkit.Boxes(b).bounds),
+    "Boxes.boxes": (_big_boxes, lambda b: trimkit.Boxes(b).boxes()),
+    "Boxes.intersect": (_big_boxes, lambda b: trimkit.Boxes(b).intersect(b)),
+    "CollisionScene.boxes": (_many_instances, lambda i: trimkit.CollisionScene([box()]).boxes(*i).boxes()),
+    "CollisionScene": (
+        _near_spheres,
+        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]),
+    ),
+    "CollisionScene.collides": (
+        _near_spheres,
+        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]),
+    ),
+    "CollisionScene.distances": (
+        _near_spheres,
+        lambda i: trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]),
+    ),
+    "triangulate": (lambda: circle(2_000_000), trimkit.triangulate),
+    "exchange.svg_parse": (_big_path, trimkit.exchange.svg_parse),
+    "exchange.svg_string": (
+        lambda: trimkit.exchange.svg_parse(_big_path()),
+        lambda parsed: trimkit.exchange.svg_string(*parsed),
+    ),
+    "decompose": (_big_mesh, lambda mesh: trimkit.decompose(*mesh, resolution=50_000)),
+    "parametrize": (_big_mesh, lambda mesh: trimkit.parametrize(*mesh)),
+    "simplify": (lambda: sphere(400, 800), lambda mesh: trimkit.simplify(*mesh, 1000)),
+    "exchange.draco_encode": (_big_draco, lambda i: trimkit.exchange.draco_encode(*i)),
+    "exchange.draco_decode": (
+        _big_buffer,
+        lambda buffer: trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64)),
+    ),
+}
+
+
+def slow_call(name: str):
+    # the call for `name`, its input built now and freed along with the call
+    build, call = _SLOW_CALLS[name]
+    given = build()
+    return lambda: call(given)
 
 
 @functools.cache
@@ -141,7 +180,7 @@ def empty_calls():
 def test_tables_cover_the_api():
     # every public function, class and method is in every table, and nothing
     # else: a new one can't go untested, and a renamed one can't linger
-    for table in (small_calls(), slow_calls(), empty_calls(), _array_arguments()):
+    for table in (small_calls(), _SLOW_CALLS, empty_calls(), _array_arguments()):
         assert sorted(table) == API
 
 
@@ -177,7 +216,8 @@ def test_releases_gil(name):
     # held off for at most a third of the call: Python's checks before and
     # after the work hold the GIL. The least of three runs, as a held GIL
     # stalls every run and a busy machine's scheduler only some of them
-    stall = min(longest_gil_stall(slow_calls()[name], minimum=0.05) for _ in range(3))
+    call = slow_call(name)
+    stall = min(longest_gil_stall(call, minimum=0.05) for _ in range(3))
     assert stall < 1 / 3, f"the GIL was held for {stall:.0%} of the call at once"
 
 
@@ -485,7 +525,7 @@ def test_ctrl_c_stops_long_calls(name):
     # it stops at the end of the call, a known gap.)
     scale = 1
     while True:
-        call = slow_calls()[name] if name == "decompose" else _long_query(name, scale)
+        call = slow_call(name) if name == "decompose" else _long_query(name, scale)
         tic = time.perf_counter()
         call()
         uninterrupted = time.perf_counter() - tic

@@ -8,8 +8,8 @@
 // Decoding has no size limit: draco sizes its allocations from counts the
 // buffer declares, and a valid buffer of a few bytes can really decode to
 // millions of points (rANS codes a near-certain symbol in almost no bits). What
-// doesn't fit in the memory available is a MemoryError, before any of it is
-// allocated (config/draco/available_memory.h), not the kernel's SIGKILL.
+// doesn't fit in the memory available is a MemoryError (src/trimkit.cpp), not the
+// kernel's SIGKILL.
 
 #include "common.hpp"
 
@@ -385,7 +385,7 @@ Notes
 -----
 It has no size limit: a buffer of a few bytes can really hold
 millions of points. What it declares beyond the memory available
-raises MemoryError before any of it is allocated.
+raises MemoryError.
 
 Examples
 --------

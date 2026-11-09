@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 import pytest
-from helpers import LITTLE_ENDIAN, draco_faces_bomb, draco_points_bomb, runs_here
+from helpers import LITTLE_ENDIAN, runs_here
 
 import trimkit
 
@@ -220,15 +220,6 @@ def test_wide_integers_cost_no_table():
     start = time.perf_counter()
     trimkit.exchange.draco_encode(faces, [value], kind)
     assert time.perf_counter() - start < 0.5
-
-
-@pytest.mark.parametrize("bomb", [lambda: draco_points_bomb(2**32 - 1), draco_faces_bomb])
-def test_bomb_is_a_memory_error_before_any_is_allocated(bomb):
-    # asks for hundreds of GiB: refused, not zero-filled until the kernel kills us
-    runs_here("exchange.draco_decode")
-    buffer = bomb()
-    with pytest.raises(MemoryError):
-        trimkit.exchange.draco_decode(buffer, np.zeros(0, np.int64))
 
 
 @pytest.mark.parametrize("bad", [-1, 25, 30])

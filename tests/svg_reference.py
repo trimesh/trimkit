@@ -130,8 +130,10 @@ def evaluate(commands) -> list[dict]:
     current = start = (0.0, 0.0)
     # the last command, and its last control point, for S and T reflections
     last, control = None, None
-    # a moveto starts a subpath on a new vertex at the next segment drawn
+    # a moveto starts a subpath on a new vertex at the next segment drawn, and
+    # closing a subpath with nothing drawn yet draws nothing
     moved = False
+    drawn = False
     for letter, values in commands:
         upper = letter.upper()
         n = ARGUMENTS[upper]
@@ -153,8 +155,10 @@ def evaluate(commands) -> list[dict]:
             if command == "M":
                 current = start = point(*a)
                 moved = True
+                drawn = False
             elif command == "Z":
-                segment = dict(kind=LINE, flags=CLOSE, end=start)
+                if drawn:
+                    segment = dict(kind=LINE, flags=CLOSE, end=start)
             elif command == "L":
                 segment = dict(kind=LINE, end=point(*a))
             elif command == "H":
@@ -188,5 +192,6 @@ def evaluate(commands) -> list[dict]:
                 segment.setdefault("flags", 0)
                 out.append(segment)
                 current = segment["end"]
+                drawn = command != "Z"
             last = command
     return out

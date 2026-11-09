@@ -18,7 +18,6 @@
 #include <cstdint>
 
 #include "draco/compression/attributes/sequential_attribute_decoders_controller.h"
-#include "draco/available_memory.h"
 #include "draco/compression/mesh/mesh_edgebreaker_decoder.h"
 #include "draco/compression/mesh/mesh_edgebreaker_traversal_predictive_decoder.h"
 #include "draco/compression/mesh/mesh_edgebreaker_traversal_valence_decoder.h"
@@ -377,14 +376,6 @@ bool MeshEdgebreakerDecoderImpl<TraversalDecoder>::DecodeConnectivity() {
   if (corner_table_ == nullptr) {
     return false;
   }
-  // trimkit (vendor/patches/draco-decode-memory-check.patch): a corner table per
-  // face and vertex, for the mesh and for each attribute's own connectivity.
-  RefuseOverAvailableMemory(
-      (44 * static_cast<uint64_t>(num_faces) +
-       4 * (static_cast<uint64_t>(num_encoded_vertices_) +
-            num_encoded_split_symbols)) *
-      (1 + static_cast<uint64_t>(num_attribute_data)));
-
   processed_corner_ids_.clear();
   processed_corner_ids_.reserve(num_faces);
   processed_connectivity_corners_.clear();

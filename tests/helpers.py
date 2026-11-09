@@ -2,7 +2,7 @@
 Small numpy-only fixtures and predicates shared by the tests.
 """
 
-import itertools
+import math
 import struct
 import sys
 import threading
@@ -352,27 +352,35 @@ def longest_gil_stall(call, minimum: float = 0.2) -> float:
     and small when it releases it around its work, as a held GIL stops the
     thread outright for as long as it is held.
     """
-    stamps = []
+    # the call's start and end, then the thread's last stamp and its longest gap
+    # within them, kept as it goes: a list of every stamp grew by gigabytes
+    # over a call of a few seconds, which is what a 2 GiB limit killed
+    window = [math.inf, math.inf]
+    last = [time.perf_counter()]
+    longest = [0.0]
     stop = threading.Event()
 
     def stamp():
         while not stop.is_set():
-            stamps.append(time.perf_counter())
+            now = time.perf_counter()
+            longest[0] = max(longest[0], min(now, window[1]) - max(last[0], window[0]))
+            last[0] = now
 
     worker = threading.Thread(target=stamp)
     worker.start()
     try:
         time.sleep(0.05)
-        tic = time.perf_counter()
+        window[0] = time.perf_counter()
         call()
-        toc = time.perf_counter()
+        window[1] = time.perf_counter()
     finally:
         stop.set()
         worker.join()
+    tic, toc = window
     elapsed = toc - tic
     assert elapsed > minimum, f"call took {elapsed:.3f}s, make the input larger"
-    during = [tic] + [s for s in stamps if tic < s < toc] + [toc]
-    return max(b - a for a, b in itertools.pairwise(during)) / elapsed
+    # with no stamp after the call, its last gap ends at the call's end
+    return max(longest[0], toc - max(last[0], tic)) / elapsed
 
 
 # what one parsed SVG segment means, every point resolved: lets tests compare

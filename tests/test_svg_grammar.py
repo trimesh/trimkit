@@ -196,12 +196,20 @@ def test_matches_svg_path(d):
     from svg.path import Arc, Close, CubicBezier, Line, Move, QuadraticBezier, parse_path
 
     try:
-        old = [seg for seg in parse_path(d) if not isinstance(seg, Move)]
+        parsed = parse_path(d)
     except ZeroDivisionError:
         # svg.path divides by radii like 1e-178, which we draw
         return
-    # svg.path keeps arcs to their own start, which draw nothing (F.6.2)
-    old = [seg for seg in old if not (isinstance(seg, Arc) and seg.start == seg.end)]
+    # svg.path keeps what draws nothing: arcs to their own start (F.6.2), and
+    # closes of a subpath with nothing drawn, right after a move or a close
+    old = []
+    for seg in parsed:
+        if isinstance(seg, Arc) and seg.start == seg.end:
+            continue
+        if isinstance(seg, Close) and (not old or isinstance(old[-1], (Move, Close))):
+            continue
+        old.append(seg)
+    old = [seg for seg in old if not isinstance(seg, Move)]
     s = svg_rows(*trimkit.exchange.svg_parse(d))
     assert len(old) == len(s)
     for seg, row in zip(old, s, strict=True):

@@ -126,7 +126,7 @@ def draco_decode(buffer: Annotated[NDArray[numpy.uint8], dict(shape=(None,), ord
     -----
     It has no size limit: a buffer of a few bytes can really hold
     millions of points. What it declares beyond the memory available
-    raises MemoryError before any of it is allocated.
+    raises MemoryError.
 
     Examples
     --------

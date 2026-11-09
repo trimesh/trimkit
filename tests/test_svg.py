@@ -307,7 +307,8 @@ def test_string_close_is_by_vertex():
     ("path", "segment_count", "vertex_count"),
     [
         ("M0 0" + "h1v1h-1z" * 1000, 4000, 3001),  # every square shares its corner
-        ("M0 0" + "Z" * 10000, 10000, 1),  # repeated closes, one vertex
+        ("M0 0" + "Z" * 10000, 0, 0),  # closes of nothing draw nothing
+        ("M0 0 h1" + "Z" * 10000, 2, 2),  # only the first close has something to close
         ("M1 1 " * 10000, 0, 0),  # moves that draw nothing
         ("Z" * 10000, 0, 0),  # no moveto
         pytest.param("M0 0" + " l1 2" * 2_000_000, 2_000_000, 2_000_001, id="10MB"),

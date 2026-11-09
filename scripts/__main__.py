@@ -205,16 +205,18 @@ def test_files() -> list[Path]:
     return [p for p in builder.tracked_under(ROOT / "tests") if p.name.startswith("test_")]
 
 
+def cmd_build(args) -> None:
+    # the dev build alone: `in_image` runs it before `test`, which has less memory
+    dev(args.root)
+
+
 def cmd_test(args) -> None:
-    dev(args.root).pytest(*test_files())
-
-
-def cmd_memory(args) -> None:
-    # draco's bombs in a container with a memory limit, where the kernel kills
-    # what touches too much. `in_image` sets the limit, which the build just
-    # before this in `check` doesn't have to fit in: this reuses it
+    # in a container with a memory limit (`in_image`): a suite that holds on to
+    # too much fails here, not one push later on a platform with less. Then the
+    # bombs, where the kernel kills what touches too much
     build = dev(args.root)
-    run(build.python, ROOT / "tests" / "draco_memory_limit.py", cwd=ROOT / "tests")
+    build.pytest(*test_files())
+    run(build.python, ROOT / "tests" / "memory_limit.py", cwd=ROOT / "tests")
 
 
 def cmd_asan(args) -> None:
@@ -489,7 +491,9 @@ def cmd_licenses(args) -> None:
 
 # what only src/numpy.hpp may do: touch nanobind's ndarray directly, or the
 # checks behind its `read*` functions, so no binding can skip one
-DOOR_ONLY = re.compile(r"nb::ndarray|try_cast|check_bounded|check_coordinates|trimkit::detail::")
+DOOR_ONLY = re.compile(
+    r"nb::ndarray|try_cast|check_bounded|check_coordinates|trimkit::detail::|\b(malloc|calloc|realloc)\("
+)
 
 
 def check_door() -> None:
@@ -497,7 +501,7 @@ def check_door() -> None:
     sources = [
         p
         for p in builder.tracked_under(ROOT / "src")
-        if p.suffix in (".cpp", ".hpp") and p.name != "numpy.hpp"
+        if p.suffix in (".cpp", ".hpp") and p.name not in ("numpy.hpp", "trimkit.cpp")
     ]
     found = [
         f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
@@ -638,7 +642,7 @@ def cmd_generate(args) -> None:
 # the gate, which should take minutes after a small change: the distribution
 # packages (`distro --run`, two more builds and suites) are checked when the
 # packaging changes, and the sdist's own build (`sdist`) in release CI
-STAGES = ["test", "memory", "static", "asan", "tsan", "fuzz", "atheris"]
+STAGES = ["test", "static", "asan", "tsan", "fuzz", "atheris"]
 
 
 def cmd_check(args) -> None:
@@ -705,8 +709,6 @@ def in_image(args) -> None:
     # docker's default seccomp profile refuses: only those runs drop seccomp,
     # still unprivileged, as the caller's uid, with no added capabilities
     seccomp = ["--security-opt", "seccomp=unconfined"] if args.command in SANITIZED else []
-    # no swap to page out to, as the limit is what `memory` is testing
-    limit = ["--memory", "2g", "--memory-swap", "2g"] if args.command == "memory" else []
     docker = [
         tool("docker"),
         "run",
@@ -714,7 +716,6 @@ def in_image(args) -> None:
         "--init",
         *docker_cores(),
         *seccomp,
-        *limit,
         # Docker's default open-file limit is about 2**31, and sanitizers
         # close every descriptor up to it before starting llvm-symbolizer:
         # each symbolized line, every NEW_FUNC libFuzzer prints included,
@@ -730,8 +731,12 @@ def in_image(args) -> None:
         "-w",
         "/src",
     ]
-    inside = ["python3", "/src/scripts", "--inside", "--root", "/src/build/docker", *forwarded]
-    run(*docker, IMAGE, *inside)
+    inside = ["python3", "/src/scripts", "--inside", "--root", "/src/build/docker"]
+    if args.command == "test":
+        run(*docker, IMAGE, *inside, "build")
+        # no swap to page out to, as the limit is what it's testing
+        docker += ["--memory", "2g", "--memory-swap", "2g"]
+    run(*docker, IMAGE, *inside, *forwarded)
 
 
 def main() -> None:
