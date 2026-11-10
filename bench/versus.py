@@ -160,10 +160,10 @@ directions = rng.normal(size=(1_000_000, 3))
 embree = RayMeshIntersector(sphere)
 scene = trimkit.RayScene([(v, f)])
 row(
-    "trimkit.RayScene.intersect_first",
+    "trimkit.RayScene.intersect",
     "embreex",
     lambda: embree.intersects_first(origins, directions),
-    lambda: scene.intersect_first(origins, directions),
+    lambda: scene.intersect(origins, directions, maximum_hits=1),
     repeat=3,
     note="1M rays, 82k faces",
 )

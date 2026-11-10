@@ -51,8 +51,7 @@ Everything below this line is LLM output.
 |---|---|
 | `RayScene` | Meshes, each built once into a double precision BVH, and the only thing rays are cast against.<br>`scene = trimkit.RayScene([(vertices, faces)])` |
 | `RayScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = trimkit.RayScene([(vertices, faces)]).boxes()` |
-| `RayScene.intersect_first` | The nearest triangle each ray hits, from either side.<br>`instances, faces, distances = scene.intersect_first(origins, directions)` |
-| `RayScene.intersect_all` | Every triangle each ray hits, from either side.<br>`rays, instances, faces, distances = scene.intersect_all(origins, directions)` |
+| `RayScene.intersect` | Where each ray crosses the scene's surface, nearest first, from either side.<br>`rays, instances, faces, distances = scene.intersect(origins, directions)` |
 | `RayScene.intersect_any` | Whether each ray hits anything, stopping at the first triangle found.<br>`hits = scene.intersect_any(origins, directions)` |
 | `Boxes` | Axis-aligned boxes built into a BVH for overlap queries: a static, numpy-native replacement for a bulk-loaded R-tree.<br>`tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))` |
 | `Boxes.bounds` | The box around every box.<br>`bounds = tree.bounds` |
@@ -67,7 +66,7 @@ Everything below this line is LLM output.
 | `CollisionScene.collides` | The pairs of instances that touch.<br>`pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))` |
 | `CollisionScene.distances` | The distance between each pair of instances, and where it is.<br>`distances, points, normals = scene.distances(placed, np.zeros(2, dtype=np.int64))` |
 | `__version__` | This package's version.<br>`isinstance(trimkit.__version__, str)` |
-| `Mesh` | A triangle mesh as the scenes take it and `decompose` returns it: a (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle indices into them.<br>`mesh: trimkit.Mesh = (np.zeros((3, 3)), np.array([[0, 1, 2]], dtype=np.int64))` |
+| `Mesh` | A triangle mesh as the scenes take it and `decompose` returns it: a (vertices, faces) pair of (n, 3) float64 vertices and (m, 3) int64 triangle indices into them, given as a tuple, list or any sequence of two.<br>`mesh: trimkit.Mesh = (np.zeros((3, 3)), np.array([[0, 1, 2]], dtype=np.int64))` |
 | `exchange.DracoKind` | What a draco attribute holds, as `draco_encode` takes it.<br>`POSITION, NORMAL, TEXCOORD, COLOR, GENERIC` |
 | `exchange.draco_encode` | Compress a glTF triangle primitive, keeping vertex order.<br>`buffer = trimkit.exchange.draco_encode(faces, [vertices.astype(np.float32)], kinds)` |
 | `exchange.draco_decode` | Decompress a glTF draco buffer, decoding it once.<br>`faces, attributes = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))` |
@@ -78,35 +77,59 @@ Everything below this line is LLM output.
 
 | part | upstream | license |
 |---|---|---|
-| `bvh` | [jbikker/tinybvh](https://github.com/jbikker/tinybvh) | MIT |
+| `bvh` | [jbikker/tinybvh](https://github.com/jbikker/tinybvh), [KhronosGroup/Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | MIT, Apache-2.0 OR MIT |
 | `earcut` | [mapbox/earcut.hpp](https://github.com/mapbox/earcut.hpp) | ISC |
 | `vhacd` | [kmammou/v-hacd](https://github.com/kmammou/v-hacd) | BSD-3-Clause |
 | `xatlas` | [jpcy/xatlas](https://github.com/jpcy/xatlas) | MIT |
 | `draco` | [google/draco](https://github.com/google/draco) | Apache-2.0 |
-| `svg` | ours, [fastfloat/fast_float](https://github.com/fastfloat/fast_float), [jk-jeon/dragonbox](https://github.com/jk-jeon/dragonbox) | MIT, MIT OR Apache-2.0 OR BSL-1.0, Apache-2.0 WITH LLVM-exception OR BSL-1.0 |
+| `svg` | [fastfloat/fast_float](https://github.com/fastfloat/fast_float), [jk-jeon/dragonbox](https://github.com/jk-jeon/dragonbox) | MIT OR Apache-2.0 OR BSL-1.0, Apache-2.0 WITH LLVM-exception OR BSL-1.0 |
 | `meshoptimizer` | [zeux/meshoptimizer](https://github.com/zeux/meshoptimizer) | MIT |
 | `collision` | [coal-library/coal](https://github.com/coal-library/coal), [libeigen/eigen](https://gitlab.com/libeigen/eigen) | BSD-3-Clause, MPL-2.0 |
 | every part | [wjakob/nanobind](https://github.com/wjakob/nanobind), [Tessil/robin-map](https://github.com/Tessil/robin-map) | BSD-3-Clause, MIT |
 <!-- api:end -->
 
-Each docstring has the full parameters and returns (`help(trimkit.RayScene.intersect_first)`).
+Each docstring has the full parameters and returns (`help(trimkit.RayScene.intersect)`).
 
-Scalar arguments take Python's numbers or numpy's. Every array argument takes
-exactly the dtype shown (float64 finite and within ±1e30) and is never converted:
-another dtype or a list is a `TypeError`, and a bad value a `ValueError`, saying what
-was expected. A C-contiguous array is read in place, and any other layout copied
-once, as `np.ascontiguousarray` would; faces are always copied once, into each
-library's index type, and scene constructors keep their own copy of their meshes.
+Scalar arguments take Python's numbers or numpy's. Every array argument is read in
+place when it is exactly the dtype shown (float64 finite and within ±1e30) and
+C-contiguous, and copied once, as `np.ascontiguousarray` would, in any other layout.
+Another dtype numpy casts safely (float32, int32), or a list, is converted to that
+dtype once with a `UserWarning` naming the argument: the copy is what you would have
+written, and the warning says so. A dtype that would lose values, or anything that
+isn't array-like, is a `TypeError`, and a bad value a `ValueError`, saying what was
+expected. Faces are always copied once, into each library's index type, and scene
+constructors keep their own copy of their meshes.
 Everything returned is freshly allocated, and the GIL is released while computing.
-Answers are dense when you name the rows (rays, pairs) and sparse rows of what was
-found otherwise, and `decompose` answers a list of `Mesh`, one per hull. Nothing a
+Answers are dense when you name the rows (`intersect_any`'s rays, `distances`'
+pairs) and sparse rows of what was found otherwise (hits, touching pairs,
+overlapping boxes), and `decompose` answers a list of `Mesh`, one per hull. Nothing a
 scene answers ever depends on what it was asked before, so threads can share one.
 
-`RayScene`, `Boxes` and `CollisionScene` queries spread big batches
-across the cores they may run on, on one pool of workers that exit after 10 s
-idle (so a `fork` within that time gets CPython's multi-threaded warning);
-`decompose` and `parametrize` use their libraries' own threads, and the rest run
-on the calling thread.
+`RayScene`, `Boxes` and `CollisionScene` queries spread big batches, and
+`decompose` its hull splits and merge costs, across the cores they may run on
+(their affinity, within a cgroup's CPU quota), on one pool of workers that exit
+after 10 s idle (so a `fork` within that time gets CPython's multi-threaded
+warning); `parametrize` uses xatlas's own threads, and the rest run on the
+calling thread.
+
+`RayScene(meshes, use_gpu=True)` traces on a Vulkan device instead: the first
+GPU that computes in double precision, found through the system's Vulkan loader
+at run time (no wheel links or needs Vulkan, and Vulkan 1.0 is enough). It holds
+the same trees and runs a compute shader that makes every decision tinybvh's
+traversal makes, most of them in float32 behind a proven error bound and the
+rest with tinybvh's own float64 operations (`docs/trace.md`), so it answers the
+same bytes the CPU does. Measured on an RTX 3090 against twenty CPU threads, a
+million rays against a 160k-face mesh: `intersect_any` 25 ms against 44, the
+nearest hit 37 against 59, four crossings per ray 41 against 196, every crossing
+92 against 197; the traversal itself is under 3 ms of that, the rest is the 48 MB
+of rays crossing the bus, so below about 50,000 rays the CPU is quicker. Rays
+that share one origin or one direction upload one row. Rays stream through in chunks the shader
+reads from host memory, each chunk one submission that traces, counts, scans and
+compacts the hits on the device. When no such device can be used, at
+construction or later, the scene warns once (a `UserWarning` naming why) and the
+CPU answers. `tests/golden.json` holds the hashed answers of an exact corpus
+(dyadic coordinates, integer-length directions, lattice meshes) that every
+platform and the device are checked against: the same answers everywhere.
 
 ### Example
 
@@ -159,7 +182,7 @@ spec a distribution's maintainer commits, into `build/distro/`.
 uv run scripts check       # the gate: build, tests, static checks, sanitizers, fuzzers
 uv run scripts update      # every upstream and dependency to its newest
 uv run scripts format      # our C++, as scripts/clang-format.yaml says
-uv run scripts generate    # regenerate the stubs and this README's generated block
+uv run scripts generate    # regenerate the shaders' SPIR-V, the stubs, this README's generated block and tests/golden.json
 uv run scripts wheel       # this platform's release wheels
 uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
 ```

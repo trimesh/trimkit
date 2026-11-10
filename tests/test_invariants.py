@@ -1,9 +1,10 @@
 """
 The package-wide promises: numpy is the only dependency, Python is a
 docstring, every array input is exactly typed and bounded, read in place when
-C-contiguous and aligned and copied once otherwise (never converted), every
-output is a fresh array that owns its memory and aliases no input, the tables
-cover the whole public API, and the GIL is released while computing.
+C-contiguous and aligned and copied once otherwise, converted only when numpy
+casts the dtype safely and then with a warning, every output is a fresh array
+that owns its memory and aliases no input, the tables cover the whole public
+API, and the GIL is released while computing.
 """
 
 import _thread
@@ -26,6 +27,7 @@ from helpers import (
     LITTLE_ENDIAN,
     box,
     circle,
+    first_hits,
     leaves,
     longest_gil_stall,
     public_api,
@@ -95,11 +97,10 @@ def _big_buffer():
 _SLOW_CALLS = {
     "RayScene": (lambda: sphere(500, 1000), lambda mesh: len(trimkit.RayScene([mesh]))),
     "RayScene.boxes": (_many_instances, lambda i: trimkit.RayScene([box()]).boxes(*i).boxes()),
-    "RayScene.intersect_first": (
+    "RayScene.intersect": (
         _big_rays,
-        lambda i: trimkit.RayScene([i[0]]).intersect_first(*i[1], i[2], np.zeros(8, dtype=np.int64)),
+        lambda i: trimkit.RayScene([i[0]]).intersect(*i[1], i[2], np.zeros(8, dtype=np.int64)),
     ),
-    "RayScene.intersect_all": (_big_rays, lambda i: trimkit.RayScene([i[0]]).intersect_all(*i[1])),
     "RayScene.intersect_any": (_big_rays, lambda i: trimkit.RayScene([i[0]]).intersect_any(*i[1])),
     "Boxes": (_big_boxes, lambda b: len(trimkit.Boxes(b))),
     "Boxes.bounds": (_big_boxes, lambda b: trimkit.Boxes(b).bounds),
@@ -149,11 +150,8 @@ def empty_calls():
     no_rays = (no_vertices, no_vertices)
     return {
         "RayScene": lambda: len(trimkit.RayScene([])),
-        "RayScene.intersect_first": lambda: trimkit.RayScene([(no_vertices, no_faces)]).intersect_first(
-            *no_rays
-        ),
         "RayScene.boxes": lambda: trimkit.RayScene([]).boxes().boxes(),
-        "RayScene.intersect_all": lambda: trimkit.RayScene([]).intersect_all(
+        "RayScene.intersect": lambda: trimkit.RayScene([(no_vertices, no_faces)]).intersect(
             *no_rays, np.zeros((0, 4, 4)), np.zeros(0, dtype=np.int64)
         ),
         "RayScene.intersect_any": lambda: trimkit.RayScene([]).intersect_any(*no_rays),
@@ -266,8 +264,8 @@ def test_the_bound_itself_is_accepted():
     vertices, faces = sphere(8, 16)
     huge = vertices * 1e30
     assert np.abs(huge).max() == 1e30
-    _, hit_faces, _ = trimkit.RayScene([(huge, faces)]).intersect_first(
-        np.zeros((50, 3)), np.random.default_rng(0).normal(size=(50, 3))
+    _, hit_faces, _ = first_hits(
+        trimkit.RayScene([(huge, faces)]), np.zeros((50, 3)), np.random.default_rng(0).normal(size=(50, 3))
     )
     assert (hit_faces >= 0).all()
     assert len(trimkit.simplify(huge, faces, 20)[1]) == len(trimkit.simplify(vertices, faces, 20)[1])
@@ -309,8 +307,7 @@ def _array_arguments(big: bool = False) -> dict:
             {"meshes": [(vertices, faces)]},
         ),
         ("RayScene.boxes", scene.boxes, ray_instances),
-        ("RayScene.intersect_first", scene.intersect_first, {**origins_directions, **ray_instances}),
-        ("RayScene.intersect_all", scene.intersect_all, {**origins_directions, **ray_instances}),
+        ("RayScene.intersect", scene.intersect, {**origins_directions, **ray_instances}),
         ("RayScene.intersect_any", scene.intersect_any, {**origins_directions, **ray_instances}),
         ("Boxes", trimkit.Boxes, {"boxes": bounds}),
         ("Boxes.bounds", lambda: trimkit.Boxes(bounds).bounds, {}),
@@ -378,10 +375,15 @@ def _replace(value, path, new):
 
 
 def _converted(value: np.ndarray):
-    # the same values as another dtype and as a list: never accepted
-    other = {np.dtype(np.float64): np.float32, np.dtype(np.int64): np.int32, np.dtype(np.uint8): np.int8}
-    yield "dtype", value.astype(other.get(value.dtype, np.float64))
+    # the same values as a narrower dtype of the same kind (a safe cast back,
+    # converted with a warning), as a list (the same), and as a dtype that
+    # casts back only with loss (refused). A uint8 buffer as a list reads as
+    # int64, which doesn't cast back safely either
+    narrower = {np.dtype(np.float64): np.float32, np.dtype(np.int64): np.int32, np.dtype(np.uint8): np.int8}
+    lossy = {np.dtype(np.float64): np.complex128, np.dtype(np.int64): np.float64, np.dtype(np.uint8): np.int8}
+    yield "narrower", value.astype(narrower.get(value.dtype, np.float64))
     yield "list", value.tolist()
+    yield "lossy", value.astype(lossy.get(value.dtype, np.int64))
 
 
 def _relaid(value: np.ndarray):
@@ -400,19 +402,42 @@ def _relaid(value: np.ndarray):
 
 
 @pytest.mark.parametrize("name", API)
-def test_arrays_are_never_converted(name):
-    # every array argument, and each array of a mesh tuple, refused as any
-    # other dtype or as a list (the bare arrays of a list, draco's
-    # attributes, take any dtype)
+def test_safe_conversions_warn_and_match(name):
+    # every array argument, and each array of a mesh pair, given as another
+    # dtype or a list: converted with a UserWarning naming the argument and
+    # answering exactly as the exact dtype does when numpy casts it back
+    # safely, a TypeError naming the argument otherwise (the bare arrays of a
+    # list, draco's attributes, take any dtype as they are)
     runs_here(name)
     function, arguments = _array_arguments()[name]
     for argument, value in arguments.items():
         for path, array, in_tuple in _paths(value):
             if array.dtype.names or not (in_tuple or not path):
                 continue
-            for _how, wrong in _converted(array):
-                with pytest.raises(TypeError, match=argument):
-                    function(**{**arguments, argument: _replace(value, path, wrong)})
+            for how, wrong in _converted(array):
+                given = {**arguments, argument: _replace(value, path, wrong)}
+                if not np.can_cast(np.asarray(wrong).dtype, array.dtype, "safe"):
+                    with pytest.raises(TypeError, match=argument):
+                        function(**given)
+                    continue
+                # the same values as the exact dtype (narrowing rounded them)
+                same = np.asarray(wrong).astype(array.dtype).reshape(array.shape)
+                expected = _results(function(**{**arguments, argument: _replace(value, path, same)}))
+                with pytest.warns(UserWarning, match=f"{argument}.*converted to {array.dtype.name}"):
+                    got = _results(function(**given))
+                for a, b in zip(got, expected, strict=True):
+                    same = np.array_equal(a, b, equal_nan=True) if isinstance(a, np.ndarray) else a == b
+                    assert same, (argument, how)
+
+
+def test_a_mesh_is_any_pair():
+    # a mesh is any sequence of two: a list is as good as a tuple, a triple isn't
+    vertices, faces = box()
+    expected = trimkit.RayScene([(vertices, faces)]).boxes().boxes()
+    assert np.array_equal(trimkit.RayScene([[vertices, faces]]).boxes().boxes(), expected)
+    assert np.array_equal(trimkit.CollisionScene([[vertices, faces]]).boxes().boxes(), expected)
+    with pytest.raises(TypeError, match=r"meshes\[0\] must be a \(vertices, faces\) pair"):
+        trimkit.RayScene([(vertices, faces, faces)])
 
 
 def _results(result) -> list:
@@ -502,10 +527,10 @@ def _long_query(name: str, scale: int):
     # a query whose structure is built outside it, so only the polling loop is
     # timed: a tinybvh build has no point at which to check for Ctrl-C
     rng = np.random.default_rng(0)
-    if name == "RayScene.intersect_all":
+    if name == "RayScene.intersect":
         scene = trimkit.RayScene([sphere(100, 200)])
         origins, directions = rng.normal(size=(2, 250_000 * scale, 3)) * 0.1
-        return lambda: scene.intersect_all(origins, directions)
+        return lambda: scene.intersect(origins, directions)
     corners = rng.uniform(0, 100, (200_000, 3))
     tree = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
     queries = rng.uniform(0, 100, (25_000 * scale, 3))
@@ -514,7 +539,7 @@ def _long_query(name: str, scale: int):
 
 
 @pytest.mark.timing
-@pytest.mark.parametrize("name", ["decompose", "RayScene.intersect_all", "Boxes.intersect"])
+@pytest.mark.parametrize("name", ["decompose", "RayScene.intersect", "Boxes.intersect"])
 def test_ctrl_c_stops_long_calls(name):
     # every long loop polls for Ctrl-C with the GIL released: an interrupt
     # 50 ms in stops the call well before it would finish. Queries double
@@ -586,8 +611,8 @@ index = np.zeros(300, np.int64)
 boxes = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
 outputs = [
     boxes.intersect(np.stack([queries, queries + 3.0], axis=1)),
-    *scene.intersect_first(origins, directions),
-    *scene.intersect_all(origins, directions),
+    *scene.intersect(origins, directions, maximum_hits=1),
+    *scene.intersect(origins, directions),
     *solids.distances(matrices, index),
     solids.collides(matrices, index),
 ]
@@ -798,7 +823,15 @@ def _scalar_calls():
         ),
         "convex": (lambda v: trimkit.CollisionScene([box()], convex=v).distances(placed, which), True),
         "margin": (lambda v: (scene().collides(placed, which, margin=v),), 1),
+        "maximum_hits": (
+            lambda v: trimkit.RayScene([(vertices, faces)]).intersect(
+                np.zeros((2, 3)), np.eye(3)[:2], maximum_hits=v
+            ),
+            2,
+        ),
         "upper_bound": (lambda v: scene().distances(placed, which, upper_bound=v), 4),
+        # False never touches a device, so this runs everywhere
+        "use_gpu": (lambda v: len(trimkit.RayScene([(vertices, faces)], use_gpu=v)), False),
     }
 
 
@@ -824,6 +857,7 @@ def test_numpy_scalars_are_python_scalars(name):
         "decompose maximum_vertices",
         "resolution",
         "quantization_bits",
+        "maximum_hits",
     )
     for scalar in _numpy_kinds(value):
         if integral and isinstance(scalar, (float, np.floating)):
@@ -834,7 +868,7 @@ def test_numpy_scalars_are_python_scalars(name):
             assert np.array_equal(got, same, equal_nan=True) if isinstance(got, np.ndarray) else got == same
 
 
-@pytest.mark.parametrize("name", ["lock_border", "convex"])
+@pytest.mark.parametrize("name", ["lock_border", "convex", "use_gpu"])
 @pytest.mark.parametrize("wrong", [0, 1, None, "yes", np.int64(1)])
 def test_nothing_else_is_a_bool(name, wrong):
     with pytest.raises(TypeError):

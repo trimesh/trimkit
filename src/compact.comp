@@ -1,0 +1,56 @@
+// The chunk's crossings as the host reads them, written straight into host
+// memory: one lane per output slot, so consecutive lanes write consecutive
+// addresses (a write over the bus must coalesce: a lane per ray writing its
+// run of crossings measured 50x slower), and lanes past the scan's total do
+// nothing, so the output is sized by the device without the host knowing the
+// total. A slot's ray is found by binary search over src/scan.comp's offsets;
+// its crossing is read from where src/trace.comp put it: pass 1 wrote it
+// compacted at this same slot (`dense` 0), pass 2 dense at `ray * dense + k`.
+// Four columns, 20 bytes a crossing: the host widens them to the caller's
+// int64 (adding the chunk's first ray, mapping the instance through its
+// table) as it copies them into the result, which costs it the same as
+// copying int64 would. Compiled by `uv run scripts generate` into
+// src/trace_spirv.hpp
+#version 450
+
+layout(local_size_x = 256) in;
+#define GROUP 256u
+
+layout(set = 0, binding = 0, std430) readonly buffer OffsetBuffer { uint offsets[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BlockBuffer { uint blocks[]; };  // the total after the last block
+layout(set = 0, binding = 2, std430) readonly buffer InstanceBuffer { uint hit_instances[]; };
+layout(set = 0, binding = 3, std430) readonly buffer FaceBuffer { uint hit_faces[]; };
+layout(set = 0, binding = 4, std430) readonly buffer DistanceBuffer { double hit_distances[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer OutRayBuffer { uint out_rays[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer OutInstanceBuffer { uint out_instances[]; };
+layout(set = 0, binding = 7, std430) writeonly buffer OutFaceBuffer { uint out_faces[]; };
+layout(set = 0, binding = 8, std430) writeonly buffer OutDistanceBuffer { double out_distances[]; };
+layout(push_constant) uniform Constants {
+    uint count;        // rays in the chunk
+    uint block_count;  // the scan's blocks: the total is blocks[block_count]
+    uint dense;        // slots per ray pass 2 wrote, or 0 when pass 1 wrote compacted
+};
+
+void main() {
+    // groups in two dimensions: a device may cap one dimension at 65535
+    const uint slot = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP) + gl_GlobalInvocationID.x;
+    if (slot >= blocks[block_count]) {
+        return;
+    }
+    // the ray whose run holds the slot: the first r with offsets[r + 1] > slot
+    uint low = 0u, high = count - 1u;
+    while (low < high) {
+        const uint mid = (low + high) / 2u;
+        if (offsets[mid + 1u] > slot) {
+            high = mid;
+        } else {
+            low = mid + 1u;
+        }
+    }
+    const uint r = low;
+    const uint from = dense == 0u ? slot : r * dense + (slot - offsets[r]);
+    out_rays[slot] = r;
+    out_instances[slot] = hit_instances[from];
+    out_faces[slot] = hit_faces[from];
+    out_distances[slot] = hit_distances[from];
+}

@@ -187,7 +187,10 @@ def bvh_old(scene, origin, scale, origins, directions):
 def bvh_new(built, origins, directions):
     origins = np.ascontiguousarray(origins, np.float64)
     directions = np.ascontiguousarray(directions, np.float64)
-    return built[0].intersect_first(origins, directions)[1]
+    rays, _, faces, _ = built[0].intersect(origins, directions, maximum_hits=1)
+    hit = np.full(len(origins), -1, dtype=np.int64)
+    hit[rays] = faces
+    return hit
 
 
 def _hit(vertices, faces, faces_hit, origins, directions):

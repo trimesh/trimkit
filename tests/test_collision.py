@@ -76,7 +76,8 @@ def test_convex_meshes_are_solids():
     assert scene(False, inner, outer).collides().tolist() == []
     assert scene(True, inner, outer).collides().tolist() == [[0, 1]]
     assert scene(False, inner, outer).distances()[0][0] == pytest.approx(0.4)
-    assert scene(True, inner, outer).distances()[0][0] < 0.0
+    # as solids: the least translation that separates them, 0.6 along an axis
+    assert scene(True, inner, outer).distances()[0][0] == pytest.approx(-0.6, abs=1e-9)
 
 
 @pytest.mark.parametrize("convex", [False, True])
@@ -281,8 +282,9 @@ def test_convex_is_a_solid_against_every_mesh():
     flipped = scene([True, False], outer, inner)
     assert mixed.collides().tolist() == [[0, 1]]
     assert flipped.collides().tolist() == [[0, 1]]
-    distance, points, normals = mixed.distances()
-    assert distance[0] < 0.0
+    # the inner surface is 0.4 inside the solid's boundary, either way round
+    assert mixed.distances()[0][0] == pytest.approx(-0.4, abs=1e-9)
+    assert flipped.distances()[0][0] == pytest.approx(-0.4, abs=1e-9)
     # apart, a mixed pair measures the same as two surfaces, either way round
     matrices = placed(0.0, 2.0)
     for order in ([False, True], [True, False]):
@@ -325,7 +327,9 @@ def test_upper_bound_is_exact(convex):
     matrices = placed(0.0, (2.2, 2.2, 2.2))
     measured, points, normals = two.distances(matrices)
     gap = measured[0]
-    assert 1.5 < gap < 2.0
+    # the gap a brute-force minimum over every vertex of either sphere against
+    # every triangle of the other gives (2026-11-09), from each kernel alike
+    assert gap == pytest.approx(1.813354063143859, abs=1e-9)
     far, far_points, far_normals = two.distances(matrices, upper_bound=1.0)
     assert far.tolist() == [np.inf]
     assert np.isnan(far_points).all() and np.isnan(far_normals).all()

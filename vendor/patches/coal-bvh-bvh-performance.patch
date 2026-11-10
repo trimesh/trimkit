@@ -1,8 +1,22 @@
 kind: perf
 upstream: coal PR #858 (open), "Improve the performances of BVH-BVH collision
 detection", by coal maintainer lmontaut: its head, d7b7355, merged onto the
-pinned devel commit with no conflicts in include/ or src/ (rebased 2026-11-06). Drop this patch once
-#858 is in devel.
+pinned devel commit with no conflicts in include/ or src/ (rebased 2026-11-06).
+  https://github.com/coal-library/coal/pull/858
+  https://github.com/coal-library/coal/commit/d7b73551d8a530d88c03aa1e2d8a722daf1b941a
+Drop this patch once #858 is in devel.
+
+Status 2026-11-09: opened 2026-05-13; approved by maintainer jcarpent on
+2026-09-22; maintainer jorisv asked the same day for housekeeping only (delete
+collision_node.cpp and traversal_recurse.cpp, which the PR empties and drops
+from its CMake, and use constexpr now that C++17 is coal's floor); the author
+pushed one fix on 2026-10-02 and stopped, and on 2026-11-05 jorisv wrote "This
+PR is stall since a lot of time. Can you fix the last issues ?". So the change
+itself is reviewed and accepted; only the author's follow-through is missing.
+Revisit at each `update`: if it merges, `update` drops this patch; if it is
+closed instead, decide again whether 2x on mesh-mesh `collides` is worth
+owning these 1680 lines (660 of them are the recursion moving from
+traversal_recurse.cpp into traversal_recurse.h, counted twice).
 
 Mesh/mesh collision was 1.5-2x slower than FCL (coal issue #857): the
 traversal nodes are virtual, the relative transform is recomputed, and every

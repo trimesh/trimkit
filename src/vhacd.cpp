@@ -1,8 +1,11 @@
 // Approximate convex decomposition with kmammou/v-hacd (VHACD.h).
 //
-// V-HACD runs synchronously on the calling thread with the GIL released, using
-// its own thread pool, whose answers match running alone. Its progress callback is where
-// we poll for Ctrl-C, cancelling the decomposition cleanly if one arrives.
+// V-HACD runs synchronously on the calling thread with the GIL released. Its
+// fan-outs (splitting hulls, costing merges) run on the extension's one pool
+// through the hook vendor/patches/vhacd-parallel-for.patch adds, in place of
+// the 8-thread pool it would start per call, and answer the same however the
+// ranges fall. Its progress callback is where we poll for Ctrl-C, cancelling
+// the decomposition cleanly if one arrives.
 
 #include "common.hpp"
 
@@ -35,6 +38,13 @@ public:
 private:
     VHACD::IVHACD* vhacd_;
 };
+
+// V-HACD's fan-outs on the one pool: a body over [0, count), every item once,
+// an exception a worker's range threw rethrown here, on V-HACD's thread
+void parallel_for(void* /*unused*/, std::size_t count, void (*body)(void* context, std::size_t begin, std::size_t end),
+                  void* context) {
+    trimkit::run_ranges(count, body, context);
+}
 
 // refuse what V-HACD would misbehave on rather than check
 void check_parameters(std::uint32_t maximum_hulls, std::uint32_t maximum_vertices, std::uint32_t resolution,
@@ -73,8 +83,9 @@ trimkit::MeshOuts decompose(const trimkit::Array<double, -1, 3>& vertices_argume
                             trimkit::Number<double> maximum_error) {
     const trimkit::In<double, -1, 3> vertices = trimkit::read(vertices_argument, "vertices");
     check_parameters(maximum_hulls, maximum_vertices, resolution, maximum_error);
-    // everything else stays V-HACD's own default, its thread pool included
+    // everything else stays V-HACD's own default
     VHACD::IVHACD::Parameters parameters;
+    parameters.m_parallelFor = &parallel_for;
     parameters.m_maxConvexHulls = maximum_hulls;
     parameters.m_maxNumVerticesPerCH = maximum_vertices;
     parameters.m_resolution = resolution;

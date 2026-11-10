@@ -1,0 +1,202 @@
+{
+ "boxes": {
+  "arrays": [
+   [
+    "float64",
+    [
+     2,
+     2,
+     3
+    ]
+   ],
+   [
+    "float64",
+    [
+     12,
+     2,
+     3
+    ]
+   ]
+  ],
+  "sha256": "b7ab67ac8958d323a5a605ffa840662b6e462730ff112ca6d885629c3de1f8c0"
+ },
+ "intersect": {
+  "arrays": [
+   [
+    "int64",
+    [
+     2868
+    ]
+   ],
+   [
+    "int64",
+    [
+     2868
+    ]
+   ],
+   [
+    "int64",
+    [
+     2868
+    ]
+   ],
+   [
+    "float64",
+    [
+     2868
+    ]
+   ]
+  ],
+  "sha256": "c1f4c5271271a73731e11bbfb62543a10a114394fac31ade6c4a1571fa206cd3"
+ },
+ "intersect nearest": {
+  "arrays": [
+   [
+    "int64",
+    [
+     1123
+    ]
+   ],
+   [
+    "int64",
+    [
+     1123
+    ]
+   ],
+   [
+    "int64",
+    [
+     1123
+    ]
+   ],
+   [
+    "float64",
+    [
+     1123
+    ]
+   ]
+  ],
+  "sha256": "462bf41abc19ee6fec7ecb2b2cad042fbf911caa0b85c7c93a607cefca023e88"
+ },
+ "intersect two": {
+  "arrays": [
+   [
+    "int64",
+    [
+     2046
+    ]
+   ],
+   [
+    "int64",
+    [
+     2046
+    ]
+   ],
+   [
+    "int64",
+    [
+     2046
+    ]
+   ],
+   [
+    "float64",
+    [
+     2046
+    ]
+   ]
+  ],
+  "sha256": "a6746f4bf9b91d2d4246d69d41990061cd7498172a745c8846600c7f6d1d2c2b"
+ },
+ "intersect_any": {
+  "arrays": [
+   [
+    "bool",
+    [
+     4394
+    ]
+   ]
+  ],
+  "sha256": "377a41d984d3993fdfa9c07a4c9a0a3aac424f3c1b35bc2e64658a82d2518489"
+ },
+ "instances intersect": {
+  "arrays": [
+   [
+    "int64",
+    [
+     10618
+    ]
+   ],
+   [
+    "int64",
+    [
+     10618
+    ]
+   ],
+   [
+    "int64",
+    [
+     10618
+    ]
+   ],
+   [
+    "float64",
+    [
+     10618
+    ]
+   ]
+  ],
+  "sha256": "6ebabe30ebb9a94b89954222d26bc2cf2756e1b405497461871914dbb7e375cb"
+ },
+ "instances nearest": {
+  "arrays": [
+   [
+    "int64",
+    [
+     2965
+    ]
+   ],
+   [
+    "int64",
+    [
+     2965
+    ]
+   ],
+   [
+    "int64",
+    [
+     2965
+    ]
+   ],
+   [
+    "float64",
+    [
+     2965
+    ]
+   ]
+  ],
+  "sha256": "44890fcad3dc0c062cb554af2f4519038f544914baddcc5102f004b6d0d3782f"
+ },
+ "instances intersect_any": {
+  "arrays": [
+   [
+    "bool",
+    [
+     4394
+    ]
+   ]
+  ],
+  "sha256": "8bb3dc60150c6205d854bec63bb15a5324621303b4cfcfbd5dec1a9c10a213ef"
+ },
+ "Boxes.intersect": {
+  "arrays": [
+   [
+    "int64",
+    [
+     11034,
+     2
+    ]
+   ]
+  ],
+  "sha256": "26214de48f9bd4a47b8a4ad9246b7dd848d08fa04d1b5192a3cc4729ec5d30f8"
+ }
+}

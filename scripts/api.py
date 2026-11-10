@@ -155,7 +155,7 @@ def inside() -> str:
     manifest = load()
 
     def links(upstreams) -> str:
-        return ", ".join("ours" if u.own else f"[{u.repo}](https://{u.host}/{u.repo})" for u in upstreams)
+        return ", ".join(f"[{u.repo}](https://{u.host}/{u.repo})" for u in upstreams)
 
     def spdx(upstreams) -> str:
         return ", ".join(u.spdx for u in upstreams)

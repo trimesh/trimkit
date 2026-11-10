@@ -122,6 +122,13 @@ def test_arc_reaching_past_the_bound_is_a_line():
     assert rows("M0 0 A1 1e-291 0 0 0 0 1")["kind"].tolist() == [trimkit.exchange.SvgKind.LINE]
 
 
+def test_arc_below_its_radii_precision_is_a_line():
+    # found by fuzzing: a chord of 1e-300 against radii of 1e30 underflows the
+    # center conversion to nothing (the endpoints coincide as far as the
+    # ellipse can tell), so that arc is its chord
+    assert rows("M0 0 A1e30 1e30 0 0 1 1e-300 0")["kind"].tolist() == [trimkit.exchange.SvgKind.LINE]
+
+
 @pytest.mark.parametrize("rx", ["3.2e-168", "1e-300", "1e30"])
 def test_extreme_radii(rx):
     # found by fuzzing: squaring radii like these underflowed or overflowed the
@@ -278,8 +285,10 @@ def test_string_hand_built():
     bad["points"][1, 3] = len(vertices)
     with pytest.raises(ValueError, match="out of range"):
         trimkit.exchange.svg_string(vertices, bad)
-    with pytest.raises(TypeError, match="vertices"):
-        trimkit.exchange.svg_string(vertices.astype(np.float32), segments)
+    # float32 vertices cast safely: converted with a warning, the same path
+    with pytest.warns(UserWarning, match="vertices: float32 converted to float64"):
+        converted = trimkit.exchange.svg_string(vertices.astype(np.float32), segments)
+    assert converted == trimkit.exchange.svg_string(vertices, segments)
 
 
 def test_string_close_is_by_vertex():

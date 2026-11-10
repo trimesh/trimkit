@@ -10,8 +10,12 @@
 // never copied. One of the exact dtype in any other layout (strided,
 // reversed, Fortran-ordered, misaligned) is copied once, exactly as
 // `numpy.ascontiguousarray` would: what a caller would have written, and
-// lossless. Nothing is ever converted: any other dtype, a list or anything
-// else is a TypeError (or for values, a ValueError) naming the argument.
+// lossless. An array of another dtype that numpy casts safely (float32 to
+// float64, int32 to int64: lossless), or a list, is converted once with a
+// UserWarning naming the argument: the copy is what the caller would have
+// written, and the warning says so. Anything else, a dtype that would lose
+// values or an object that isn't array-like, is a TypeError (or for values,
+// a ValueError) naming the argument.
 // Read-only, mmap'd and buffer-protocol inputs are all fine. Call them with
 // the GIL held; long scans release it themselves. The one copy always made
 // is `read_indices`': faces arrive as int64 and each library takes its own
@@ -67,8 +71,9 @@ using AnyArguments = nb::typed<nb::sequence, nb::ndarray<>>;
 
 // An argument that must already be an `In<T, Shape...>`. It reads as that
 // array type in the signature and stubs, but nanobind accepts any object for
-// it, and `read` checks it without converting: no copy, ever, and a TypeError
-// that names the argument instead of an overload dump.
+// it, and `read` checks it itself: in place when exact, copied or converted
+// once as the header says, and a TypeError that names the argument instead
+// of an overload dump.
 template <typename T, nb::ssize_t... Shape>
 struct Array {
     nb::handle object;
@@ -197,32 +202,73 @@ inline std::string describe(nb::handle object) {
     return detail::text(object.type().attr("__name__"));
 }
 
+// The one warning the extension gives, a UserWarning at the caller: something
+// asked for happened another way (a conversion, the CPU answering for a
+// device). A filter that makes warnings errors raises here, before anything runs
+inline void warn(const std::string& message) {
+    if (PyErr_WarnEx(PyExc_UserWarning, message.c_str(), 1) != 0) {
+        throw nb::python_error();
+    }
+}
+
 namespace detail {
 
+// `name` arrived as `source` and is read as a fresh `dtype` copy
+inline void warn_converted(const std::string& name, const std::string& source, const char* dtype) {
+    warn(name + ": " + source + " converted to " + dtype + " (a copy); pass a " + dtype + " array to avoid it");
+}
+
 // A numpy array of exactly `dtype` (any dtype for null) that can't be read
-// in place, as one fresh C-contiguous copy: what `numpy.ascontiguousarray`
-// gives, and aligned as every fresh numpy buffer is, where a view at an odd
-// byte offset would make every read of it undefined (a packed structured
-// dtype counts as aligned to numpy there, so this always copies). Anything
-// else, another dtype or a list, gets nothing: it stays refused
-inline nb::object relaid(nb::handle object, const char* dtype) {
+// in place, as one fresh C-contiguous copy, aligned as every fresh numpy
+// buffer is (a view at an odd byte offset would make every read of it
+// undefined; a packed structured dtype counts as aligned to numpy there, so
+// this always copies):
+// - an ndarray of that dtype in another layout, what `numpy.ascontiguousarray`
+//   gives, silently: lossless, and what a caller would have written
+// - with a dtype named, an ndarray of another dtype that numpy casts safely
+//   (`can_cast(..., "safe")`: float32 to float64, int32 to int64, never the
+//   other way), or a list or any other sequence `numpy.asarray` reads,
+//   converted with a UserWarning naming the argument
+// Anything else gets nothing: it stays refused
+inline nb::object relaid(nb::handle object, const char* dtype, const std::string& name) {
     const nb::module_ numpy = nb::module_::import_("numpy");
-    const bool exact = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1 &&
-                       (dtype == nullptr || object.attr("dtype").equal(numpy.attr("dtype")(dtype)));
-    if (!exact) {
+    const bool is_array = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1;
+    nb::object array = nb::borrow(object);
+    if (!is_array) {
+        if (dtype == nullptr) {
+            return {};
+        }
+        // what numpy makes of it, or nothing: a ragged list, a scene, None
+        try {
+            array = numpy.attr("asarray")(object);
+        } catch (const nb::python_error&) {
+            return {};
+        }
+    }
+    const std::string source = is_array ? text(array.attr("dtype")) : "a " + text(object.type().attr("__name__"));
+    if (dtype == nullptr || array.attr("dtype").equal(numpy.attr("dtype")(dtype))) {
+        if (!is_array) {
+            warn_converted(name, source, dtype);
+        }
+        return numpy.attr("array")(array, nb::arg("copy") = true, nb::arg("order") = "C");
+    }
+    const nb::object wanted = numpy.attr("dtype")(dtype);
+    if (!nb::cast<bool>(numpy.attr("can_cast")(array.attr("dtype"), wanted, "safe"))) {
         return {};
     }
-    return numpy.attr("array")(object, nb::arg("copy") = true, nb::arg("order") = "C");
+    warn_converted(name, source, dtype);
+    return numpy.attr("array")(array, nb::arg("dtype") = wanted, nb::arg("copy") = true, nb::arg("order") = "C");
 }
 
 // view an object as exactly an In<T, Shape...>, aligned for T: in place, or
-// copied once when only its layout is wrong. The view holds what it reads
+// copied once when its layout is wrong, or converted once (with a warning)
+// when its dtype casts safely. The view holds what it reads
 template <typename T, nb::ssize_t... Shape>
 In<T, Shape...> view(nb::handle object, const std::string& name) {
     In<T, Shape...> array;
     bool exact = nb::try_cast(object, array, /*convert=*/false) && aligned(array.data(), alignof(T));
     if (!exact) {
-        const nb::object copy = relaid(object, dtype_name<T>());
+        const nb::object copy = relaid(object, dtype_name<T>(), name);
         exact = copy.is_valid() && nb::try_cast(copy, array, /*convert=*/false) && aligned(array.data(), alignof(T));
     }
     if (!exact) {
@@ -262,13 +308,18 @@ bool same_bytes(const Array<T, Shape...>& argument, const std::vector<T>& stored
 
 // A bool array argument, as its bytes: a byte other than 0 or 1 in a numpy
 // bool array (a uint8 array viewed as bool can hold one) is undefined as a
-// C++ bool, so its values are read as uint8 and tested `!= 0`
+// C++ bool, so its values are read as uint8 and tested `!= 0`. A list of
+// bools converts (with the warning); no other dtype casts safely to bool
 inline In<std::uint8_t, -1> read(const Array<bool, -1>& argument, const std::string& name) {
-    const nb::handle object = argument.object;
     const nb::module_ numpy = nb::module_::import_("numpy");
-    if (PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) != 1 ||
-        !object.attr("dtype").equal(numpy.attr("dtype")("bool")) || nb::cast<int>(object.attr("ndim")) != 1) {
-        type_error(name + " must be a bool array of shape (*,), not " + describe(object));
+    nb::object object = nb::borrow(argument.object);
+    const bool is_array = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1;
+    if (!is_array) {
+        object = detail::relaid(object, "bool", name);
+    }
+    if (!object.is_valid() || !object.attr("dtype").equal(numpy.attr("dtype")("bool")) ||
+        nb::cast<int>(object.attr("ndim")) != 1) {
+        type_error(name + " must be a bool array of shape (*,), not " + describe(argument.object));
     }
     return detail::view<std::uint8_t, -1>(object.attr("view")("u1"), name);
 }
@@ -308,7 +359,7 @@ std::vector<Index> read_indices(const Array<std::int64_t, -1, 3>& argument, cons
     return indices;
 }
 
-// A mesh argument: a `(vertices, faces)` tuple, shown in signatures as
+// A mesh argument: a `(vertices, faces)` pair, shown in signatures as
 // `Mesh`, the alias src/trimkit.cpp defines. `read_mesh` checks it
 struct MeshArgument {
     nb::handle object;
@@ -326,13 +377,13 @@ struct Mesh {
     std::vector<Index> faces;
 };
 
-// One mesh of a sequence, named `name` (as "meshes[3]"): exactly a 2-tuple,
-// whose (n, 3) float64 vertices and (m, 3) int64 faces read as every other
-// array does, the faces checked against the vertices
+// One mesh of a sequence, named `name` (as "meshes[3]"): any sequence of
+// exactly two, whose (n, 3) float64 vertices and (m, 3) int64 faces read as
+// every other array does, the faces checked against the vertices
 template <typename Index>
 Mesh<Index> read_mesh(nb::handle object, const std::string& name) {
-    if (!nb::isinstance<nb::tuple>(object) || nb::len(object) != 2) {
-        type_error(name + " must be a (vertices, faces) tuple, not " + describe(object));
+    if (!nb::isinstance<nb::sequence>(object) || nb::len(object) != 2) {
+        type_error(name + " must be a (vertices, faces) pair, not " + describe(object));
     }
     Mesh<Index> mesh;
     mesh.vertices = read<double, -1, 3>(object[0], name + "[0]");
@@ -359,7 +410,7 @@ inline AnyIn read_any(nb::handle object, const std::string& name) {
     // in place, or its own dtype copied once into a readable layout
     AnyIn array;
     if (!detail::any_readable(object, &array)) {
-        const nb::object copy = detail::relaid(object, nullptr);
+        const nb::object copy = detail::relaid(object, nullptr, name);
         if (!copy.is_valid() || !detail::any_readable(copy, &array)) {
             type_error(name + " must be a numeric array, not " + describe(object));
         }
@@ -411,7 +462,7 @@ Records<Record> read_records(nb::handle object, const nb::object& dtype, const c
                           nb::try_cast(object.attr("view")("u1"), bytes, /*convert=*/false) &&
                           detail::aligned(bytes.data(), alignof(Record));
     if (!in_place) {
-        bytes = detail::view<std::uint8_t, -1>(detail::relaid(object, nullptr).attr("view")("u1"), name);
+        bytes = detail::view<std::uint8_t, -1>(detail::relaid(object, nullptr, name).attr("view")("u1"), name);
     }
     return {bytes};
 }

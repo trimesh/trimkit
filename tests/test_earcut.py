@@ -53,14 +53,17 @@ def test_inputs_in_place_or_refused():
     frozen.flags.writeable = False
     for interiors in ([hole], (hole,)):
         assert np.array_equal(trimkit.triangulate(frozen, interiors)[1], expected)
-    # a ring of another dtype, or a list, is refused naming which one (the
-    # exterior is covered with every other array in test_invariants)
-    for exterior, interiors, name in [
-        (shell, [hole.astype(np.float32)], r"interiors\[0\]"),
-        (shell, [hole, hole.tolist()], r"interiors\[1\]"),
+    # a ring of a dtype that casts safely, or a list, is converted with a
+    # warning naming which one and tiles the same; anything else is refused
+    # naming it (the exterior is covered with every other array in test_invariants)
+    for interiors, name in [
+        ([hole.astype(np.float32)], r"interiors\[0\]: float32 converted to float64"),
+        ([hole.tolist()], r"interiors\[0\]: a list converted to float64"),
     ]:
-        with pytest.raises(TypeError, match=name):
-            trimkit.triangulate(exterior, interiors)
+        with pytest.warns(UserWarning, match=name):
+            assert np.array_equal(trimkit.triangulate(shell, interiors)[1], expected)
+    with pytest.raises(TypeError, match=r"interiors\[1\]"):
+        trimkit.triangulate(shell, [hole, "not a ring"])
 
 
 def test_no_holes_and_empty_rings():

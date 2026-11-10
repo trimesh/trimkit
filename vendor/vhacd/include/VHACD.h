@@ -393,6 +393,11 @@ public:
         bool                m_asyncACD{ true };             // Whether or not to run asynchronously, taking advantage of additional cores
         uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
         bool                m_findBestPlane{ false };       // Whether or not to attempt to split planes along the best location. Experimental feature. False by default.
+        // trimkit (vendor/patches/vhacd-parallel-for.patch): the caller's own fan-out, if it has one: runs
+        // body(bodyContext, begin, end) over [0, count) on whatever threads it likes and returns once every item
+        // ran, in place of the thread pool Compute would otherwise start. Null runs every fan-out in order here.
+        void              (*m_parallelFor)(void* context, size_t count, void (*body)(void* bodyContext, size_t begin, size_t end), void* bodyContext){ nullptr };
+        void*               m_parallelForContext{ nullptr };
     };
 
     /**
@@ -6742,7 +6747,6 @@ public:
     IVHACD::ConvexHull* m_hullA{ nullptr };
     IVHACD::ConvexHull* m_hullB{ nullptr };
     double              m_concavity{ 0 }; // concavity of the two combined
-    std::future<void>   m_future;
 };
 
 class HullPair
@@ -7127,12 +7131,6 @@ bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
     m_canceled = false;
 
     Clean(); // release any previous results
-#if !VHACD_DISABLE_THREADING
-    if ( m_params.m_asyncACD )
-    {
-        m_threadPool = std::unique_ptr<ThreadPool>(new ThreadPool(8));
-    }
-#endif
     CopyInputMesh(points,
                   triangles);
     if ( !m_canceled )
@@ -7328,14 +7326,30 @@ void VHACDImpl::ReleaseConvexHull(ConvexHull* ch)
     }
 }
 
-void jobCallback(std::unique_ptr<VoxelHull>& userPtr)
+// trimkit (vendor/patches/vhacd-parallel-for.patch): body(i) for every i in [0, count), through the caller's
+// m_parallelFor when it gave one (an exception a body throws there comes back out of it, so the fan-out
+// unwinds like a loop), else here in order
+template <typename Body>
+void RunParallel(const IVHACD::Parameters& params, size_t count, const Body& body)
 {
-    userPtr->PerformPlaneSplit();
-}
-
-void computeMergeCostTask(CostTask& ptr)
-{
-    ptr.m_this->PerformMergeCostTask(ptr);
+    if ( params.m_parallelFor && count > 1 )
+    {
+        params.m_parallelFor(params.m_parallelForContext, count, [](void* context, size_t begin, size_t end)
+        {
+            const Body& each = *static_cast<const Body*>(context);
+            for (size_t i = begin; i < end; i++)
+            {
+                each(i);
+            }
+        }, const_cast<Body*>(&body));
+    }
+    else
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            body(i);
+        }
+    }
 }
 
 void VHACDImpl::PerformConvexDecomposition()
@@ -7362,42 +7376,20 @@ void VHACDImpl::PerformConvexDecomposition()
             }
             // First we make a copy of the hulls we are processing
             std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
-            // For each hull we want to split, we either
-            // immediately perform the plane split or we post it as
-            // a job to be performed in a background thread
-            std::vector<std::future<void>> futures(oldList.size());
-            uint32_t futureCount = 0;
+            // Every hull we want to split, split at once through the caller's fan-out
+            std::vector<VoxelHull*> splitting;
+            splitting.reserve(oldList.size());
             for (auto& i : oldList)
             {
-                if ( i->IsComplete() || count > MaxConvexHullFragments )
+                if ( !(i->IsComplete() || count > MaxConvexHullFragments) )
                 {
-                }
-                else
-                {
-#if !VHACD_DISABLE_THREADING
-                    if ( m_threadPool )
-                    {
-                        futures[futureCount] = m_threadPool->enqueue([&i]
-                        {
-                            jobCallback(i);
-                        });
-                        futureCount++;
-                    }
-                    else
-#endif
-                    {
-                        i->PerformPlaneSplit();
-                    }
+                    splitting.push_back(i.get());
                 }
             }
-            // Wait for any outstanding jobs to complete in the background threads
-            if ( futureCount )
+            RunParallel(m_params, splitting.size(), [&splitting](size_t i)
             {
-                for (uint32_t i = 0; i < futureCount; i++)
-                {
-                    futures[i].get();
-                }
-            }
+                splitting[i]->PerformPlaneSplit();
+            });
             // Now, we rebuild the pending convex hulls list by
             // adding the two children to the output list if
             // we need to recurse them further
@@ -7503,43 +7495,19 @@ void VHACDImpl::PerformConvexDecomposition()
                     else
                     {
                         tasks.push_back(std::move(ct));
-                        CostTask* task = &tasks.back();
-#if !VHACD_DISABLE_THREADING
-                        if ( m_threadPool )
-                        {
-                            task->m_future = m_threadPool->enqueue([task]
-                            {
-                                computeMergeCostTask(*task);
-                            });
-                        }
-#endif
                     }
                 }
             }
 
             if ( !m_canceled )
             {
-#if !VHACD_DISABLE_THREADING
-                if ( m_threadPool )
+                RunParallel(m_params, tasks.size(), [&tasks](size_t i)
                 {
-                    for (CostTask& task : tasks)
-                    {
-                        task.m_future.get();
-                    }
-
-                    for (CostTask& task : tasks)
-                    {
-                        AddCostToPriorityQueue(task);
-                    }
-                }
-                else
-#endif
+                    tasks[i].m_this->PerformMergeCostTask(tasks[i]);
+                });
+                for (CostTask& task : tasks)
                 {
-                    for (CostTask& task : tasks)
-                    {
-                        PerformMergeCostTask(task);
-                        AddCostToPriorityQueue(task);
-                    }
+                    AddCostToPriorityQueue(task);
                 }
                 ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
                                100,
@@ -7627,32 +7595,10 @@ void VHACDImpl::PerformConvexDecomposition()
                             }
                         }
                         m_hulls[combinedHull->m_meshId] = combinedHull;
-                        // See how many merge cost tasks were posted
-                        // If there are 8 or more and we are running asynchronously, then do them that way.
-#if !VHACD_DISABLE_THREADING
-                        if ( m_threadPool && tasks.size() >= 2)
+                        RunParallel(m_params, tasks.size(), [&tasks](size_t i)
                         {
-                            for (CostTask& task : tasks)
-                            {
-                                task.m_future = m_threadPool->enqueue([&task]
-                                {
-                                    computeMergeCostTask(task);
-                                });
-                            }
-
-                            for (CostTask& task : tasks)
-                            {
-                                task.m_future.get();
-                            }
-                        }
-                        else
-#endif
-                        {
-                            for (CostTask& task : tasks)
-                            {
-                                PerformMergeCostTask(task);
-                            }
-                        }
+                            tasks[i].m_this->PerformMergeCostTask(tasks[i]);
+                        });
 
                         for (CostTask& task : tasks)
                         {

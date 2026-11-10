@@ -8,6 +8,7 @@ Run by `uv run scripts atheris` against an ASan build.
 import contextlib
 import pathlib
 import sys
+import warnings
 
 import atheris
 
@@ -20,6 +21,8 @@ with atheris.instrument_imports():
 
     import trimkit
 DTYPES = [np.float64, np.float32, np.int64, np.int32, np.uint32, np.uint8, np.int16, np.bool_]
+# a dtype that casts safely is converted with a warning: here that is only noise
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def array(data: atheris.FuzzedDataProvider, columns: int | None, dtype=None) -> np.ndarray:
@@ -141,10 +144,9 @@ def case_rays(data: atheris.FuzzedDataProvider):
     vertices = array(data, 3)
     scene = trimkit.RayScene([(vertices, indices(data, len(vertices)))])
     origins, directions = array(data, 3), array(data, 3)
-    result = scene.intersect_first(origins, directions)
-    assert result[1].max(initial=-1) < 60
-    rays, _, _, _ = scene.intersect_all(origins, directions)
-    assert rays.max(initial=-1) < len(origins)
+    result = scene.intersect(origins, directions)
+    rays, _, faces, _ = result
+    assert faces.max(initial=-1) < 60 and rays.max(initial=-1) < len(origins)
     scene.intersect_any(origins, directions)
     return result
 
@@ -162,7 +164,7 @@ def case_instances(data: atheris.FuzzedDataProvider):
     for _ in range(2):
         transforms = array(data, 16).reshape((-1, 4, 4))
         placements.append((transforms, array(data, None, np.int64)))
-    answers = [scene.intersect_first(origins, directions, *placed) for placed in (*placements, placements[0])]
+    answers = [scene.intersect(origins, directions, *placed) for placed in (*placements, placements[0])]
     assert all(a.tobytes() == b.tobytes() for a, b in zip(answers[0], answers[2], strict=True))
     # the boxes of those instances, one each, ordered corners
     boxes = scene.boxes(*placements[0]).boxes()
@@ -235,9 +237,10 @@ def case_boxes(data: atheris.FuzzedDataProvider):
     tree = trimkit.Boxes(bounds)
     result = tree.intersect(array(data, 2 * d).reshape((-1, 2, d)))
     assert result.shape[1:] == (2,) and result[:, 1].max(initial=-1) < len(tree)
-    # every box back exactly, and the union of them
+    # every box back exactly (as the float64 a safely cast input became), and
+    # the union of them
     copy = tree.boxes()
-    assert copy.tobytes() == bounds.tobytes()
+    assert copy.tobytes() == np.ascontiguousarray(bounds, dtype=np.float64).tobytes()
     if len(copy):
         assert np.array_equal(tree.bounds, [copy[:, 0].min(axis=0), copy[:, 1].max(axis=0)])
     return result, copy, tree.bounds
@@ -255,8 +258,7 @@ CASES = {
     "exchange.draco_decode": case_draco_decode,
     "RayScene": case_instances,
     "RayScene.boxes": case_instances,
-    "RayScene.intersect_first": case_rays,
-    "RayScene.intersect_all": case_rays,
+    "RayScene.intersect": case_rays,
     "RayScene.intersect_any": case_rays,
     "simplify": case_meshoptimizer,
     "Boxes": case_boxes,

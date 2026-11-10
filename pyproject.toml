@@ -13,7 +13,7 @@ description = "Thin stable-ABI numpy bindings to mature geometry libraries: rays
 readme = "README.md"
 requires-python = ">=3.12"
 # what a wheel contains: ours, then every upstream compiled in (`check` derives it from trimkit.toml)
-license = "MIT AND Apache-2.0 AND (Apache-2.0 WITH LLVM-exception OR BSL-1.0) AND BSD-3-Clause AND ISC AND (MIT OR Apache-2.0 OR BSL-1.0) AND MPL-2.0"
+license = "MIT AND Apache-2.0 AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR BSL-1.0) AND BSD-3-Clause AND ISC AND (MIT OR Apache-2.0 OR BSL-1.0) AND MPL-2.0"
 license-files = ["LICENSE", "vendor/*/LICENSE*", "vendor/*/COPYING*"]
 authors = [{ name = "Michael Dawson-Haggerty", email = "mikedh@kerfed.com" }]
 dependencies = ["numpy>=2"]
@@ -128,7 +128,10 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config -p no:cacheprovider"
 # wall-clock measurements: everywhere but PGO training and the sanitizers,
 # whose instrumented builds are slower and measure themselves, not the code
-markers = ["timing: asserts a wall-clock bound or measures how long the GIL is held"]
+markers = [
+    "timing: asserts a wall-clock bound or measures how long the GIL is held",
+    "device: needs a Vulkan device computing in double precision, else skips (see tests/conftest.py)",
+]
 xfail_strict = true
 filterwarnings = ["error"]
 

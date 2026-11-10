@@ -1,10 +1,11 @@
 """
 Thin, stable-ABI numpy bindings to pinned C and C++ geometry libraries.
 
-They depend only on `numpy`, take exact-dtype arrays (float64 ones finite
-and within +-1e30), read C-contiguous ones in place and copy any other layout
-once, return fresh arrays that own their memory, and release the GIL during
-compute.
+They depend only on `numpy`, read arrays of exactly the dtype shown (float64
+ones finite and within +-1e30) in place when C-contiguous and copy any other
+layout once, convert a dtype numpy casts safely (or a list) once with a
+UserWarning, return fresh arrays that own their memory, and release the GIL
+during compute.
 
 Attributes
 ----------
@@ -12,8 +13,8 @@ __version__ : str
   This package's version.
 Mesh : TypeAlias
   A triangle mesh as the scenes take it and `decompose` returns it: a
-  (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle
-  indices into them.
+  (vertices, faces) pair of (n, 3) float64 vertices and (m, 3) int64 triangle
+  indices into them, given as a tuple, list or any sequence of two.
 exchange : module
   Reading and writing data formats: draco and SVG paths.
 
@@ -29,7 +30,7 @@ True
 
 Notes
 -----
-Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float dbeabee, jk-jeon/dragonbox beeeef9, google/draco d429de8 +patches, jbikker/tinybvh c9be310 +patches, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1, svgpath (ours).
+Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float dbeabee, jk-jeon/dragonbox beeeef9, google/draco d429de8 +patches, jbikker/tinybvh c9be310 +patches, KhronosGroup/Vulkan-Headers 753d0fa, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1.
 """
 
 from collections.abc import Sequence
@@ -50,7 +51,8 @@ class RayScene:
 
     Every query names its instances (which mesh, placed where), as a
     CollisionScene's do, so a bare query casts at each mesh once, where it
-    is. Instances are placed under a top-level BVH built from exactly the
+    is. `intersect` answers where each ray crosses the surface, nearest first
+    and as many as asked; `intersect_any` only whether it does. Instances are placed under a top-level BVH built from exactly the
     arrays a query gives; the scene remembers the last one, so a query naming
     the same instances again (the same bytes) costs only comparing them, and
     moving anything costs that top level, never a mesh. Answers never depend
@@ -59,10 +61,16 @@ class RayScene:
     Parameters
     ----------
     meshes : sequence of Mesh
-      The meshes to place, each a (vertices, faces) tuple of (n, 3) float64
+      The meshes to place, each a (vertices, faces) pair of (n, 3) float64
       vertices and (m, 3) int64 triangle indices into them. Copied once
       into tinybvh's padded float layout, which the scene owns, so a mesh
       can never change under the threads sharing the scene.
+    use_gpu : bool, default False
+      Trace on a Vulkan device (the first GPU that computes in double
+      precision) instead of the CPU: the same trees, the same traversal, so
+      the same answers to the byte, sooner for large batches of rays. When
+      no such device can be used, now or later, the scene warns once (a
+      UserWarning naming why) and the CPU answers.
 
     Examples
     --------
@@ -75,7 +83,7 @@ class RayScene:
     1
     """
 
-    def __init__(self, meshes: Sequence[Mesh]) -> None: ...
+    def __init__(self, meshes: Sequence[Mesh], *, use_gpu: bool | numpy.bool_ = False) -> None: ...
 
     def __len__(self) -> int:
         """
@@ -117,9 +125,9 @@ class RayScene:
         [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]
         """
 
-    def intersect_first(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
+    def intersect(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, maximum_hits: int | numpy.integer | None = None) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
         """
-        The nearest triangle each ray hits, from either side.
+        Where each ray crosses the scene's surface, nearest first, from either side.
 
         Parameters
         ----------
@@ -132,51 +140,19 @@ class RayScene:
           Defaults to the identity.
         instance_index : (k,) int64, optional
           Which mesh each instance places. Defaults to each mesh once.
-
-        Returns
-        -------
-        instances : (r,) int64
-          Instance of each first hit, or -1 for a miss.
-        faces : (r,) int64
-          Face of each first hit in its instance's mesh, or -1.
-        distances : (r,) float64
-          Distance from the origin to the hit, or infinity.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> import trimkit
-        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
-        >>> scene = trimkit.RayScene([(vertices, faces)])
-        >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
-        >>> instances, faces, distances = scene.intersect_first(origins, directions)
-        >>> instances.tolist(), faces.tolist(), distances.tolist()
-        ([0], [0], [1.0])
-        """
-
-    def intersect_all(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
-        """
-        Every triangle each ray hits, from either side.
-
-        Parameters
-        ----------
-        origins : (r, 3) float64
-          Where each ray starts.
-        directions : (r, 3) float64
-          Each ray's direction, which need not be unit length.
-        instance_matrices : (k, 4, 4) float64, optional
-          Each instance's affine transform from its mesh into the scene.
-          Defaults to the identity.
-        instance_index : (k,) int64, optional
-          Which mesh each instance places. Defaults to each mesh once.
+        maximum_hits : int, optional
+          The most hits to report per ray, nearest first, which bounds the work
+          at that many traversals per ray: 1 is the nearest hit of each ray.
+          Defaults to every hit.
 
         Returns
         -------
         rays : (h,) int64
-          Ray of each hit, one row per hit, sorted by ray and then
-          distance. A ray through a shared edge or vertex hits every triangle
-          there.
+          Ray of each hit, one row per hit, sorted by ray and then distance.
+          A ray through a shared edge or vertex crosses the surface once there
+          and gets one hit, so a closed mesh is crossed an odd number of times
+          from inside and an even number from outside, whatever the ray's
+          direction.
         instances : (h,) int64
           Instance of each hit.
         faces : (h,) int64
@@ -192,9 +168,9 @@ class RayScene:
         >>> faces = np.array([[0, 1, 2]], dtype=np.int64)
         >>> scene = trimkit.RayScene([(vertices, faces)])
         >>> origins, directions = np.array([[0.2, 0.2, 1.0]]), np.array([[0.0, 0.0, -1.0]])
-        >>> rays, instances, faces, distances = scene.intersect_all(origins, directions)
-        >>> rays.tolist(), distances.tolist()
-        ([0], [1.0])
+        >>> rays, instances, faces, distances = scene.intersect(origins, directions)
+        >>> rays.tolist(), instances.tolist(), faces.tolist(), distances.tolist()
+        ([0], [0], [0], [1.0])
         """
 
     def intersect_any(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None) -> NDArray[numpy.bool_]:
@@ -495,7 +471,7 @@ class CollisionScene:
     Parameters
     ----------
     meshes : sequence of Mesh
-      The meshes to place, each a (vertices, faces) tuple of (n, 3) float64
+      The meshes to place, each a (vertices, faces) pair of (n, 3) float64
       vertices and (m, 3) int64 triangle indices into them. Copied once
       into coal's own storage, which the scene owns, so a mesh can never
       change under the threads sharing the scene.

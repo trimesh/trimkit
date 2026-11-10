@@ -7,6 +7,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 
 import numpy as np
 import pytest
@@ -178,6 +179,54 @@ def check_boxes(boxes, meshes, matrices=None, index=None) -> None:
         assert (low >= center - half - slack).all() and (high <= center + half + slack).all()
 
 
+def first_hits(scene, origins, directions, *instances, **options):
+    """
+    The nearest hit of each ray as dense rows, one per ray: its instance and
+    face, -1 for a miss, and its distance, inf for a miss. `intersect` with
+    `maximum_hits=1`, scattered back onto the rays.
+    """
+    rays, instances_hit, faces, distances = scene.intersect(
+        origins, directions, *instances, maximum_hits=1, **options
+    )
+    instance_of = np.full(len(origins), -1, dtype=np.int64)
+    face_of = np.full(len(origins), -1, dtype=np.int64)
+    distance_of = np.full(len(origins), np.inf)
+    instance_of[rays], face_of[rays], distance_of[rays] = instances_hit, faces, distances
+    return instance_of, face_of, distance_of
+
+
+def device_scene(meshes, device_required):
+    """
+    A RayScene on the device, or a skip (with `--device-required`, a failure)
+    quoting the warning the scene gives when there is none. A fallback to the
+    CPU later warns again, which the suite's `filterwarnings = error` raises.
+    """
+    import trimkit
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        scene = trimkit.RayScene(meshes, use_gpu=True)
+    if caught:
+        message = str(caught[0].message)
+        assert message.startswith("use_gpu: ")
+        if device_required:
+            pytest.fail(message)
+        pytest.skip(message)
+    return scene
+
+
+def same(a, b) -> None:
+    """
+    Two answers, exactly: each array of one is the other's, in dtype, shape
+    and every byte.
+    """
+    a, b = (x if isinstance(x, (tuple, list)) else (x,) for x in (a, b))
+    assert len(a) == len(b)
+    for x, y in zip(a, b, strict=True):
+        assert x.dtype == y.dtype and x.shape == y.shape
+        assert x.tobytes() == y.tobytes()
+
+
 def ray_scene(meshes, matrices=None, index=None):
     """
     A RayScene of these meshes, checked to know where these instances of
@@ -303,8 +352,7 @@ def small_calls() -> dict:
         # building inside the call keeps no scene alive past the tests
         "RayScene": lambda: len(trimkit.RayScene([mesh])),
         "RayScene.boxes": lambda: trimkit.RayScene([mesh]).boxes(placed, three).boxes(),
-        "RayScene.intersect_first": lambda: trimkit.RayScene([mesh]).intersect_first(*rays, placed, three),
-        "RayScene.intersect_all": lambda: trimkit.RayScene([mesh]).intersect_all(*rays, placed, three),
+        "RayScene.intersect": lambda: trimkit.RayScene([mesh]).intersect(*rays, placed, three),
         "RayScene.intersect_any": lambda: trimkit.RayScene([mesh]).intersect_any(*rays),
         "Boxes": lambda: len(trimkit.Boxes(boxes)),
         "Boxes.bounds": lambda: trimkit.Boxes(boxes).bounds,

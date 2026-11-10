@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import box, check_boxes, flatten, ray_scene, sphere, transform
+from helpers import box, check_boxes, first_hits, flatten, ray_scene, same, sphere, transform
 
 import trimkit
 
@@ -89,7 +89,7 @@ def test_first_hits_match_brute_force(name, vertices, faces):
     origins = center + rng.normal(size=(2000, 3)) * 3
     directions = center + rng.normal(size=(2000, 3)) * 0.6 - origins
 
-    instances, faces_hit, distances = scene_of(vertices, faces).intersect_first(origins, directions)
+    instances, faces_hit, distances = first_hits(scene_of(vertices, faces), origins, directions)
     t = parameters(distances, directions)
     every = brute_force(vertices, faces, origins, directions)
     best = every.min(axis=1)
@@ -121,13 +121,14 @@ def test_distances_are_true_distances():
     origins = rng.normal(size=(500, 3))
     origins *= 4 / np.linalg.norm(origins, axis=1)[:, None]
     unit = -origins / np.linalg.norm(origins, axis=1)[:, None]
-    _, faces_unit, d_unit = scene.intersect_first(origins, unit)
+    _, faces_unit, d_unit = first_hits(scene, origins, unit)
     scaled = unit * rng.uniform(1e-3, 1e3, (500, 1))
-    _, faces_scaled, d_scaled = scene.intersect_first(origins, scaled)
+    _, faces_scaled, d_scaled = first_hits(scene, origins, scaled)
     assert np.array_equal(faces_unit, faces_scaled)
     assert np.allclose(d_unit, d_scaled, rtol=1e-12, atol=0)
-    # aimed at the center of a unit sphere from 4 away: about 3 to the surface
-    assert np.allclose(d_unit, 3.0, atol=0.02)
+    # aimed at the center of a unit sphere from 4 away: exactly the nearest
+    # triangle a brute force over every triangle finds
+    assert np.allclose(d_unit, brute_force(vertices, faces, origins, unit).min(axis=1), rtol=1e-12, atol=0)
 
 
 def test_closed_mesh_is_watertight():
@@ -141,7 +142,7 @@ def test_closed_mesh_is_watertight():
     for origin in np.random.default_rng(0).uniform(-0.3, 0.3, (4, 3)):
         origins = np.tile(origin, (len(targets), 1))
         directions = targets - origin
-        _, faces_hit, distances = scene.intersect_first(origins, directions)
+        _, faces_hit, distances = first_hits(scene, origins, directions)
         assert (faces_hit >= 0).all()
         assert scene.intersect_any(origins, directions).all()
         # and on the way out each hits at most a hair past its target
@@ -153,15 +154,15 @@ def test_empty_and_degenerate():
     origins, directions = np.zeros((3, 3)), np.array([[1.0, 0, 0], [0, 0, 0], [0, 0, 1]])
     # no faces hits nothing, and a ray without a direction goes nowhere
     empty = scene_of(vertices, np.zeros((0, 3), dtype=np.int64))
-    instances, faces_hit, distances = empty.intersect_first(origins, directions)
+    instances, faces_hit, distances = first_hits(empty, origins, directions)
     assert instances.tolist() == faces_hit.tolist() == [-1, -1, -1] and np.isinf(distances).all()
     assert not empty.intersect_any(origins, directions).any()
-    assert all(len(a) == 0 for a in empty.intersect_all(origins, directions))
+    assert all(len(a) == 0 for a in empty.intersect(origins, directions))
     scene = scene_of(vertices, faces)
-    instances, faces_hit, distances = scene.intersect_first(origins, directions)
+    instances, faces_hit, distances = first_hits(scene, origins, directions)
     assert faces_hit[1] == -1 and faces_hit[0] >= 0 and faces_hit[2] >= 0
     assert scene.intersect_any(origins, directions).tolist() == [True, False, True]
-    rays, *_ = scene.intersect_all(origins, directions)
+    rays, *_ = scene.intersect(origins, directions)
     assert 1 not in rays
 
 
@@ -171,13 +172,19 @@ def test_bad_input():
         trimkit.RayScene([(vertices, faces + len(vertices))])
     with pytest.raises(ValueError, match=r"meshes\[0\]\[0\].*finite"):
         trimkit.RayScene([(np.where(vertices == vertices.max(), np.nan, vertices), faces)])
-    for mesh in ([vertices, faces], (vertices,), (vertices, faces, faces), vertices):
-        with pytest.raises(TypeError, match=r"meshes\[0\] must be a \(vertices, faces\) tuple"):
+    for mesh in ((vertices,), (vertices, faces, faces), vertices):
+        with pytest.raises(TypeError, match=r"meshes\[0\] must be a \(vertices, faces\) pair"):
             trimkit.RayScene([mesh])
+    # int32 faces cast safely to int64: converted with a warning, the same scene
+    expected = trimkit.RayScene([(vertices, faces)]).boxes().boxes()
+    with pytest.warns(UserWarning, match=r"meshes\[0\]\[1\]: int32 converted to int64"):
+        converted = trimkit.RayScene([(vertices, faces.astype(np.int32))])
+    assert np.array_equal(converted.boxes().boxes(), expected)
+    # float64 faces would lose values: refused
     with pytest.raises(TypeError, match=r"meshes\[0\]\[1\]"):
-        trimkit.RayScene([(vertices, faces.astype(np.int32))])
+        trimkit.RayScene([(vertices, faces.astype(np.float64))])
     scene = scene_of(vertices, faces)
-    for query in (scene.intersect_first, scene.intersect_any, scene.intersect_all):
+    for query in (scene.intersect, scene.intersect_any):
         with pytest.raises(ValueError, match="same number"):
             query(np.zeros((2, 3)), np.ones((3, 3)))
         with pytest.raises(ValueError, match="finite"):
@@ -191,10 +198,10 @@ def test_mesh_owns_its_geometry():
     scene = trimkit.RayScene([(vertices, faces)])
     before_boxes = scene.boxes().boxes()
     rays = np.array([[0, 0, 5.0]]), np.array([[0, 0, -1.0]])
-    before = scene.intersect_first(*rays)
+    before = first_hits(scene, *rays)
     vertices[:] = 1e6
     faces[:] = 0
-    after = scene.intersect_first(*rays)
+    after = first_hits(scene, *rays)
     assert all(np.array_equal(a, b) for a, b in zip(before, after, strict=True))
     assert np.array_equal(scene.boxes().boxes(), before_boxes)
 
@@ -216,8 +223,8 @@ def test_flat_mesh_with_spatial_splits():
     vertices = np.column_stack([x.ravel(), y.ravel(), np.zeros(side * side)])
     rng = np.random.default_rng(0)
     origins = np.column_stack([rng.uniform(0, side - 1, (5000, 2)), rng.uniform(1, 10, 5000)])
-    _, faces_hit, distances = scene_of(vertices, faces).intersect_first(
-        origins, np.tile([0.0, 0.0, -1.0], (5000, 1))
+    _, faces_hit, distances = first_hits(
+        scene_of(vertices, faces), origins, np.tile([0.0, 0.0, -1.0], (5000, 1))
     )
     # straight down onto z = 0, every ray lands at its own height to an ulp
     assert (faces_hit >= 0).all()
@@ -250,7 +257,7 @@ def test_defaults_and_fast_path():
         scene.boxes(two, np.array([0, 0], dtype=np.int64)), [mesh], two, np.array([0, 0], dtype=np.int64)
     )
     assert len(scene) == 1
-    for query in (scene.intersect_first, scene.intersect_all, scene.intersect_any):
+    for query in (scene.intersect, scene.intersect_any):
         expected = query(origins, directions)
         for placed in (
             (one, np.array([0], dtype=np.int64)),
@@ -261,17 +268,11 @@ def test_defaults_and_fast_path():
     # matrices alone default the meshes, one each
     pair = ray_scene([mesh, mesh], two)
     same(
-        pair.intersect_first(origins, directions, two),
-        scene.intersect_first(origins, directions, two, np.zeros(2, np.int64)),
+        first_hits(pair, origins, directions, two),
+        first_hits(scene, origins, directions, two, np.zeros(2, np.int64)),
     )
     # and every way of spelling the same instances places them the same
     assert np.array_equal(scene.boxes().boxes(), scene.boxes(one, np.array([0], dtype=np.int64)).boxes())
-
-
-def same(a, b) -> None:
-    # two answers, exactly: every array, bit for bit
-    a, b = (x if isinstance(x, tuple) else (x,) for x in (a, b))
-    assert len(a) == len(b) and all(x.tobytes() == y.tobytes() for x, y in zip(a, b, strict=True))
 
 
 def test_remembered_instances_answer_the_same():
@@ -288,29 +289,29 @@ def test_remembered_instances_answer_the_same():
     scene = ray_scene(meshes, first, index)
 
     def fresh(matrices):
-        return trimkit.RayScene(meshes).intersect_all(origins, directions, matrices, index)
+        return trimkit.RayScene(meshes).intersect(origins, directions, matrices, index)
 
     expected = fresh(first)
     other = fresh(second)
     assert expected[0].size and not all(np.array_equal(x, y) for x, y in zip(expected, other, strict=True))
-    same(scene.intersect_all(origins, directions, first, index), expected)
-    same(scene.intersect_all(origins, directions, first, index), expected)
-    same(scene.intersect_all(origins, directions, second, index), other)
-    same(scene.intersect_all(origins, directions, first.copy(), index), expected)
+    same(scene.intersect(origins, directions, first, index), expected)
+    same(scene.intersect(origins, directions, first, index), expected)
+    same(scene.intersect(origins, directions, second, index), other)
+    same(scene.intersect(origins, directions, first.copy(), index), expected)
     # the same array, its values changed: the bytes say it moved
     moving = first.copy()
-    same(scene.intersect_all(origins, directions, moving, index), expected)
+    same(scene.intersect(origins, directions, moving, index), expected)
     moving[...] = second
-    same(scene.intersect_all(origins, directions, moving, index), other)
+    same(scene.intersect(origins, directions, moving, index), other)
     # another index over the same matrices, and None for each mesh once
     swapped = 1 - index
     same(
-        scene.intersect_all(origins, directions, first, swapped),
-        trimkit.RayScene(meshes).intersect_all(origins, directions, first, swapped),
+        scene.intersect(origins, directions, first, swapped),
+        trimkit.RayScene(meshes).intersect(origins, directions, first, swapped),
     )
     same(
-        scene.intersect_first(origins, directions),
-        trimkit.RayScene(meshes).intersect_first(origins, directions),
+        first_hits(scene, origins, directions),
+        first_hits(trimkit.RayScene(meshes), origins, directions),
     )
 
 
@@ -326,11 +327,11 @@ def test_remembered_instances_from_many_threads():
     origins = rng.uniform(-30, 30, (2000, 3))
     directions = placements[0][rng.integers(0, 30, 2000), :3, 3] - origins
     scene = ray_scene(meshes, placements[0], index)
-    expected = [trimkit.RayScene(meshes).intersect_first(origins, directions, m, index) for m in placements]
+    expected = [first_hits(trimkit.RayScene(meshes), origins, directions, m, index) for m in placements]
     with ThreadPoolExecutor(8) as pool:
         results = list(
             pool.map(
-                lambda k: (k % 3, scene.intersect_first(origins, directions, placements[k % 3], index)),
+                lambda k: (k % 3, first_hits(scene, origins, directions, placements[k % 3], index)),
                 range(48),
             )
         )
@@ -353,9 +354,9 @@ def test_instances_match_flattened_scene():
         transforms[rng.integers(0, len(index), 20000), :3, 3] + rng.normal(size=(20000, 3)) * 2 - origins
     )
 
-    instances, faces_hit, distances = scene.intersect_first(origins, directions, transforms, index)
+    instances, faces_hit, distances = first_hits(scene, origins, directions, transforms, index)
     flattened = scene_of(vertices, faces)
-    _, flat, d_flat = flattened.intersect_first(origins, directions)
+    _, flat, d_flat = first_hits(flattened, origins, directions)
     miss = flat == -1
     assert miss.any() and not miss.all()
     assert np.array_equal(instances == -1, miss) and np.array_equal(faces_hit == -1, miss)
@@ -366,7 +367,7 @@ def test_instances_match_flattened_scene():
     # the flattened scene hits the instanced one's triangle there too
     mapped = np.where(miss, -1, face_starts[instances] + faces_hit)
     for ray in np.flatnonzero(mapped != flat):
-        _, _, tied, at = flattened.intersect_all(origins[ray : ray + 1], directions[ray : ray + 1])
+        _, _, tied, at = flattened.intersect(origins[ray : ray + 1], directions[ray : ray + 1])
         assert mapped[ray] in tied[np.isclose(at, d_flat[ray], rtol=1e-12, atol=0)]
     assert np.array_equal(scene.intersect_any(origins, directions, transforms, index), ~miss)
 
@@ -385,7 +386,7 @@ def test_instances_are_watertight():
         targets = np.ascontiguousarray(transform(local, m))
         origin = m[:3, 3]  # the transformed center of the sphere
         origins = np.tile(origin, (len(targets), 1))
-        instances, _, distances = scene.intersect_first(origins, targets - origin, transforms, index)
+        instances, _, distances = first_hits(scene, origins, targets - origin, transforms, index)
         assert (instances >= 0).all()
         assert (parameters(distances, targets - origin) <= 1 + 1e-9).all()
 
@@ -400,14 +401,14 @@ def test_instances_of_nothing_and_lifetime():
     scene = ray_scene(meshes, transforms, index)
     del meshes
     origins = np.array([[5.5, 0.5, 10.0], [0.5, 0.5, 10.0], [50.0, 0, 0]])
-    instances, faces_hit, distances = scene.intersect_first(
-        origins, np.tile([0, 0, -1.0], (3, 1)), transforms, index
+    instances, faces_hit, distances = first_hits(
+        scene, origins, np.tile([0, 0, -1.0], (3, 1)), transforms, index
     )
     assert instances.tolist() == [2, 1, -1] and faces_hit[2] == -1
     assert np.allclose(distances[:2], 9.0) and np.isinf(distances[2])
     # with nothing that can be hit, every ray misses
     none = ray_scene([])
-    instances, faces_hit, distances = none.intersect_first(np.zeros((2, 3)), np.ones((2, 3)))
+    instances, faces_hit, distances = first_hits(none, np.zeros((2, 3)), np.ones((2, 3)))
     assert (instances == -1).all() and (faces_hit == -1).all() and np.isinf(distances).all()
 
 
@@ -423,21 +424,19 @@ def test_scene_bad_input():
     ]:
         # every query, and boxes, place instances alike, refusals included
         scene = trimkit.RayScene([mesh])
-        for query in (scene.intersect_first, scene.intersect_all, scene.intersect_any):
+        for query in (scene.intersect, scene.intersect_any):
             with pytest.raises(ValueError, match=match):
                 query(np.zeros((1, 3)), np.ones((1, 3)), transforms, index)
         with pytest.raises(ValueError, match=match):
             scene.boxes(transforms, index)
         # and a refused placement is never remembered
         same(
-            scene.intersect_first(np.zeros((1, 3)), np.ones((1, 3))),
-            trimkit.RayScene([mesh]).intersect_first(np.zeros((1, 3)), np.ones((1, 3))),
+            first_hits(scene, np.zeros((1, 3)), np.ones((1, 3))),
+            first_hits(trimkit.RayScene([mesh]), np.zeros((1, 3)), np.ones((1, 3))),
         )
     with pytest.raises(ValueError, match="one instance per mesh"):
-        trimkit.RayScene([mesh]).intersect_first(
-            np.zeros((1, 3)), np.ones((1, 3)), np.concatenate([eye, eye])
-        )
-    with pytest.raises(TypeError, match=r"meshes\[1\] must be a \(vertices, faces\) tuple, not str"):
+        first_hits(trimkit.RayScene([mesh]), np.zeros((1, 3)), np.ones((1, 3)), np.concatenate([eye, eye]))
+    with pytest.raises(TypeError, match=r"meshes\[1\] must be a \(vertices, faces\) pair, not str"):
         trimkit.RayScene([mesh, "not a mesh"])
 
 
@@ -449,13 +448,13 @@ def test_all_hits_match_brute_force_and_first():
     scene = ray_scene(meshes, transforms, index)
     origins = rng.uniform(-40, 40, (3000, 3))
     directions = transforms[rng.integers(0, 4, 3000), :3, 3] + rng.normal(size=(3000, 3)) - origins
-    rays, instances, faces_hit, distances = scene.intersect_all(origins, directions, transforms, index)
+    rays, instances, faces_hit, distances = scene.intersect(origins, directions, transforms, index)
     assert len(rays) > 0
     # sorted by ray, then nearest first
     order = np.lexsort((distances, rays))
     assert np.array_equal(order, np.arange(len(rays)))
-    # the first row of each ray is exactly intersect_first's hit
-    _, _, first_distances = scene.intersect_first(origins, directions, transforms, index)
+    # the first row of each ray is exactly its nearest hit, capped at one
+    _, _, first_distances = first_hits(scene, origins, directions, transforms, index)
     heads = np.flatnonzero(np.r_[True, rays[1:] != rays[:-1]])
     assert np.array_equal(first_distances[rays[heads]], distances[heads])
     hit = np.isfinite(first_distances)
@@ -467,9 +466,9 @@ def test_all_hits_match_brute_force_and_first():
         expected = {tuple(row) for row in np.argwhere(np.isfinite(every)).tolist()}
         mine = rays[instances == k], faces_hit[instances == k]
         found = set(zip(*(a.tolist() for a in mine), strict=True))
-        # the two disagree only on a ray through a shared edge or vertex,
-        # which the watertight test hits on every side and the float64
-        # reference sometimes on none
+        # the two disagree only on a ray through a shared edge or vertex: one
+        # crossing, so one hit here, where the float64 reference finds every
+        # triangle there, or none
         for ray, face in expected ^ found:
             assert edge_distance(vertices, meshes[g][1][face], origins[ray], directions[ray]) < 1e-9
         # and where both hit, at the same distance
@@ -487,7 +486,7 @@ def test_all_hits_cross_closed_meshes_in_pairs():
     origins = rng.normal(size=(2000, 3))
     origins *= 5 / np.linalg.norm(origins, axis=1)[:, None]
     directions = rng.normal(size=(2000, 3)) * 0.5 - origins
-    rays, _, _, distances = scene.intersect_all(origins, directions)
+    rays, _, _, distances = scene.intersect(origins, directions)
     distinct = np.unique(np.column_stack([rays, distances]), axis=0)[:, 0].astype(np.int64)
     counts = np.bincount(distinct, minlength=2000)
     assert (counts % 2 == 0).all() and counts.any()
@@ -509,8 +508,8 @@ def test_no_leaks_and_shared_meshes():
         # a remembered placement, replaced, and the default again
         placed = (None, np.array([0, 1, 0], dtype=np.int64))
         for scene, instances in [(scenes[0], ()), (scenes[1], placed), (scenes[1], ())]:
-            assert scene.intersect_first(*rays, *instances)[1][0] >= 0
-            scene.intersect_all(*rays, *instances)
+            assert len(scene.intersect(*rays, *instances, maximum_hits=1)[0]) == 1
+            scene.intersect(*rays, *instances)
             scene.intersect_any(*rays, *instances)
             scene.boxes(*instances).boxes()
         boxes = trimkit.Boxes(np.zeros((4, 2, 3)))
@@ -627,7 +626,7 @@ def test_distance_for_any_direction_length(scale):
     # to a distance in the scene's units
     vertices = np.array([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]])
     scene = scene_of(vertices, np.array([[0, 1, 2]], dtype=np.int64))
-    _, faces, distances = scene.intersect_first(np.array([[0.0, 0.0, 5.0]]), np.array([[0.0, 0.0, -scale]]))
+    _, faces, distances = first_hits(scene, np.array([[0.0, 0.0, 5.0]]), np.array([[0.0, 0.0, -scale]]))
     assert faces.tolist() == [0]
     assert np.isclose(distances[0], 5.0)
 
@@ -650,8 +649,12 @@ def test_transform_inverse_must_be_bounded():
     tiny = np.tile(np.eye(4), (1, 1, 1))
     tiny[0, :3, :3] *= 1e-31
     with pytest.raises(ValueError, match="not invertible with an inverse within"):
-        trimkit.RayScene([(vertices, faces)]).intersect_first(
-            np.zeros((1, 3)), np.ones((1, 3)), tiny, np.zeros(1, np.int64)
+        first_hits(
+            trimkit.RayScene([(vertices, faces)]),
+            np.zeros((1, 3)),
+            np.ones((1, 3)),
+            tiny,
+            np.zeros(1, np.int64),
         )
 
 
@@ -663,7 +666,7 @@ def test_instanced_scene_near_the_bound_still_hits():
     scaled[0, :3, :3] *= 10.0
     scene = ray_scene([(vertices * 1e29, faces)], scaled)
     directions = np.random.default_rng(0).normal(size=(100, 3))
-    _, hit_faces, distances = scene.intersect_first(np.zeros((100, 3)), directions, scaled)
+    _, hit_faces, distances = first_hits(scene, np.zeros((100, 3)), directions, scaled)
     assert (hit_faces >= 0).all() and np.isfinite(distances).all()
 
 
@@ -674,7 +677,7 @@ def test_empty_mesh_instances_are_checked_too():
     singular = np.zeros((1, 4, 4))
     singular[0, 3, 3] = 1.0
     with pytest.raises(ValueError, match="not invertible"):
-        trimkit.RayScene([empty]).intersect_first(np.zeros((1, 3)), np.ones((1, 3)), singular)
+        first_hits(trimkit.RayScene([empty]), np.zeros((1, 3)), np.ones((1, 3)), singular)
 
 
 def test_scene_boxes_hold_every_instance():
@@ -702,13 +705,62 @@ def test_scene_boxes_hold_every_instance():
 def test_all_hits_on_axis_aligned_rays_far_out(x):
     # a ray along one axis has a zero direction on the others, so a node's
     # planes there are 0 * inf: NaN, which the slab test must drop exactly as
-    # tinybvh's does. Kept, intersect_all lost every hit past |x| ~1.7e7
+    # tinybvh's does. Kept, every hit past |x| ~1.7e7 was lost
     width = max(1.0, x * 1e-9)  # wide enough to be a triangle at x's precision
     triangle = np.array([[x - width, -1, 0], [x + width, -1, 0], [x, 1, 0]], dtype=np.float64)
     scene = ray_scene([(triangle, np.array([[0, 1, 2]], dtype=np.int64))])
     origins, directions = np.array([[x, 0.0, 10.0]]), np.array([[0.0, 0.0, -1.0]])
-    first = scene.intersect_first(origins, directions)
-    every = scene.intersect_all(origins, directions)
+    first = first_hits(scene, origins, directions)
+    every = scene.intersect(origins, directions)
     assert first[2].tolist() == [10.0]
     ray = np.zeros(1, dtype=np.int64)
     same((every[0], every[1], every[2], every[3]), (ray, first[0], first[1], first[2]))
+
+
+def test_hit_counts_tell_inside_from_outside():
+    # a closed mesh is crossed an odd number of times from inside and an even
+    # number from outside, whichever way a ray goes: so hit counts are a
+    # containment test. That needs a ray through a shared edge or vertex to
+    # cross once there (one hit), not once per triangle meeting there
+    vertices, faces = sphere(40, 80)
+    scene = scene_of(vertices, faces)
+    rng = np.random.default_rng(3)
+    points = rng.uniform(-1.5, 1.5, (3000, 3))
+    radius = np.linalg.norm(points, axis=1)
+    # the faceted sphere lies just inside the unit sphere: stay clear of its skin
+    points = points[(radius < 0.95) | (radius > 1.05)]
+    inside = np.linalg.norm(points, axis=1) < 1.0
+    rays, _, _, _ = scene.intersect(points, rng.normal(size=points.shape))
+    assert np.array_equal(np.bincount(rays, minlength=len(points)) % 2 == 1, inside)
+    # and straight at every vertex and every edge's midpoint from inside, the
+    # rays that used to get two hits for one crossing: exactly one each
+    edges = faces[:, [0, 1, 1, 2, 2, 0]].reshape((-1, 2))
+    targets = np.vstack([vertices, vertices[edges].mean(axis=1)])
+    origin = np.array([0.1, -0.2, 0.05])
+    rays, _, _, distances = scene.intersect(np.tile(origin, (len(targets), 1)), targets - origin)
+    assert np.array_equal(np.bincount(rays, minlength=len(targets)), np.ones(len(targets), dtype=np.int64))
+    assert (parameters(distances, (targets - origin)[rays]) <= 1 + 1e-9).all()
+
+
+def test_maximum_hits_caps_each_ray():
+    # the first k hits of each ray, exactly the full answer's first k rows for
+    # it; one hit per ray is the nearest; fewer than one is refused
+    vertices, faces = sphere(10, 20)
+    meshes = [(vertices, faces), (vertices + np.array([3.0, 0.0, 0.0]), faces)]
+    scene = ray_scene(meshes)
+    rng = np.random.default_rng(4)
+    origins = np.column_stack([np.full(50, -5.0), rng.uniform(-0.5, 0.5, (50, 2))])
+    directions = np.tile([1.0, 0.0, 0.0], (50, 1))
+    full = scene.intersect(origins, directions)
+    assert np.array_equal(np.bincount(full[0]), np.full(50, 4))
+    for k in (1, 2, 3, 4, 10):
+        keep = np.concatenate([np.flatnonzero(full[0] == ray)[:k] for ray in range(50)])
+        for column, expected in zip(scene.intersect(origins, directions, maximum_hits=k), full, strict=True):
+            assert np.array_equal(column, expected[keep])
+    rays, instances, faces_hit, distances = scene.intersect(origins, directions, maximum_hits=1)
+    first = first_hits(scene, origins, directions)
+    assert np.array_equal(rays, np.arange(50))
+    for mine, theirs in zip((instances, faces_hit, distances), first, strict=True):
+        assert np.array_equal(mine, theirs)
+    with pytest.raises(ValueError, match="maximum_hits"):
+        scene.intersect(origins, directions, maximum_hits=0)

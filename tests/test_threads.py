@@ -41,16 +41,16 @@ def test_free_threaded_stays_free():
 def test_shared_scene():
     # one scene queried from many threads at once, with batches big enough
     # that each query also splits across its own worker threads
-    from helpers import sphere
+    from helpers import first_hits, sphere
 
     import trimkit
 
     vertices, faces = sphere(30, 60)
     origins, directions = np.random.default_rng(0).normal(size=(2, 20_000, 3))
     scene = trimkit.RayScene([(vertices, faces)])
-    expected = _flatten(scene.intersect_first(origins, directions))
+    expected = _flatten(first_hits(scene, origins, directions))
     with ThreadPoolExecutor(4) as pool:
-        results = list(pool.map(lambda _: _flatten(scene.intersect_first(origins, directions)), range(8)))
+        results = list(pool.map(lambda _: _flatten(first_hits(scene, origins, directions)), range(8)))
     del scene
     for result in results:
         assert all(np.array_equal(a, b) for a, b in zip(result, expected, strict=True))
@@ -61,7 +61,7 @@ def test_scheduler_stress():
     # and big enough to wake the pool's workers: every caller shares the same
     # workers through parallel.hpp's slots, and still gets exactly the answer
     # it gets alone
-    from helpers import sphere
+    from helpers import first_hits, sphere
 
     import trimkit
 
@@ -79,8 +79,8 @@ def test_scheduler_stress():
         rays = rng.normal(size=(2, size, 3)) * 0.1
         queries += [
             lambda b=boxes: tree.intersect(np.stack([b, b + 3.0], axis=1)),
-            lambda r=rays: scene.intersect_first(*r),
-            lambda r=rays: scene.intersect_all(*r),
+            lambda r=rays: first_hits(scene, *r),
+            lambda r=rays: scene.intersect(*r),
         ]
     queries += [lambda: solids.distances(matrices, index), lambda: solids.collides(matrices, index)]
     expected = [_flatten(query()) for query in queries]
@@ -103,7 +103,7 @@ def test_fork_while_threads_swap_placements():
     # gets the parent's answer, never stuck on a lock a vanished thread held
     import threading
 
-    from helpers import box, sphere
+    from helpers import box, first_hits, sphere
 
     import trimkit
 
@@ -119,19 +119,19 @@ def test_fork_while_threads_swap_placements():
     origins = rng.uniform(-15, 15, (32, 3))
     directions = placements[0][rng.integers(0, 20, 32), :3, 3] - origins
     scene = trimkit.RayScene(meshes)
-    expected = scene.intersect_first(origins, directions, placements[0], index)
+    expected = first_hits(scene, origins, directions, placements[0], index)
     stop = threading.Event()
 
     def churn(k):
         while not stop.is_set():
-            scene.intersect_first(origins, directions, placements[k % 2], index)
+            first_hits(scene, origins, directions, placements[k % 2], index)
 
     threads = [threading.Thread(target=churn, args=(k,)) for k in range(4)]
     for thread in threads:
         thread.start()
     try:
         for _ in range(20):
-            child = lambda: scene.intersect_first(origins, directions, placements[0], index)  # noqa: E731
+            child = lambda: first_hits(scene, origins, directions, placements[0], index)  # noqa: E731
             answer = _forked_answer(child, expected)
             assert answer == b"1", "the child hung" if answer == b"" else "the child answered differently"
     finally:

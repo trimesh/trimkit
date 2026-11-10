@@ -97,7 +97,6 @@ class Upstream:
 
     name: str
     spdx: str
-    own: bool = False
     repo: str = ""
     host: str = "github.com"
     ref: str = ""
@@ -124,8 +123,6 @@ class Upstream:
 
     @property
     def described(self) -> str:
-        if self.own:
-            return f"{self.name} (ours)"
         return f"{self.repo} {self.commit[:7]}" + (" +patches" if self.patches else "")
 
 
@@ -177,9 +174,8 @@ class Manifest:
 
     @property
     def directories(self) -> list[Path]:
-        # where our C++ is, headers included: src/ and our own upstreams' headers
-        own = [ROOT / d for u in self.upstreams.values() if u.own for d in u.include]
-        return [ROOT / "src", *own]
+        # where our C++ is, headers included
+        return [ROOT / "src"]
 
 
 def _tuples(table: dict) -> dict:
@@ -601,7 +597,7 @@ FORTIFY = ("-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3")
 HARDENING = {
     "linux": Flags(
         (*SECTIONS, *FORTIFY, "-fstack-clash-protection"),
-        ("-Wl,--gc-sections", "-Wl,-z,relro,-z,now,-z,noexecstack"),
+        ("-Wl,--gc-sections", "-Wl,-z,relro,-z,now,-z,noexecstack", "-Wl,-z,separate-code"),
     ),
     "macos": Flags((*SECTIONS, *FORTIFY), ("-Wl,-dead_strip",)),
     # control flow guard, and the linker's dead-code stripping. clang's driver
@@ -637,6 +633,36 @@ WARNINGS = Flags(
 STRICT = Flags(("-Werror",))
 # vendored code: we don't edit it, so its warnings aren't actionable
 QUIET = Flags(("-w",))
+# under `undefined`, our sources alone also take clang's stricter groups
+# (unsigned overflow, implicit narrowing and sign changes, nullability, local
+# bounds, float division by zero): vendored code is not ours to fix, ours must
+# be clean. Each upstream's [no_sanitize] table turns checks off for it instead
+OURS_CHECKS = ("integer", "nullability", "implicit-conversion", "local-bounds", "float-divide-by-zero")
+OURS_SANITIZED = Flags((f"-fsanitize={','.join(OURS_CHECKS)}",))
+# what clang's -fsanitize-ignorelist= reads, written beside build.ninja
+IGNORELIST = "sanitize_ignorelist.txt"
+
+
+def ignorelist(manifest: Manifest) -> str:
+    """
+    OURS_CHECKS reach the vendored headers our sources compile in (tinybvh,
+    earcut, VHACD, fast_float, dragonbox, Eigen, Vulkan, nanobind), whose
+    intentional wraps, shifts and casts aren't ours to fix: every vendored
+    directory is left out of exactly those checks, keeping today's set
+    """
+    directories = ["vendor/nanobind/include"]
+    for upstream in manifest.upstreams.values():
+        directories += upstream.include
+    # a section per check (its name is a pattern, so one can't name several),
+    # each over every vendored directory, however the build names the tree
+    lines = []
+    for check in OURS_CHECKS:
+        lines += [f"[{check}]", *(f"src:*/{d}/*" for d in directories)]
+    # std::make_shared's cast to its not yet constructed storage: libstdc++ 14
+    # moved it from _Sp_counted_ptr_inplace, which clang's own cfi_ignorelist
+    # names, into __aligned_buffer::_M_ptr
+    lines += ["[cfi-unrelated-cast]", "fun:_ZN9__gnu_cxx16__aligned_buffer*"]
+    return "\n".join(lines) + "\n"
 
 
 # The extension exports its init function and nothing else, so none of its
@@ -692,13 +718,23 @@ def instrumentation(config: Config) -> Flags:
     if config.sanitizers:
         flags += Flags(
             (
-                f"-fsanitize={config.sanitizers}", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer",
+                # every check reports and aborts: CFI alone would otherwise trap silently
+                f"-fsanitize={config.sanitizers}", "-fno-sanitize-recover=all", "-fno-sanitize-trap=all",
+                "-fno-omit-frame-pointer",
                 # bounds-checked standard containers in every library: too slow
                 # for release (V-HACD is 3-5% slower) but what analysis wants
                 "-D_GLIBCXX_ASSERTIONS", "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
             ),
             (f"-fsanitize={config.sanitizers}",),
         )  # fmt: skip
+    if "undefined" in config.sanitizers:
+        flags += Flags((f"-fsanitize-ignorelist={config.build_dir / IGNORELIST}",))
+    if "cfi" in config.sanitizers:
+        # not indirect calls: their targets include libpython and numpy (type
+        # slots from PyType_GetSlot, DLPack deleters), compiled without CFI
+        # metadata, which every such call would fail without cross-DSO CFI.
+        # Virtual calls and casts between polymorphic types stay checked
+        flags += Flags(("-fno-sanitize=cfi-icall",), ("-fno-sanitize=cfi-icall",))
     if config.pgo == "generate":
         # counters bumped plainly, clang's default: threads racing in training
         # lose a few counts, which only steers the optimizer a little less.
@@ -779,6 +815,8 @@ def plan(manifest: Manifest, target: Target) -> str:
     stripped = NONE if config.debug or config.sanitizers else STRIP[platform.os]
     abi = FREE_THREADED if python.free_threaded else STABLE_ABI
     ours = WARNINGS + (STRICT if config.strict else NONE)
+    if "undefined" in config.sanitizers:
+        ours += OURS_SANITIZED
     edges: list[str] = []
 
     def edge(rule: str, output: str, inputs, flags=None) -> str:
@@ -801,7 +839,7 @@ def plan(manifest: Manifest, target: Target) -> str:
                 words += [] if directory is None else ["-isystem", str(directory)]
                 continue
             for directory in upstream.include:
-                words += ["-I" if upstream.own else "-isystem", str(ROOT / directory)]
+                words += ["-isystem", str(ROOT / directory)]
         return words
 
     def defines(upstreams) -> list[str]:
@@ -913,7 +951,9 @@ def write(target: Target) -> None:
     if config.pgo == "use" and not config.profile.is_file():
         sys.exit(f"pgo=use but no {config.profile}: run scripts/pgo.py first")
     config.build_dir.mkdir(parents=True, exist_ok=True)
-    (config.build_dir / "build.ninja").write_text(plan(load(), target))
+    manifest = load()
+    (config.build_dir / IGNORELIST).write_text(ignorelist(manifest))
+    (config.build_dir / "build.ninja").write_text(plan(manifest, target))
 
 
 # -- checks ---------------------------------------------------------------------
@@ -922,7 +962,7 @@ def write(target: Target) -> None:
 EXAMPLE_CONFIGS = [
     {},
     {"strict": True},
-    {"sanitize": "address,undefined"},
+    {"sanitize": "address,undefined,cfi"},
     {"pgo": "generate"},
     {"pgo": "use"},
     {"fuzz": True},

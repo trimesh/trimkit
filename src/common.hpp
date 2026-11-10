@@ -1,7 +1,8 @@
 // What every binding shares besides arrays (those go through numpy.hpp, the
 // one door): the GIL is released around compute, big batches run across
-// every core, long loops poll for Ctrl-C, and positions convert to float32
-// one way.
+// every core (and a vendored library's or a device driver's fan-outs on the
+// same pool, Python-free), long loops poll for Ctrl-C, rows found in
+// parallel gather once, and positions convert to float32 one way.
 #pragma once
 
 #include "numpy.hpp"
@@ -179,54 +180,167 @@ void in_parallel(std::size_t count, const Body& body) {
     }
 }
 
+// The pool's fork handler, installed once by the module's init
+inline void install_fork_handler() { parallel::install_fork_handler(); }
+
+// A vendored library's own fan-out, on the same pool and Python-free:
+// `body(context, begin, end)` over [0, count) on this thread and the workers,
+// called by the library while the binding already holds the GIL released,
+// with no Ctrl-C poll (the library's progress callback polls), and the first
+// exception a range threw rethrown here, on the library's thread, for it to
+// unwind through
+inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_t begin, std::size_t end),
+                       void* context) {
+    if (count == 0) {
+        return;
+    }
+    struct Call {
+        void (*body)(void* context, std::size_t begin, std::size_t end);
+        void* context;
+    };
+    const Call call{body, context};
+    parallel::Job job;
+    job.count = count;
+    job.eager = true;
+    job.run = [](const void* called, std::size_t begin, std::size_t end) {
+        const Call* c = static_cast<const Call*>(called);
+        c->body(c->context, begin, end);
+    };
+    job.body = &call;
+    parallel::run_job(job);
+    if (job.error) {
+        std::rethrow_exception(job.error);
+    }
+}
+
+// `in_parallel` for code already past the GIL (a device driver, between the
+// chunks it hands a device): the same pool, through the Python-free door
+template <typename Body>
+void in_parallel_without_gil(std::size_t count, const Body& body) {
+    run_ranges(
+        count,
+        [](void* context, std::size_t begin, std::size_t end) { (*static_cast<const Body*>(context))(begin, end); },
+        const_cast<void*>(static_cast<const void*>(&body)));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+}
+
+// One holder at a time, for what takes exactly one (a device's queue): a
+// waiter sleeps on the scheduler's parking rather than spinning. Held only
+// around one bounded call that takes no other lock, so there is nothing to
+// deadlock on; never nested
+class Exclusive {
+public:
+    void acquire() {
+        while (taken_.exchange(1, std::memory_order_acquire) != 0) {
+            parallel::park(taken_, 1, 1000);
+        }
+    }
+    void release() {
+        taken_.store(0, std::memory_order_release);
+        parallel::unpark(taken_);
+    }
+
+private:
+    std::atomic<std::uint32_t> taken_{0};
+};
+
+class Exclusively {
+public:
+    explicit Exclusively(Exclusive& lock) : lock_(lock) { lock_.acquire(); }
+    ~Exclusively() { lock_.release(); }
+    Exclusively(const Exclusively&) = delete;
+    Exclusively& operator=(const Exclusively&) = delete;
+
+private:
+    Exclusive& lock_;
+};
+
 // For a query that finds its rows: `body(begin, end, out)` appends the rows
-// of items [begin, end) in order, and they come back in item order, however
-// the ranges fell across threads
-template <typename T, typename Body>
-std::vector<T> gather_in_parallel(std::size_t count, const Body& body) {
+// of items [begin, end) in order to `out`, and they come back in item order
+// however the ranges fell across threads, as chunks: `size()` rows in all,
+// each chunk's `offset` its first row's place. `write(offset, rows, count)`
+// is then called once per chunk, from many threads, to put them where they
+// go: straight into the output arrays, with no copy in between
+template <typename T>
+class Gathered {
+public:
     struct Chunk {
-        std::size_t begin = 0;
+        std::size_t begin = 0;   // the first item the chunk's rows came from
+        std::size_t offset = 0;  // the first row's place in the whole
         std::vector<T> rows;
         Chunk* next = nullptr;
     };
-    struct Gathered {
-        // pushed by every thread, never popped until all are done
-        std::atomic<Chunk*> head{nullptr};
-        ~Gathered() {
-            for (Chunk* chunk = head.load(std::memory_order_acquire); chunk != nullptr;) {
-                Chunk* next = chunk->next;
-                delete chunk;  // NOLINT(cppcoreguidelines-owning-memory): the list owns its chunks
-                chunk = next;
-            }
+
+    Gathered() = default;
+    Gathered(const Gathered&) = delete;
+    Gathered& operator=(const Gathered&) = delete;
+    ~Gathered() {
+        for (Chunk* chunk = head_.load(std::memory_order_acquire); chunk != nullptr;) {
+            Chunk* next = chunk->next;
+            delete chunk;  // NOLINT(cppcoreguidelines-owning-memory): the list owns its chunks
+            chunk = next;
         }
-    };
-    Gathered gathered;
-    in_parallel(count, [&](std::size_t begin, std::size_t end) {
-        auto chunk = std::make_unique<Chunk>();
-        chunk->begin = begin;
-        body(begin, end, chunk->rows);
-        if (chunk->rows.empty()) {
-            return;
-        }
-        chunk->next = gathered.head.load(std::memory_order_relaxed);
-        while (!gathered.head.compare_exchange_weak(chunk->next, chunk.get(), std::memory_order_release,
-                                                    std::memory_order_relaxed)) {
+    }
+
+    // pushed by every thread while the query runs, never popped until it is done
+    void push(std::unique_ptr<Chunk> chunk) {
+        chunk->next = head_.load(std::memory_order_relaxed);
+        while (!head_.compare_exchange_weak(chunk->next, chunk.get(), std::memory_order_release,
+                                            std::memory_order_relaxed)) {
         }
         static_cast<void>(chunk.release());
+    }
+
+    // once the query is done: the chunks in item order, with their offsets
+    void settle() {
+        for (Chunk* chunk = head_.load(std::memory_order_acquire); chunk != nullptr; chunk = chunk->next) {
+            chunks_.push_back(chunk);
+        }
+        std::sort(chunks_.begin(), chunks_.end(), [](const Chunk* a, const Chunk* b) { return a->begin < b->begin; });
+        total_ = 0;
+        for (Chunk* chunk : chunks_) {
+            chunk->offset = total_;
+            total_ += chunk->rows.size();
+        }
+    }
+
+    std::size_t size() const { return total_; }
+
+    template <typename Write>
+    void write(const Write& write) const {
+        in_parallel(chunks_.size(), [&](std::size_t begin, std::size_t end) {
+            for (std::size_t c = begin; c < end; c++) {
+                const Chunk& chunk = *chunks_[c];
+                write(chunk.offset, chunk.rows.data(), chunk.rows.size());
+            }
+        });
+    }
+
+private:
+    std::atomic<Chunk*> head_{nullptr};
+    std::vector<Chunk*> chunks_;
+    std::size_t total_ = 0;
+};
+
+template <typename T, typename Body>
+void gather_in_parallel(std::size_t count, Gathered<T>* gathered, const Body& body) {
+    in_parallel(count, [&](std::size_t begin, std::size_t end) {
+        auto chunk = std::make_unique<typename Gathered<T>::Chunk>();
+        chunk->begin = begin;
+        body(begin, end, chunk->rows);
+        if (!chunk->rows.empty()) {
+            gathered->push(std::move(chunk));
+        }
     });
-    std::vector<Chunk*> chunks;
-    std::size_t total = 0;
-    for (Chunk* chunk = gathered.head.load(std::memory_order_acquire); chunk != nullptr; chunk = chunk->next) {
-        chunks.push_back(chunk);
-        total += chunk->rows.size();
-    }
-    std::sort(chunks.begin(), chunks.end(), [](const Chunk* a, const Chunk* b) { return a->begin < b->begin; });
-    std::vector<T> rows;
-    rows.reserve(total);
-    for (Chunk* chunk : chunks) {
-        rows.insert(rows.end(), std::make_move_iterator(chunk->rows.begin()),
-                    std::make_move_iterator(chunk->rows.end()));
-    }
+    gathered->settle();
+}
+
+// the gathered rows as one array, written in parallel chunk by chunk
+template <typename T>
+std::vector<Unset<T>> gathered_rows(const Gathered<T>& gathered) {
+    std::vector<Unset<T>> rows(gathered.size());
+    T* out = elements(rows);
+    gathered.write(
+        [&](std::size_t offset, const T* chunk, std::size_t count) { std::copy_n(chunk, count, out + offset); });
     return rows;
 }
 

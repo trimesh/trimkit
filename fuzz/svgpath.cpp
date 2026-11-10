@@ -9,7 +9,7 @@
 //   its endpoints and its halfway point
 // - `format` writes it all, parsing that gives the same vertices and
 //   segments byte for byte, and formatting that gives the same text
-#include <svgpath.hpp>
+#include "../src/svgpath.hpp"
 
 #include <cmath>
 #include <cstddef>

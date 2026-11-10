@@ -11,6 +11,10 @@ callers and workers can reach, asserting in each:
   stopped having run each item once
 - P1: no worker sleeps through a wake: asleep with `wake` past what it saw,
   and no wake on its way
+- P2: a published job with items still unclaimed always has a worker: live,
+  or one leaving that is about to start its replacement (a caller bumps the
+  wake before counting the live, and a leaving worker leaves the count before
+  its last look at the wake, so one of them sees the other)
 
 Sleeps have no timeouts here (but idle exit), so a lost wakeup is a hang,
 not a 50 ms delay. Then each mutation breaks one guard of the C++, and the
@@ -109,7 +113,9 @@ def caller_frame(job: int) -> Frame:
 def initial(scenario: Scenario) -> State:
     jobs = tuple(new_job(scenario) for _ in range(scenario.callers))
     threads = tuple(Thread((caller_frame(c),), scenario.calls - 1, True) for c in range(scenario.callers))
-    threads += tuple(Thread((), 0, False) for _ in range(scenario.workers))
+    # one token more than the cap: a worker leaving still holds its own while
+    # the replacement it starts needs one
+    threads += tuple(Thread((), 0, False) for _ in range(scenario.workers + 1))
     slots = tuple(Slot(0, False, 0, -1, 0) for _ in range(scenario.slots))
     return State(slots, jobs, threads, 0, 0, 0, scenario.interrupt, False)
 
@@ -261,17 +267,20 @@ def store_job(at: At):
 
 
 def open_slot(at: At):
-    yield "try_publish (open)", at.go("wake_spawn", set_slot(at.state, at.frame.slot, open=True))
+    first = "wake_spawn" if "wake_counts_live_first" in at.mutations else "wake_bump"
+    yield "try_publish (open)", at.go(first, set_slot(at.state, at.frame.slot, open=True))
 
 
 def wake_spawn(at: At):
-    state = at.go("wake_bump", at.state._replace(wanted=at.scenario.workers))
+    after = "wake_bump" if "wake_counts_live_first" in at.mutations else "wake_unpark"
+    state = at.go(after, at.state._replace(wanted=at.scenario.workers))
     for spawned in spawn_worker(state, at.scenario):
         yield "wake_workers (spawn_worker)", spawned
 
 
 def wake_bump(at: At):
-    yield "wake_workers (bump)", at.go("wake_unpark", at.state._replace(wake=at.state.wake + 1))
+    after = "wake_unpark" if "wake_counts_live_first" in at.mutations else "wake_spawn"
+    yield "wake_workers (bump)", at.go(after, at.state._replace(wake=at.state.wake + 1))
 
 
 def wake_unpark(at: At):
@@ -392,6 +401,17 @@ def worker_park(at: At):
     yield "park_worker", at.go("sleep" if sleeps else "scan_start")
 
 
+def worker_exit_check(at: At):
+    # already out of the count: a wake since it last looked means a caller may
+    # have counted it, so it starts its replacement before it goes
+    gone = pop(at.state, at.t)
+    if at.state.wake != at.frame.observed and "exit_without_recheck" not in at.mutations:
+        for spawned in spawn_worker(gone, at.scenario):
+            yield "worker_main (exit, spawn replacement)", spawned
+    else:
+        yield "worker_main (exit)", gone
+
+
 def nothing(at: At):
     return iter(())
 
@@ -432,7 +452,10 @@ WORKER = {
     "unpark_left": unpark_left,
     "park": worker_park,
     "sleep": nothing,
+    "exit_check": worker_exit_check,
 }
+# a caller between opening its slot and waking the workers
+WAKING = frozenset({"store_job", "open", "wake_bump", "wake_spawn", "wake_unpark"})
 
 
 def child_after_fork(state: State, scenario: Scenario) -> State:
@@ -454,7 +477,9 @@ def successors(state: State, scenario: Scenario, mutations: frozenset):
             yield f"thread {t}: {name}", following
         exits = at.frame.pc == "sleep" or ("exit_while_joined" in mutations and at.frame.pc == "claim")
         if at.frame.kind == "worker" and scenario.idle_exit and exits:
-            yield f"thread {t}: exit_idle", pop(state._replace(live=state.live - 1), t)
+            leaving = at.frame._replace(pc="exit_check")
+            left = set_frame(state._replace(live=state.live - 1), t, leaving)
+            yield f"thread {t}: exit_idle (leave the count)", left
     if scenario.fork and not state.forked:
         yield "fork: child_after_fork", child_after_fork(state, scenario)
 
@@ -465,8 +490,8 @@ def terminal(state: State) -> bool:
     return not calls_left and not calling
 
 
-def check_state(state: State) -> None:
-    unparking = any(t.frames and t.frames[-1].pc == "wake_unpark" for t in state.threads)
+def check_state(state: State, scenario: Scenario) -> None:
+    unparking = any(t.frames and t.frames[-1].pc in ("wake_spawn", "wake_unpark") for t in state.threads)
     for thread in state.threads:
         for frame in thread.frames:
             if (
@@ -476,6 +501,17 @@ def check_state(state: State) -> None:
                 and not unparking
             ):
                 raise Violation("P1: a worker sleeps through a wake")
+    # P2: unless starting threads may fail, every published job with items
+    # left has a live worker or one leaving that will start its replacement
+    leaving = any(t.frames and t.frames[-1].pc == "exit_check" for t in state.threads)
+    for thread in state.threads:
+        for frame in thread.frames:
+            if frame.kind != "caller" or frame.slot < 0 or frame.pc in WAKING:
+                continue
+            job = state.jobs[frame.job]
+            unserved = job.next < job.count and not job.stop and state.live == 0 and not leaving
+            if unserved and not scenario.spawn_fails:
+                raise Violation(f"P2: job {frame.job} is published with items left and no worker")
     if terminal(state):
         for j, job in enumerate(state.jobs):
             if job.returned and not job.stop and job.done != (1 << job.count) - 1:
@@ -501,7 +537,7 @@ def explore(scenario: Scenario, mutations: frozenset = frozenset()) -> int:
     while queue:
         state = queue.popleft()
         try:
-            check_state(state)
+            check_state(state, scenario)
             following = list(successors(state, scenario, mutations))
         except Violation as violation:
             raise Violation(f"{violation} in {scenario.name}, after:\n  {trace(state)}") from None
@@ -557,9 +593,11 @@ MUTATIONS = {
     "publish_keeps_epoch": ("S1", Scenario("no epoch")),
     "claim_load_then_store": ("S2", Scenario("racy claim", calls=1)),
     "park_ignores_wake": ("P1", Scenario("lost wake")),
-    "exit_while_joined": ("L1", Scenario("exit holding a job", calls=1, idle_exit=True)),
+    "exit_while_joined": ("L1|P2", Scenario("exit holding a job", calls=1, idle_exit=True)),
     "wait_checks_count_first": ("L1", Scenario("caller sleeps through the last leave", calls=1)),
     "wait_ignores_epoch": ("L1", Scenario("caller waits on the next job", callers=2, calls=1, slots=1)),
+    "exit_without_recheck": ("P2", Scenario("worker leaves as a caller publishes", idle_exit=True)),
+    "wake_counts_live_first": ("P2", Scenario("caller counts a leaving worker", idle_exit=True)),
 }
 
 

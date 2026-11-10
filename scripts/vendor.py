@@ -332,7 +332,7 @@ def _fetch_one(pin: Upstream, latest: bool) -> None:
 
 def fetch(names: list[str], latest: bool = False) -> None:
     pins = load().upstreams
-    for name in names or [n for n, pin in pins.items() if not pin.own]:
+    for name in names or list(pins):
         _fetch_one(pins[name], latest)
 
 
@@ -346,7 +346,7 @@ def check() -> None:
     extra, missing = sorted(present - set(pins)), sorted(set(pins) - present)
     errors = [f"vendor/{name} isn't an upstream in trimkit.toml" for name in extra]
     errors += [f"vendor/{name} is missing: run `uv run scripts fetch {name}`" for name in missing]
-    fetched = [name for name in sorted(pins) if not pins[name].own and name in present]
+    fetched = [name for name in sorted(pins) if name in present]
     errors += [
         f"vendor/{name} doesn't match its tree_sha256: see `git status vendor/{name}` and `git diff`"
         for name in fetched
@@ -390,8 +390,6 @@ def check() -> None:
 def outdated() -> None:
     stale = 0
     for name, pin in load().upstreams.items():
-        if pin.own:
-            continue
         latest = _resolve(pin)
         if latest != pin.commit:
             stale += 1

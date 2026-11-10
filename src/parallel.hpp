@@ -54,9 +54,13 @@ __declspec(dllimport) int __stdcall CloseHandle(void* handle);
 #include <sched.h>
 #include <signal.h>
 #if defined(__linux__)
+#include "cgroup.hpp"
+
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#include <cstdlib>
 #elif defined(__APPLE__)
 // libc++'s std::atomic::wait is built on these, since macOS 10.12
 extern "C" int __ulock_wait(std::uint32_t operation, void* address, std::uint64_t value, std::uint32_t timeout_us);
@@ -92,6 +96,12 @@ struct Job {
     std::size_t count = 0;
     void (*run)(const void* body, std::size_t begin, std::size_t end) = nullptr;
     const void* body = nullptr;
+    // published and every worker woken before the first item, as a library's
+    // own pool would: for a vendored library's fan-out, coarse by construction
+    // (a split per hull, a cost per pair of hulls), where measuring the first
+    // item alone would run two batches of a round that fits in one. A query
+    // from Python measures first, so a small one costs no wake at all
+    bool eager = false;
     // called by the caller only, between its ranges: true stops the job
     bool (*poll)(void* context) = nullptr;
     void* poll_context = nullptr;
@@ -185,16 +195,37 @@ inline void unpark(std::atomic<std::uint32_t>& word) {
 #endif
 }
 
-// the CPUs this process may run on: its affinity, where there is one
+// the CPUs this process may run on: its affinity, where there is one, and no
+// more than a cgroup's CPU quota allows (`cpu.max` at its cgroup and each one
+// above), which affinity doesn't see: a container limited to 2 CPUs on a
+// 64-core host would otherwise wake 63 workers for them
 inline std::uint32_t cpu_count() {
+    std::uint32_t count = std::max(1U, std::thread::hardware_concurrency());
 #if defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        return static_cast<std::uint32_t>(std::max(1, CPU_COUNT(&set)));
+        count = static_cast<std::uint32_t>(std::max(1, CPU_COUNT(&set)));
+    }
+    char directory[cgroup::DIRECTORY_CAPACITY];
+    cgroup::own_directory(directory, sizeof(directory));
+    // this process's cgroup and each one above it
+    for (bool more = true; more; more = cgroup::ascend(directory)) {
+        // "max 100000" for no quota, or "<quota> <period>" in microseconds
+        char path[cgroup::PATH_CAPACITY];
+        char text[64];
+        cgroup::join(path, sizeof(path), directory, "cpu.max");
+        cgroup::read_text(path, text, sizeof(text));
+        char* end = nullptr;
+        const unsigned long long quota = std::strtoull(text, &end, 10);
+        const unsigned long long period = end == text ? 0 : std::strtoull(end, nullptr, 10);
+        if (period > 0) {
+            const unsigned long long cpus = std::max<unsigned long long>(1, (quota + period - 1) / period);
+            count = static_cast<std::uint32_t>(std::min<unsigned long long>(count, cpus));
+        }
     }
 #endif
-    return std::max(1U, std::thread::hardware_concurrency());
+    return count;
 }
 
 inline void* worker_main(void* unused);
@@ -285,9 +316,15 @@ inline void child_after_fork() {
     pool.wanted.store(0, std::memory_order_relaxed);
 }
 
+// Registered once by the module's init (src/trimkit.cpp, through common.hpp)
+// as an explicit call: the standard lets a header variable's dynamic
+// initialization wait until the variable is first used, and one registering
+// a handler never would be
+inline void install_fork_handler() {
 #if !defined(_WIN32)
-inline const int FORK_HANDLER = pthread_atfork(nullptr, nullptr, child_after_fork);
+    pthread_atfork(nullptr, nullptr, child_after_fork);
 #endif
+}
 
 // a free slot holding `job`, or none when every slot is busy: then the
 // caller runs alone
@@ -328,14 +365,18 @@ inline bool spawn_worker() {
     return true;
 }
 
-// at least `want` workers awake: one thread started here, and each new
-// worker starts the next, so the caller pays for one start at most
+// At least `want` workers awake: one thread started here, and each new
+// worker starts the next, so the caller pays for one start at most. The wake
+// is bumped before the live are counted, and a worker leaving leaves the
+// count before it reads the wake (worker_main), both sequentially consistent:
+// one side sees the other, so a worker counted here never leaves without
+// starting its replacement
 inline void wake_workers(std::uint32_t want) {
     pool.wanted.store(want, std::memory_order_relaxed);
-    if (pool.live.load(std::memory_order_relaxed) < want) {
+    pool.wake.fetch_add(1, std::memory_order_seq_cst);
+    if (pool.live.load(std::memory_order_seq_cst) < want) {
         spawn_worker();
     }
-    pool.wake.fetch_add(1, std::memory_order_release);
     unpark(pool.wake);
 }
 
@@ -421,9 +462,10 @@ inline void* worker_main(void* /*unused*/) {
     // the epoch each slot last held when this worker found nothing left in
     // it: a drained job its caller hasn't closed yet isn't joined again
     std::uint32_t drained[SLOTS] = {};
+    std::uint32_t observed = 0;
     for (;;) {
         // before scanning: a job published after this bumps `wake`
-        const std::uint32_t observed = pool.wake.load(std::memory_order_acquire);
+        observed = pool.wake.load(std::memory_order_acquire);
         bool joined = false;
         for (std::size_t s = 0; s < SLOTS; s++) {
             Slot& slot = pool.slots[s];
@@ -449,7 +491,12 @@ inline void* worker_main(void* /*unused*/) {
             break;
         }
     }
-    pool.live.fetch_sub(1, std::memory_order_relaxed);
+    // out of the count, then one last look at the wake (see wake_workers): a
+    // publish that counted this worker as live gets its helper from here
+    pool.live.fetch_sub(1, std::memory_order_seq_cst);
+    if (pool.wake.load(std::memory_order_seq_cst) != observed) {
+        spawn_worker();
+    }
     return nullptr;
 }
 
@@ -468,6 +515,18 @@ inline void run_job(Job& job) {
     std::uint32_t helpers = 0;
     double item_ns = 0.0;  // measured cost of an item; 0 while probing
     std::size_t probe = 1;
+    if (job.eager && job.count > 1) {
+        tried = true;
+        const std::uint32_t cap = cpu_count() - 1;
+        if (cap > 0) {
+            pool.cap.store(cap, std::memory_order_relaxed);
+            slot = try_publish(job);
+        }
+        if (slot != nullptr) {
+            helpers = static_cast<std::uint32_t>(std::min<std::size_t>(cap, job.count - 1));
+            wake_workers(helpers);
+        }
+    }
     for (;;) {
         std::size_t grain = probe;
         if (item_ns > 0.0) {

@@ -9,7 +9,7 @@
 // rewrite (radii scaled up, a zero-length arc dropped), the parse gives back
 // exactly the input's kinds, closes flags and coordinates (with -0 read as
 // 0, since an absolute coordinate is 0 + the number written).
-#include <svgpath.hpp>
+#include "../src/svgpath.hpp"
 
 #include <charconv>
 #include <cmath>

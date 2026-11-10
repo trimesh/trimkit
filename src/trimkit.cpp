@@ -14,8 +14,7 @@
 #include <new>
 
 #if defined(__linux__)
-#include <fcntl.h>
-#include <unistd.h>
+#include "cgroup.hpp"
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -47,63 +46,20 @@ constexpr std::uint64_t NO_LIMIT = std::numeric_limits<std::uint64_t>::max();
 constexpr std::size_t LOOK_EVERY = std::size_t{16} << 20;
 
 #if defined(__linux__)
-// the number after `name` at the start of a line of `path`, or NO_LIMIT: an empty
-// name reads the first line, which cgroups may spell `max`
-static std::uint64_t read_value(const char* path, const char* name) {
-    char text[8192];
-    const int file = ::open(path, O_RDONLY | O_CLOEXEC);
-    if (file < 0) {
-        return NO_LIMIT;
-    }
-    std::size_t size = 0;
-    for (;;) {
-        const ssize_t got = ::read(file, text + size, sizeof(text) - 1 - size);
-        if (got <= 0) {
-            break;
-        }
-        size += static_cast<std::size_t>(got);
-    }
-    ::close(file);
-    text[size] = '\0';
-    const std::size_t length = std::strlen(name);
-    for (const char* line = text; line != nullptr && *line != '\0';) {
-        if (std::strncmp(line, name, length) == 0) {
-            char* end = nullptr;
-            const unsigned long long value = std::strtoull(line + length, &end, 10);
-            return end == line + length ? NO_LIMIT : value;
-        }
-        const char* newline = std::strchr(line, '\n');
-        line = newline == nullptr ? nullptr : newline + 1;
-    }
-    return NO_LIMIT;
-}
-
-// `directory`/`file` into `path`, which holds the longest cgroup path we keep
-static void join(char* path, std::size_t capacity, const char* directory, const char* file) {
-    const std::size_t directory_length = std::strlen(directory);
-    const std::size_t file_length = std::strlen(file);
-    path[0] = '\0';
-    if (directory_length + 1 + file_length < capacity) {
-        std::memcpy(path, directory, directory_length);
-        path[directory_length] = '/';
-        std::memcpy(path + directory_length + 1, file, file_length + 1);
-    }
-}
-
 // what a cgroup's limit leaves: what it holds, less the file cache the kernel
 // gives back before it kills anyone
 static std::uint64_t cgroup_room(const char* directory, const char* limit_file, const char* usage_file,
                                  const char* cache_name) {
-    char path[4096];
-    join(path, sizeof(path), directory, limit_file);
-    const std::uint64_t limit = read_value(path, "");
-    join(path, sizeof(path), directory, usage_file);
-    const std::uint64_t usage = read_value(path, "");
+    char path[trimkit::cgroup::PATH_CAPACITY];
+    trimkit::cgroup::join(path, sizeof(path), directory, limit_file);
+    const std::uint64_t limit = trimkit::cgroup::read_value(path, "");
+    trimkit::cgroup::join(path, sizeof(path), directory, usage_file);
+    const std::uint64_t usage = trimkit::cgroup::read_value(path, "");
     if (limit == NO_LIMIT || usage == NO_LIMIT) {
         return NO_LIMIT;
     }
-    join(path, sizeof(path), directory, "memory.stat");
-    const std::uint64_t cache = read_value(path, cache_name);
+    trimkit::cgroup::join(path, sizeof(path), directory, "memory.stat");
+    const std::uint64_t cache = trimkit::cgroup::read_value(path, cache_name);
     const std::uint64_t held = cache == NO_LIMIT ? usage : usage - std::min(usage, cache);
     return limit - std::min(limit, held);
 }
@@ -112,31 +68,10 @@ static std::uint64_t cgroup_room(const char* directory, const char* limit_file, 
 static std::uint64_t cgroups_room() {
     std::uint64_t room =
         cgroup_room("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file ");
-    constexpr char ROOT[] = "/sys/fs/cgroup";
-    char directory[3072] = "/sys/fs/cgroup";
-    // cgroup v2's one line, `0::/its/path`, is the file's last on a mixed system
-    char text[4096];
-    const int file = ::open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
-    if (file >= 0) {
-        const ssize_t got = ::read(file, text, sizeof(text) - 1);
-        ::close(file);
-        text[got > 0 ? got : 0] = '\0';
-        const char* line = std::strstr(text, "0::/");
-        if (line != nullptr && (line == text || line[-1] == '\n')) {
-            const std::size_t length = std::strcspn(line + 3, "\n");
-            if (sizeof(ROOT) + length < sizeof(directory)) {
-                std::memcpy(directory + sizeof(ROOT) - 1, line + 3, length);
-                directory[sizeof(ROOT) - 1 + length] = '\0';
-            }
-        }
-    }
-    while (std::strlen(directory) >= sizeof(ROOT) - 1) {
+    char directory[trimkit::cgroup::DIRECTORY_CAPACITY];
+    trimkit::cgroup::own_directory(directory, sizeof(directory));
+    for (bool more = true; more; more = trimkit::cgroup::ascend(directory)) {
         room = std::min(room, cgroup_room(directory, "memory.max", "memory.current", "inactive_file "));
-        char* last = std::strrchr(directory, '/');
-        if (last == nullptr) {
-            break;
-        }
-        *last = '\0';
     }
     return room;
 }
@@ -145,7 +80,7 @@ static std::uint64_t cgroups_room() {
 static std::uint64_t available() {
     std::uint64_t bytes = NO_LIMIT;
 #if defined(__linux__)
-    const std::uint64_t kib = read_value("/proc/meminfo", "MemAvailable:");
+    const std::uint64_t kib = trimkit::cgroup::read_value("/proc/meminfo", "MemAvailable:");
     if (kib != NO_LIMIT) {
         bytes = kib * 1024;
     }
@@ -268,14 +203,16 @@ void operator delete[](void* block, std::size_t /*unused*/, std::align_val_t /*u
 // NOLINTEND(misc-new-delete-overloads, cppcoreguidelines-no-malloc, cppcoreguidelines-owning-memory)
 
 NB_MODULE(trimkit, m) {  // NOLINT(performance-unnecessary-value-param): the macro passes it by value
+    trimkit::install_fork_handler();
     // the last paragraph names what this build compiled in, each upstream's
     // repository and commit, or `(system)` for a distribution's copy
     m.doc() = R"(Thin, stable-ABI numpy bindings to pinned C and C++ geometry libraries.
 
-They depend only on `numpy`, take exact-dtype arrays (float64 ones finite
-and within +-1e30), read C-contiguous ones in place and copy any other layout
-once, return fresh arrays that own their memory, and release the GIL during
-compute.
+They depend only on `numpy`, read arrays of exactly the dtype shown (float64
+ones finite and within +-1e30) in place when C-contiguous and copy any other
+layout once, convert a dtype numpy casts safely (or a list) once with a
+UserWarning, return fresh arrays that own their memory, and release the GIL
+during compute.
 
 Attributes
 ----------
@@ -283,8 +220,8 @@ __version__ : str
   This package's version.
 Mesh : TypeAlias
   A triangle mesh as the scenes take it and `decompose` returns it: a
-  (vertices, faces) tuple of (n, 3) float64 vertices and (m, 3) int64 triangle
-  indices into them.
+  (vertices, faces) pair of (n, 3) float64 vertices and (m, 3) int64 triangle
+  indices into them, given as a tuple, list or any sequence of two.
 exchange : module
   Reading and writing data formats: draco and SVG paths.
 

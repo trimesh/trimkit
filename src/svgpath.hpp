@@ -206,6 +206,11 @@ static inline bool arc_center(Segment* segment, double* center, double* middle, 
     const double ratio_x = rotated_x / radius_x;
     const double ratio_y = rotated_y / radius_y;
     const double reach = std::hypot(ratio_x, ratio_y);
+    // a chord below the radii's precision (the ratios underflowed, or the
+    // endpoints coincide) places no center: the arc is its chord
+    if (reach == 0.0) {
+        return false;
+    }
     // Radii within a few ulps of exactly reaching both endpoints are treated
     // as reaching them: the center is the chord's midpoint and the radii stay
     // as given. Radii scaled up by F.6.6 and written back out land within

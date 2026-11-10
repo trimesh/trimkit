@@ -17,7 +17,7 @@
 #                      `kind: fix` (a bug or UB upstream) or `kind: perf` and
 #                      why, every hunk matching exactly; `fetch` writes the hashes
 # and how it is built, all of it quietly (vendored warnings aren't ours to fix):
-#   include            header directories; system headers unless `own`
+#   include            header directories, as system headers
 #   system             a header of it as the sources include it (`Eigen/Core`):
 #                      a build may take it from the system's copy instead
 #                      (`-Csystem=NAME,...`), never with patches
@@ -29,7 +29,6 @@
 #   sources            globs of files compiled into a static library
 #   defines            { NAME = why } compile definitions for it and its users
 #   no_sanitize        { check = why } sanitizer checks off for its sources
-#   own                our own work: no repo, never fetched or hashed
 # vendor/ holds exactly these upstreams and vendor/patches/, nothing else.
 #
 # [part.NAME], a part of the one extension: src/NAME.cpp, whose bind_NAME adds
@@ -78,14 +77,18 @@ include = ["vendor/earcut/include/mapbox"]
 repo = "kmammou/v-hacd"
 ref = "master"
 commit = "f900e42361491f525262d4825e758845e4969897"
-tree_sha256 = "6d37071fe771f42f5e9a8ff6cc597c665d178be493f78eb72622d2a550946d31"
+tree_sha256 = "6977317884238579db3f5ec7ffedd97f4ee1392de10b2940a78641c1e1fdf7e1"
 spdx = "BSD-3-Clause"
 keep = ["LICENSE"]
 include = ["vendor/vhacd/include"]
 
+[upstream.vhacd.defines]
+VHACD_DISABLE_THREADING = "its fan-outs run on the extension's one pool through vendor/patches/vhacd-parallel-for.patch: no thread pool of its own, no futures, no asynchronous implementation"
+
 [upstream.vhacd.patches]
 "vhacd-atomic-hull-counter.patch" = "67ed17f039adedaef0a000edc896e8dafc41cf4953cc1c7ed86a63b1bb92c300"
 "vhacd-empty-volume.patch" = "8db53c1a9d074b9eae4ed91ed526ff0360e09373dd4cd8bfd9ca2526fd60a587"
+"vhacd-parallel-for.patch" = "52252b0af7e8d008ed8d151db202c275da672f6b022bb78a8c9feaaa9fd30e90"
 
 [upstream.xatlas]
 repo = "jpcy/xatlas"
@@ -164,6 +167,18 @@ NO_THREADED_BUILDS = "build on the calling thread: threaded builds gained 1-8% (
 [upstream.tinybvh.patches]
 "tinybvh-flat-node-bins.patch" = "fede891c586822c339923c731d913c12500a76ae7a6d11d9c21b48c3ae999469"
 
+[upstream.vulkan_headers]
+repo = "KhronosGroup/Vulkan-Headers"
+ref = "main"
+commit = "753d0fa284e803beabb4d5d1ab91a4f2d8a4a6a9"
+tree_sha256 = "3763ccd8c20c9e64a898c1b213261509ce98e911473861ff2e0937a7d8e49b3e"
+spdx = "Apache-2.0 OR MIT"
+copyright = "Copyright 2015-2026 The Khronos Group Inc."
+# the core API declarations only, included with VK_NO_PROTOTYPES: the loader is
+# opened at run time (src/vulkan.hpp), so no wheel links or needs Vulkan
+keep = ["LICENSE.md", "include/vulkan/vulkan_core.h", "include/vulkan/vk_platform.h", "include/vk_video"]
+include = ["vendor/vulkan_headers/include"]
+
 [upstream.meshoptimizer]
 repo = "zeux/meshoptimizer"
 ref = "v1.3"
@@ -193,7 +208,7 @@ no_sanitize = { vptr = "convex support dispatches by casting a ConvexBase to emp
 include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/third_party", "src/config/coal"]
 
 [upstream.coal.patches]
-"coal-bvh-bvh-performance.patch" = "f32a0b89a130c98ccc6a457925ab99aa6215206fc02d1c019b4d743a5ae48da8"
+"coal-bvh-bvh-performance.patch" = "8bebc611a67029abe2fd8d2493cadd0cb54510a0ca3438bb34e65fad13d292ba"
 
 # coal's linear algebra, header only: only the headers coal and our binding
 # reach on some wheel target. MPL-2.0, which binds only its own files, kept
@@ -240,18 +255,12 @@ include = ["vendor/robin_map/include"]
 system = "tsl/robin_map.h"
 distro = { debian = "robin-map-dev", fedora = "robin-map-devel" }
 
-[upstream.svgpath]
-own = true
-spdx = "MIT"
-include = ["vendor/svgpath"]
-
-
 [extension]
 budget = 4_400_000
 upstreams = ["nanobind", "robin_map"]
 
 [part.bvh]
-upstreams = ["tinybvh"]
+upstreams = ["tinybvh", "vulkan_headers"]
 fuzz = ["bvh", "parallel"]
 
 [part.earcut]
@@ -273,7 +282,7 @@ fuzz = ["draco", "draco_roundtrip"]
 seeds = "draco_seeds"
 
 [part.svg]
-upstreams = ["svgpath", "fast_float", "dragonbox"]
+upstreams = ["fast_float", "dragonbox"]
 fuzz = ["svgpath", "svgpath_format"]
 
 [part.meshoptimizer]

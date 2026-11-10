@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from helpers import box, is_closed, leaves, volume
+from helpers import box, first_hits, is_closed, leaves, volume
 
 import trimkit
 
@@ -28,7 +28,8 @@ def check_hulls(mesh, hulls):
         distance = np.einsum("fj,vj->fv", normals, v) - np.einsum("fj,fj->f", normals, v[f[:, 0]])[:, None]
         assert distance.max() < 1e-9 * np.abs(normals).max()
         total += volume(v, f)
-    assert total >= 0.95 * volume(*mesh)
+    # together they cover the mesh: at least its volume (more where hulls overlap)
+    assert total >= volume(*mesh) * (1 - 1e-12)
 
 
 @pytest.mark.parametrize("mesh", [box(), l_shape()])
@@ -37,15 +38,17 @@ def test_hulls_closed_convex_covering(mesh):
 
 
 def test_how_many_hulls():
+    # a box is one box; two disjoint boxes come out as four boxes, exactly
+    # covering them (their volumes sum to 1.038 of the input: they overlap)
     assert [(len(v), len(f)) for v, f in trimkit.decompose(*box(), resolution=100_000)] == [(8, 12)]
-    assert len(trimkit.decompose(*l_shape(), resolution=100_000)) >= 2
+    assert [(len(v), len(f)) for v, f in trimkit.decompose(*l_shape(), resolution=100_000)] == [(8, 12)] * 4
 
 
 def test_hulls_go_straight_into_the_scenes():
     # a hull is a Mesh, so the result is what the scenes take
     hulls = trimkit.decompose(*box(), resolution=100_000)
     origins, directions = np.array([[0.5, 0.5, 5.0]]), np.array([[0.0, 0.0, -1.0]])
-    instances, _, distances = trimkit.RayScene(hulls).intersect_first(origins, directions)
+    instances, _, distances = first_hits(trimkit.RayScene(hulls), origins, directions)
     assert instances.tolist() == [0]
     assert distances == pytest.approx([4.0])
     assert trimkit.CollisionScene(hulls, convex=True).boxes().bounds.tolist() == [[0, 0, 0], [1, 1, 1]]
@@ -71,8 +74,7 @@ def test_a_coarser_error_is_no_more_hulls():
 def test_caps_hold():
     mesh = l_shape()
     hulls = trimkit.decompose(*mesh, resolution=50_000, maximum_hulls=1, maximum_vertices=8)
-    assert len(hulls) == 1
-    assert len(hulls[0][0]) <= 8
+    assert [(len(v), len(f)) for v, f in hulls] == [(8, 12)]
 
 
 def test_bad_input():

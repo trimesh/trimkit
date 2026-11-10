@@ -9,10 +9,12 @@ def test_parametrize_sphere():
     vertices, faces = sphere()
     vertex_sources, new_faces, uv = trimkit.parametrize(vertices, faces)
 
-    # seams duplicate vertices, but every triangle is exactly where it was
+    # seams duplicate vertices, but every triangle is exactly where it was:
+    # this sphere cuts into charts that need 852 uv vertices for its 722
     assert len(new_faces) == len(faces)
     assert np.array_equal(vertices[vertex_sources][new_faces], vertices[faces])
-    assert len(vertex_sources) == len(uv) >= len(vertices)
+    assert len(vertex_sources) == len(uv) == 852
+    assert len(np.unique(vertex_sources)) == len(vertices) == 722
     assert uv.min() >= 0.0 and uv.max() <= 1.0
 
     # no triangle collapses to zero area, and charts don't overlap enough to
@@ -44,8 +46,10 @@ def test_far_from_origin():
     assert len(vertex_sources) == len(near[0])
     area = np.abs(areas2d(uv, new_faces))
     assert area.min() > 0
-    # packing efficiency varies with rounding, a collapsed atlas has no area at all
-    assert np.isclose(area.sum(), np.abs(areas2d(near[2], near[1])).sum(), rtol=0.25)
+    # xatlas re-decides its charts from the rounding (the sums measured 0.75
+    # and 0.65 of the square, 2026-11-09): what is checked is that neither
+    # atlas collapsed, which leaves no area at all
+    assert area.sum() > 0.5 and np.abs(areas2d(near[2], near[1])).sum() > 0.5
 
 
 def test_needle_triangle():

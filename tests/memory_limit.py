@@ -46,6 +46,26 @@ def main() -> None:
         with contextlib.suppress(MemoryError, ValueError):
             decode(draco_points_bomb(points), wanted)
 
+    # rows found in parallel: every box overlaps every query, so the pairs
+    # (16 bytes each) outgrow the limit while the pool's workers are gathering
+    # them. The worker's std::bad_alloc comes back through the scheduler to
+    # the caller, as a MemoryError, never a killed or aborted process
+    corners = np.zeros((20_000, 3))
+    boxes = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
+    assert refused(boxes.intersect, np.stack([corners, corners + 1.0], axis=1)), "20k x 20k box pairs fit"
+    del boxes
+
+    # a decomposition at the finest voxel grid V-HACD takes, whose fan-outs run
+    # on the pool: a MemoryError or an answer, as the grid may fit; never killed
+    vertices = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)])
+    faces = np.array(
+        [[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1],
+         [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]],
+        dtype=np.int64,
+    )  # fmt: skip
+    with contextlib.suppress(MemoryError):
+        trimkit.decompose(vertices, faces, resolution=64_000_000)
+
     # what fits still works, at a quarter of the limit
     kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
     points = limit // 4 // (4 * 3 * 2 + 4)

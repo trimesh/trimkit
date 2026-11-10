@@ -8,7 +8,7 @@
 
 #include "common.hpp"
 
-#include <svgpath.hpp>
+#include "svgpath.hpp"
 
 // what svgpath parses is exactly what the door lets `svg_string` read back
 static_assert(svgpath::COORDINATE_LIMIT == trimkit::COORDINATE_LIMIT, "svgpath and numpy.hpp share one bound");

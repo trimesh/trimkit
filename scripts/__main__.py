@@ -5,7 +5,8 @@ The one way to build, test and check this package, locally and in CI alike:
                              static check, ASan, TSan, and every fuzzer
   uv run scripts distro      Debian and Fedora packaging (--run: build,
                              test and lint them), when packaging changes
-  uv run scripts generate    regenerate the stubs and the README API summary
+  uv run scripts generate    regenerate the shaders' SPIR-V, the stubs, the
+                             README API summary and tests/golden.json
   uv run scripts update      move every upstream and dependency to its newest
   uv run scripts format      format our C++ with the pinned clang-format
   uv run scripts wheel       this platform's release wheels
@@ -215,12 +216,14 @@ def cmd_test(args) -> None:
     # too much fails here, not one push later on a platform with less. Then the
     # bombs, where the kernel kills what touches too much
     build = dev(args.root)
-    build.pytest(*test_files())
+    # the image has a Vulkan device (Mesa's CPU one), so the device tests run
+    build.pytest("--device-required", *test_files())
     run(build.python, ROOT / "tests" / "memory_limit.py", cwd=ROOT / "tests")
 
 
 def cmd_asan(args) -> None:
-    build = Build(args.root, "asan").install(PYTHON, sanitize="address,undefined")
+    # CFI too: it needs ThinLTO and hidden visibility, which every build has
+    build = Build(args.root, "asan").install(PYTHON, sanitize="address,undefined,cfi")
     # wall-clock bounds measure the sanitizer, not the code
     build.pytest(
         "-m",
@@ -377,9 +380,7 @@ def cmd_tidy(args) -> None:
 
 
 def cmd_cppcheck(args) -> None:
-    # our sources and our own headers (clang's analyzer runs in `tidy`)
-    own = [d for d in MANIFEST.directories if d != ROOT / "src"]
-    headers = sorted(p for d in own for p in d.glob("*.hpp"))
+    # our sources, and the headers they include (clang's analyzer runs in `tidy`)
     run(
         tool("cppcheck"),
         "--quiet",
@@ -390,9 +391,7 @@ def cmd_cppcheck(args) -> None:
         # every branch, not cppcheck's default sample of them, one line per finding
         "--check-level=exhaustive",
         "--template={file}:{line}: {severity}: {message} [{id}]",
-        *(f"-I{d}" for d in own),
         *MANIFEST.sources,
-        *headers,
     )
 
 
@@ -490,6 +489,21 @@ def cmd_licenses(args) -> None:
 
 # what only src/numpy.hpp may do: touch nanobind's ndarray directly, or the
 # checks behind its `read*` functions, so no binding can skip one
+# what starts or waits on a thread, allowed in src/parallel.hpp alone
+THREADING = (
+    "<mutex>",
+    "<condition_variable>",
+    "<future>",
+    "std::mutex",
+    "std::condition_variable",
+    "std::thread(",
+    "std::async",
+    "pthread_create",
+    "_beginthreadex",
+)
+# the vendored libraries with thread pools of their own, and the define that compiles each out
+POOLS_COMPILED_OUT = {"vhacd": "VHACD_DISABLE_THREADING", "tinybvh": "NO_THREADED_BUILDS"}
+
 DOOR_ONLY = re.compile(
     r"nb::ndarray|try_cast|check_bounded|check_coordinates|trimkit::detail::|\b(malloc|calloc|realloc)\("
 )
@@ -520,6 +534,23 @@ def check_door() -> None:
     ]
     if found:
         sys.exit("threads must go through in_parallel in src/common.hpp:\n  " + "\n  ".join(found))
+    # and the pool is the only thread, mutex or wait there is: nothing of ours
+    # starts or blocks on anything else
+    found = [
+        f"{path.relative_to(ROOT)}: {needle}"
+        for path in sources
+        if path.name != "parallel.hpp"
+        for needle in THREADING
+        if needle in path.read_text()
+    ]
+    if found:
+        sys.exit("the pool in src/parallel.hpp is the only threading there is:\n  " + "\n  ".join(found))
+    # every vendored library with a pool of its own has it compiled out, and
+    # runs its fan-outs on ours or on the calling thread; xatlas is the one
+    # exception, kept as it is with its own workers (README)
+    for upstream, define in POOLS_COMPILED_OUT.items():
+        if define not in MANIFEST.upstreams[upstream].defines:
+            sys.exit(f"trimkit.toml: [upstream.{upstream}.defines] must set {define}: one pool, parallel.hpp")
     print(f"ok: {len(sources)} sources use only src/numpy.hpp for arrays and src/common.hpp for threads")
 
 
@@ -539,6 +570,7 @@ def cmd_static(args) -> None:
         cmd_ruff,
         cmd_actions,
         cmd_licenses,
+        cmd_shader,
         # the sdist builds; building and testing from it alone is `sdist`,
         # which release CI runs, as it's a whole build and suite again
         lambda args: sdist(args.root),
@@ -631,10 +663,64 @@ def cmd_update(args) -> None:
     run(tool("git"), "-C", ROOT, "diff", "--stat", "--", "trimkit.toml", "uv.lock")
 
 
+SPIRV = ROOT / "src" / "trace_spirv.hpp"
+
+
+def shaders() -> list[Path]:
+    # every shader in src: trace.comp, scan.comp and compact.comp
+    return sorted(p for p in builder.tracked_under(ROOT / "src") if p.suffix == ".comp")
+
+
+def shader(write: bool) -> None:
+    """
+    Compile every src/*.comp to SPIR-V with the image's glslang and write them
+    as the words src/vulkan.hpp embeds (so no build or wheel needs a shader
+    compiler), or fail if the checked-in words drifted from the sources.
+    """
+    sources = shaders()
+    arrays = []
+    with tempfile.TemporaryDirectory() as fresh:
+        for source in sources:
+            compiled = Path(fresh) / f"{source.stem}.spv"
+            binary = Path(fresh) / f"{source.stem}.stripped.spv"
+            run(tool("glslang"), "-V", "--target-env", "vulkan1.0", "-o", compiled, source, capture=True)
+            # without the names glslang keeps for debuggers: a sixth smaller, the
+            # same code (spirv-opt's -O was measured 4-6% slower on NVIDIA: not used)
+            run(tool("spirv-opt"), "--strip-debug", compiled, "-o", binary, capture=True)
+            # a malformed module fails here, not in a driver
+            run(tool("spirv-val"), "--target-env", "vulkan1.0", binary, capture=True)
+            words = memoryview(binary.read_bytes()).cast("I")
+            rows = [", ".join(f"0x{w:08x}" for w in words[i : i + 8]) for i in range(0, len(words), 8)]
+            name = f"{source.stem.upper()}_SPIRV"
+            words = ",\n    ".join(rows)
+            arrays.append(f"inline constexpr std::uint32_t {name}[] = {{\n    {words},\n}};\n")
+    digests = [(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sources]
+    named = "\n".join(f"// src/{name} (sha256 {digest})" for name, digest in digests)
+    text = (
+        "// The shaders as SPIR-V, written by `uv run scripts generate`: what\n"
+        "// src/vulkan.hpp hands the device. Never edited by hand.\n"
+        f"{named}\n"
+        "// clang-format off\n"
+        "#pragma once\n\n#include <cstdint>\n\n"
+        "namespace trimkit::vulkan {\n\n" + "\n".join(arrays) + "\n}  // namespace trimkit::vulkan\n"
+    )
+    if write:
+        SPIRV.write_text(text)
+    elif not SPIRV.exists() or SPIRV.read_text() != text:
+        sys.exit("src/trace_spirv.hpp drifted from src/*.comp; run `uv run scripts generate`")
+
+
+def cmd_shader(args) -> None:
+    shader(write=False)
+
+
 def cmd_generate(args) -> None:
-    # everything derived from the sources: the stubs from the module the dev
-    # build makes, and the README's API summary from the stubs
+    # everything derived from the sources: the shaders' SPIR-V, the stubs from
+    # the module the dev build makes, the README's API summary from the stubs,
+    # and the golden answers every platform is checked against
+    shader(write=True)
     stubs(args.root, write=True)
+    run(dev(args.root).python, ROOT / "tests" / "test_golden.py", "--write", cwd=ROOT / "tests")
 
 
 # what `check` runs, in order: every stage runs even after one fails
@@ -730,6 +816,12 @@ def in_image(args) -> None:
         "-w",
         "/src",
     ]
+    # a git worktree's .git is a file naming the main repository's directory:
+    # mounted read-only at its own path, so `git ls-files` resolves inside too
+    dotgit = ROOT / ".git"
+    if dotgit.is_file():
+        main_git = Path(dotgit.read_text().split("gitdir:", 1)[1].strip()).parents[1]
+        docker += ["-v", f"{main_git}:{main_git}:ro"]
     inside = ["python3", "/src/scripts", "--inside", "--root", "/src/build/docker"]
     if args.command == "test":
         run(*docker, IMAGE, *inside, "build")
@@ -746,7 +838,7 @@ def main() -> None:
     # only the documented commands show in the usage and help
     documented = {
         "check": "the gate: build, tests, static checks, sanitizers and fuzzers",
-        "generate": "regenerate the stubs and the README API summary",
+        "generate": "regenerate the shaders' SPIR-V, the stubs, the README API summary and tests/golden.json",
         "update": "move every upstream and dependency to its newest",
         "format": "format our C++ with the pinned clang-format",
         "wheel": "this platform's release wheels",

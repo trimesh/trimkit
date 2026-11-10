@@ -396,8 +396,9 @@ public:
         coal::CollisionRequest request(coal::NO_REQUEST, 1);
         request.security_margin = margin;
         // one pass: each pair culled, then tested, keeping those that touch
-        std::vector<std::int64_t> touching = trimkit::gather_in_parallel<std::int64_t>(
-            pair_count, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& found) {
+        trimkit::Gathered<std::int64_t> touching;
+        trimkit::gather_in_parallel<std::int64_t>(
+            pair_count, &touching, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& found) {
                 coal::GJKSolver solver;
                 coal::CollisionResult result;
                 for (std::size_t p = begin; p < end; p++) {
@@ -410,7 +411,7 @@ public:
                 }
             });
         const std::size_t touching_count = touching.size() / 2;
-        return trimkit::to_numpy(std::move(touching), {touching_count, 2});
+        return trimkit::to_numpy<std::int64_t>(trimkit::gathered_rows(touching), {touching_count, 2});
     }
 
     Distances distances(const MatricesArg& matrices_argument, const IndexArg& index_argument,
@@ -646,7 +647,7 @@ negative only when a convex solid is penetrated.
 Parameters
 ----------
 meshes : sequence of Mesh
-  The meshes to place, each a (vertices, faces) tuple of (n, 3) float64
+  The meshes to place, each a (vertices, faces) pair of (n, 3) float64
   vertices and (m, 3) int64 triangle indices into them. Copied once
   into coal's own storage, which the scene owns, so a mesh can never
   change under the threads sharing the scene.

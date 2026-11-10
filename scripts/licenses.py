@@ -105,20 +105,15 @@ def sbom(created: str) -> dict:
             "copyrightText": copyright_of(pin),
             "filesAnalyzed": False,
         }
-        if not pin.own:
-            package["versionInfo"] = pin.commit
-            package["downloadLocation"] = f"git+https://{pin.host}/{pin.repo}@{pin.commit}"
-            package["externalRefs"] = [
-                {
-                    "referenceCategory": "PACKAGE-MANAGER",
-                    "referenceType": "purl",
-                    "referenceLocator": f"pkg:{pin.host.split('.')[0]}/{pin.repo.lower()}@{pin.commit}",
-                }
-            ]
-        else:
-            # our own work: part of this package's own source
-            package["versionInfo"] = meta["version"]
-            package["downloadLocation"] = "NOASSERTION"
+        package["versionInfo"] = pin.commit
+        package["downloadLocation"] = f"git+https://{pin.host}/{pin.repo}@{pin.commit}"
+        package["externalRefs"] = [
+            {
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType": "purl",
+                "referenceLocator": f"pkg:{pin.host.split('.')[0]}/{pin.repo.lower()}@{pin.commit}",
+            }
+        ]
         packages.append(package)
         # every vendored library is compiled statically into the extension
         contains = {"spdxElementId": root_id, "relationshipType": "CONTAINS"}

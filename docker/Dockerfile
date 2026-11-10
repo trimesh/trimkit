@@ -6,7 +6,9 @@
 FROM debian:trixie@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
 
 # clang (every build's compiler) with lld (its linker), its llvm tools,
-# sanitizer and libFuzzer runtimes, analyzers, git (every command reads the
+# sanitizer and libFuzzer runtimes, analyzers, the Vulkan loader with Mesa's
+# CPU device (lavapipe, which runs the GPU ray path in the gate) and glslang
+# (which `generate` compiles the shader with), git (every command reads the
 # files git tracks, never untracked ones), and what CPython needs to build,
 # from the Debian archive as it was on the day the base image was built, read
 # from the snapshot date the image records: moving the image's digest moves
@@ -23,6 +25,7 @@ RUN snapshot="$(sed -n 's|^# http://snapshot.debian.org/archive/debian/\([0-9TZ]
         ca-certificates curl git make pkg-config \
         clang clang-format clang-tidy lld llvm libclang-rt-dev cppcheck \
         python3 zlib1g-dev libffi-dev liblzma-dev libbz2-dev \
+        libvulkan1 mesa-vulkan-drivers glslang-tools \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 \
