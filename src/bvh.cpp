@@ -20,15 +20,15 @@
 // one it started with.
 //
 // A scene built with `use_gpu` holds its meshes on a Vulkan device too
-// (src/vulkan.hpp) and traces there: the same trees, and a shader
-// (src/trace.comp) that makes every decision tinybvh's traversal makes,
+// (src/vulkan/vulkan.hpp) and traces there: the same trees, and a shader
+// (src/vulkan/trace.comp) that makes every decision tinybvh's traversal makes,
 // most in f32 behind a proven bound and the rest with tinybvh's own f64
 // operations, so the same bytes come back; the crossing loop below
 // (`settle`) runs in the shader too, written the same way. A device that
 // can't be used, now or later, is a warning once, and the CPU answers.
 
 #include "common.hpp"
-#include "vulkan.hpp"
+#include "vulkan/vulkan.hpp"
 
 #include <tiny_bvh.h>
 
@@ -57,8 +57,10 @@ namespace {
 using Vec = tinybvh::bvhdbl3;
 using Transforms = trimkit::Array<double, -1, 4, 4>;
 using Numbers = trimkit::Array<std::int64_t, -1>;
-using PointsArg = trimkit::Array<double, -1, 3>;
 using Points = trimkit::In<double, -1, 3>;
+// rays' origins or directions: one each, or one for every ray
+using RaysArg = trimkit::RowsArgument<3>;
+using Rays = trimkit::Rows<3>;
 using FacesArg = trimkit::Array<std::int64_t, -1, 3>;
 using BoundsArg = trimkit::Array<double, -1, 2, -1>;
 using Bounds = trimkit::In<double, -1, 2, -1>;
@@ -134,7 +136,7 @@ bool still(const double* d) { return d[0] == 0.0 && d[1] == 0.0 && d[2] == 0.0; 
 // The length of a direction, scaled by its largest component so tiny and
 // huge directions neither underflow nor overflow: libstdc++'s three-argument
 // hypot written out, so it is the same IEEE operations (and the same bits) on
-// every platform and on the device (src/trace.comp), where libm's hypot is not
+// every platform and on the device (src/vulkan/trace.comp), where libm's hypot is not
 double length(const double* d) {
     const double x = std::abs(d[0]);
     const double y = std::abs(d[1]);
@@ -149,106 +151,89 @@ double length(const double* d) {
     return largest * std::sqrt(((u * u) + (v * v)) + (w * w));
 }
 
-void check_rays(const Points& origins, const Points& directions) {
-    if (directions.shape(0) != origins.shape(0)) {
+// how many rays: a row of each per ray, where neither is one for every ray
+std::size_t count_rays(const Rays& origins, const Rays& directions) {
+    if (!origins.one && !directions.one && directions.count != origins.count) {
         trimkit::value_error("origins and directions must have the same number of rays");
     }
+    return origins.one ? directions.count : origins.count;
 }
 
-// The f32 shadow of a tree's nodes for the device's filter (src/trace.comp,
-// docs/trace.md 3): each box rounded to nearest, and per interior node which
-// of its children's coordinates tie exactly, which decides their order
-void shadow_nodes(const tinybvh::BVH_Double& bvh, std::vector<trimkit::vulkan::Node32>* out) {
-    const std::size_t count = bvh.usedNodes;
-    const std::size_t first = out->size();
-    out->resize(first + count);
-    for (std::size_t i = 0; i < count; i++) {
-        const tinybvh::BVH_Double::BVHNode& node = bvh.bvhNode[i];
-        trimkit::vulkan::Node32& shadow = (*out)[first + i];
-        for (std::int32_t axis = 0; axis < 3; axis++) {
-            shadow.lo[axis] = static_cast<float>(node.aabbMin[axis]);
-            shadow.hi[axis] = static_cast<float>(node.aabbMax[axis]);
-        }
-        shadow.left = static_cast<std::uint32_t>(node.leftFirst);
-        if (node.isLeaf()) {
-            shadow.count_word = static_cast<std::uint32_t>(node.triCount);
-            continue;
-        }
-        std::uint32_t ties = 0;
-        const tinybvh::BVH_Double::BVHNode& a = bvh.bvhNode[node.leftFirst];
-        const tinybvh::BVH_Double::BVHNode& b = bvh.bvhNode[node.leftFirst + 1];
-        for (std::int32_t axis = 0; axis < 3; axis++) {
-            ties |= (a.aabbMin[axis] == b.aabbMin[axis] ? 1U : 0U) << static_cast<std::uint32_t>(axis);
-            ties |= (a.aabbMax[axis] == b.aabbMax[axis] ? 1U : 0U) << static_cast<std::uint32_t>(3 + axis);
-        }
-        shadow.count_word = trimkit::vulkan::INTERIOR | ties;
-    }
-}
-
-// The f32 shadow of a mesh's triangles, per primitive slot of its tree
-// (docs/trace.md 4.1, 5.2): the corners, a radius never below any coordinate's
+// The f32 image of one triangle for the device's filter (src/vulkan/trace.comp,
+// docs/trace.md 4.1, 5.2): the corners, a radius never below any coordinate's
 // magnitude, the f64 normal and `nu`, a bound on that normal's distance from
 // the exact one: the edges' roundings, the products' and difference's, the
 // result's and the f32 conversion's, inflated by 2^-20 for this arithmetic's own
-void shadow_triangles(const tinybvh::BVH_Double& bvh, const std::vector<Vec>& vertices,
-                      const std::vector<std::uint64_t>& faces, std::vector<trimkit::vulkan::Tri32>* out) {
+trimkit::vulkan::Tri32 triangle32(const std::vector<Vec>& vertices, const std::vector<std::uint64_t>& faces,
+                                  std::uint64_t face) {
     constexpr double U64 = 1.1102230246251565e-16;         // 2^-53
     constexpr double U32 = 5.960464477539063e-08;          // 2^-24
     constexpr double INFLATE = 1.0 + 9.5367431640625e-07;  // 1 + 2^-20
-    const std::size_t first = out->size();
-    out->resize(first + bvh.idxCount);
-    for (std::size_t slot = 0; slot < bvh.idxCount; slot++) {
-        const std::uint64_t prim = bvh.primIdx[slot];
-        const Vec& v0 = vertices[faces[3 * prim]];
-        const Vec& v1 = vertices[faces[(3 * prim) + 1]];
-        const Vec& v2 = vertices[faces[(3 * prim) + 2]];
-        trimkit::vulkan::Tri32& shadow = (*out)[first + slot];
-        double radius = 0.0;
-        for (std::int32_t axis = 0; axis < 3; axis++) {
-            shadow.p0[axis] = static_cast<float>(v0[axis]);
-            shadow.p1[axis] = static_cast<float>(v1[axis]);
-            shadow.p2[axis] = static_cast<float>(v2[axis]);
-            radius = std::max({radius, std::abs(v0[axis]), std::abs(v1[axis]), std::abs(v2[axis])});
-        }
-        shadow.radius = std::nextafter(static_cast<float>(radius), std::numeric_limits<float>::infinity());
-        shadow.prim = static_cast<std::uint32_t>(prim);
-        const Vec e1 = v1 - v0;
-        const Vec e2 = v2 - v0;
-        const double n[3] = {(e1[1] * e2[2]) - (e1[2] * e2[1]), (e1[2] * e2[0]) - (e1[0] * e2[2]),
-                             (e1[0] * e2[1]) - (e1[1] * e2[0])};
-        const double a1[3] = {std::abs(e1[0]), std::abs(e1[1]), std::abs(e1[2])};
-        const double a2[3] = {std::abs(e2[0]), std::abs(e2[1]), std::abs(e2[2])};
-        const double products[3] = {(a1[1] * a2[2]) + (a1[2] * a2[1]), (a1[2] * a2[0]) + (a1[0] * a2[2]),
-                                    (a1[0] * a2[1]) + (a1[1] * a2[0])};
-        double nu = 0.0;
-        for (std::int32_t axis = 0; axis < 3; axis++) {
-            shadow.n[axis] = static_cast<float>(n[axis]);
-            nu = std::max(nu, (4 * U64 * products[axis]) + (2 * U64 * std::abs(n[axis])) + (U32 * std::abs(n[axis])));
-        }
-        shadow.nu = std::nextafter(static_cast<float>(nu * INFLATE), std::numeric_limits<float>::infinity());
-        shadow.spare = 0.0F;
+    const Vec& v0 = vertices[faces[3 * face]];
+    const Vec& v1 = vertices[faces[(3 * face) + 1]];
+    const Vec& v2 = vertices[faces[(3 * face) + 2]];
+    trimkit::vulkan::Tri32 image{};
+    double radius = 0.0;
+    for (std::int32_t axis = 0; axis < 3; axis++) {
+        image.p0[axis] = static_cast<float>(v0[axis]);
+        image.p1[axis] = static_cast<float>(v1[axis]);
+        image.p2[axis] = static_cast<float>(v2[axis]);
+        radius = std::max({radius, std::abs(v0[axis]), std::abs(v1[axis]), std::abs(v2[axis])});
     }
+    image.radius = std::nextafter(static_cast<float>(radius), std::numeric_limits<float>::infinity());
+    image.prim = static_cast<std::uint32_t>(face);
+    const Vec e1 = v1 - v0;
+    const Vec e2 = v2 - v0;
+    const double n[3] = {(e1[1] * e2[2]) - (e1[2] * e2[1]), (e1[2] * e2[0]) - (e1[0] * e2[2]),
+                         (e1[0] * e2[1]) - (e1[1] * e2[0])};
+    const double a1[3] = {std::abs(e1[0]), std::abs(e1[1]), std::abs(e1[2])};
+    const double a2[3] = {std::abs(e2[0]), std::abs(e2[1]), std::abs(e2[2])};
+    const double products[3] = {(a1[1] * a2[2]) + (a1[2] * a2[1]), (a1[2] * a2[0]) + (a1[0] * a2[2]),
+                                (a1[0] * a2[1]) + (a1[1] * a2[0])};
+    double nu = 0.0;
+    for (std::int32_t axis = 0; axis < 3; axis++) {
+        image.n[axis] = static_cast<float>(n[axis]);
+        nu = std::max(nu, (4 * U64 * products[axis]) + (2 * U64 * std::abs(n[axis])) + (U32 * std::abs(n[axis])));
+    }
+    image.nu = std::nextafter(static_cast<float>(nu * INFLATE), std::numeric_limits<float>::infinity());
+    return image;
 }
 
-// A scene's meshes on the device, uploaded once from the trees the CPU traces
-struct DeviceScene {
+// a tree's nodes copied as the device reads them
+std::vector<trimkit::vulkan::Node64> nodes_of(const tinybvh::BVH_Double& bvh) {
+    static_assert(sizeof(tinybvh::BVH_Double::BVHNode) == sizeof(trimkit::vulkan::Node64));
+    std::vector<trimkit::vulkan::Node64> nodes(bvh.usedNodes);
+    std::memcpy(nodes.data(), bvh.bvhNode, nodes.size() * sizeof(trimkit::vulkan::Node64));
+    return nodes;
+}
+
+// A scene's meshes, or one top level, on the device: uploaded once from the
+// trees the CPU traces, freed with the scene or top level they mirror
+struct OnDevice {
     trimkit::vulkan::Device* device = nullptr;
-    trimkit::vulkan::Scene scene;
-    DeviceScene() = default;
-    DeviceScene(const DeviceScene&) = delete;
-    DeviceScene& operator=(const DeviceScene&) = delete;
-    ~DeviceScene() { trimkit::vulkan::destroy(*device, &scene); }
+    trimkit::vulkan::Arrays arrays;
+    OnDevice() = default;
+    OnDevice(const OnDevice&) = delete;
+    OnDevice& operator=(const OnDevice&) = delete;
+    ~OnDevice() { trimkit::vulkan::destroy(*device, &arrays); }
 };
 
-// A top level on the device, uploaded with the top level it mirrors
-struct DeviceTop {
-    trimkit::vulkan::Device* device = nullptr;
-    trimkit::vulkan::Top top;
-    DeviceTop() = default;
-    DeviceTop(const DeviceTop&) = delete;
-    DeviceTop& operator=(const DeviceTop&) = delete;
-    ~DeviceTop() { trimkit::vulkan::destroy(*device, &top); }
-};
+// `body(from, to)` over [0, count), the cores sharing it a block at a time: for
+// a few bytes copied per item, which one at a time is too little for the pool
+// to measure (and the first of them takes a page fault)
+template <typename Body>
+void in_blocks(std::size_t count, const Body& body) {
+    constexpr std::size_t BLOCK = 4096;
+    trimkit::in_parallel_without_gil((count + BLOCK - 1) / BLOCK, [&](std::size_t first, std::size_t last) {
+        body(first * BLOCK, std::min(count, last * BLOCK));
+    });
+}
+
+// a vector's bytes, to upload
+template <typename T>
+trimkit::vulkan::Span bytes_of(const std::vector<T>& values) {
+    return {values.data(), values.size() * sizeof(T)};
+}
 
 // a device takes one submitter at a time
 trimkit::Exclusive& device_lock() {
@@ -265,7 +250,7 @@ struct Hit {
 };
 
 // The four columns `intersect` answers, each written once; the device fills
-// them a chunk at a time, so a resize keeps what is there
+// them a chunk at a time, into room sized by its first chunk
 struct Columns {
     std::vector<trimkit::Unset<std::int64_t>> rays;
     std::vector<trimkit::Unset<std::int64_t>> instances;
@@ -378,7 +363,7 @@ struct TopLevel {
     double extent = 0.0;
     const RayMesh* direct = nullptr;
     // the top level on the device when the scene traces there, or why not
-    std::unique_ptr<DeviceTop> on_device;
+    std::unique_ptr<OnDevice> on_device;
     std::string device_reason;
     // declared last, so it is destroyed before the instances it points into
     std::unique_ptr<MeshBvh> tlas;
@@ -432,22 +417,27 @@ public:
 
     std::size_t size() const { return meshes_.size(); }
 
-    trimkit::Out<bool> intersect_any(const PointsArg& origins_argument, const PointsArg& directions_argument,
+    trimkit::Out<bool> intersect_any(const RaysArg& origins_argument, const RaysArg& directions_argument,
                                      const Transforms& matrices_argument, const Numbers& index_argument) const {
-        const Points origins = trimkit::read(origins_argument, "origins");
-        const Points directions = trimkit::read(directions_argument, "directions");
-        check_rays(origins, directions);
+        const Rays origins = trimkit::read_rows(origins_argument, "origins");
+        const Rays directions = trimkit::read_rows(directions_argument, "directions");
+        const std::size_t n = count_rays(origins, directions);
         const std::shared_ptr<const TopLevel> top = top_level(matrices_argument, index_argument);
-        const std::size_t n = origins.shape(0);
         std::vector<std::uint8_t> hits(n, 0);
         const tinybvh::BVH_Double* bvh = top->bvh();
         std::string fallback;
-        if (bvh != nullptr && !device_occlusion(*top, origins, directions, &hits, &fallback)) {
-            trimkit::in_parallel(n, [&](std::size_t begin, std::size_t end) {
+        if (bvh == nullptr || !device_occlusion(*top, origins, directions, n, &hits, &fallback)) {
+            // the device checks each ray's values as it copies them: here, now
+            trimkit::check_rows(origins, "origins");
+            trimkit::check_rows(directions, "directions");
+            trimkit::in_parallel(bvh != nullptr ? n : 0, [&](std::size_t begin, std::size_t end) {
                 for (std::size_t i = begin; i < end; i++) {
-                    const double* d = directions.data() + (3 * i);
+                    double o[3];
+                    double d[3];
+                    origins.read(i, o);
+                    directions.read(i, d);
                     if (!still(d)) {
-                        const tinybvh::RayEx ray = make_tinybvh_ray(origins.data() + (3 * i), d);
+                        const tinybvh::RayEx ray = make_tinybvh_ray(o, d);
                         hits[i] = bvh->IsOccluded(ray) ? 1 : 0;
                     }
                 }
@@ -457,7 +447,7 @@ public:
         return trimkit::to_numpy<bool>(std::move(hits), {n});
     }
 
-    Hits intersect(const PointsArg& origins_argument, const PointsArg& directions_argument,
+    Hits intersect(const RaysArg& origins_argument, const RaysArg& directions_argument,
                    const Transforms& matrices_argument, const Numbers& index_argument,
                    const MaximumHits& maximum_hits) const {
         if (maximum_hits && *maximum_hits < 1) {
@@ -465,17 +455,19 @@ public:
         }
         const std::size_t most = maximum_hits ? static_cast<std::size_t>(std::int64_t{*maximum_hits})
                                               : std::numeric_limits<std::size_t>::max();
-        const Points origins = trimkit::read(origins_argument, "origins");
-        const Points directions = trimkit::read(directions_argument, "directions");
-        check_rays(origins, directions);
+        const Rays origins = trimkit::read_rows(origins_argument, "origins");
+        const Rays directions = trimkit::read_rows(directions_argument, "directions");
+        const std::size_t n = count_rays(origins, directions);
         const std::shared_ptr<const TopLevel> top = top_level(matrices_argument, index_argument);
         const TopLevel& level = *top;
-        const std::size_t n = origins.shape(0);
         // the device writes the columns itself; the CPU gathers hits a chunk of
         // rays at a time and writes them after
         Columns columns;
         std::string fallback;
-        if (level.bvh() == nullptr || !device_crossings(level, origins, directions, most, &columns, &fallback)) {
+        if (level.bvh() == nullptr || !device_crossings(level, origins, directions, n, most, &columns, &fallback)) {
+            // the device checks each ray's values as it copies them: here, now
+            trimkit::check_rows(origins, "origins");
+            trimkit::check_rows(directions, "directions");
             trimkit::Gathered<Hit> found;
             if (level.bvh() != nullptr) {
                 trimkit::gather_in_parallel<Hit>(
@@ -484,14 +476,17 @@ public:
                         // two, a closed surface entered and left
                         hits.reserve((end - begin) * std::min<std::size_t>(most, 2));
                         for (std::size_t i = begin; i < end; i++) {
-                            const double* d = directions.data() + (3 * i);
+                            double o[3];
+                            double d[3];
+                            origins.read(i, o);
+                            directions.read(i, d);
                             if (still(d)) {
                                 continue;
                             }
                             const std::int64_t ray = static_cast<std::int64_t>(i);
                             // distances in the scene's units rather than the direction's
                             const double scale = length(d);
-                            crossings(level, origins.data() + (3 * i), d, scale, most,
+                            crossings(level, o, d, scale, most,
                                       [&](std::int64_t instance, std::int64_t face, double t) {
                                           hits.push_back({ray, instance, face, t * scale});
                                       });
@@ -718,69 +713,63 @@ private:
         }
     }
 
-    // two points with the same bits: -0.0 and 0.0 differ, as they do to tinybvh
-    static bool same_point(const double* a, const double* b) {
-        std::uint64_t bits_a[3];
-        std::uint64_t bits_b[3];
-        std::memcpy(bits_a, a, sizeof(bits_a));
-        std::memcpy(bits_b, b, sizeof(bits_b));
-        return bits_a[0] == bits_b[0] && bits_a[1] == bits_b[1] && bits_a[2] == bits_b[2];
-    }
-
-    // Is every row of `points` the first row? Row 1 first, so random rays
-    // answer in nanoseconds; then the rest across the cores. Then the device
-    // reads one row for every ray and the host copies one row
-    static bool one_row(const Points& points) {
-        const std::size_t n = points.shape(0);
-        const double* rows = points.data();
-        if (n < 2 || !same_point(rows, rows + 3)) {
-            return false;
+    // `count` of a query's origins or directions from `begin`, written for
+    // the device as a chunk's, the cores sharing the pass, and how it wrote
+    // them (trimkit::vulkan::STEP_*): one row for every ray; float32 rows
+    // while `*narrow` holds, which the first value that isn't exactly a
+    // float32 ends for the rest of the query; else float64 rows. `*taken` is
+    // cleared by a value `read` refuses: the one look these values get on
+    // their way to a device
+    static std::uint32_t fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::size_t count, bool* narrow,
+                                   bool* taken) {
+        double* wide = static_cast<double*>(chunk);
+        if (rays.one) {
+            double row[3];
+            rays.read(0, row);
+            *taken = trimkit::copy_coordinates(row, 3, wide) == 0 && *taken;
+            return trimkit::vulkan::STEP_ONE;
         }
-        std::atomic<bool> equal{true};
-        trimkit::in_parallel_without_gil(n, [&](std::size_t from, std::size_t to) {
-            for (std::size_t i = from; i < to && equal.load(std::memory_order_relaxed); i++) {
-                if (!same_point(rows, rows + (3 * i))) {
-                    equal.store(false, std::memory_order_relaxed);
+        if (*narrow) {
+            std::atomic<bool> kept{true};
+            float* out = static_cast<float*>(chunk);
+            in_blocks(count, [&](std::size_t from, std::size_t to) {
+                const std::size_t first = 3 * (begin + from);
+                const bool same =
+                    rays.wide != nullptr
+                        ? trimkit::narrow_coordinates(rays.wide + first, 3 * (to - from), out + (3 * from))
+                        : trimkit::narrow_coordinates(rays.narrow + first, 3 * (to - from), out + (3 * from));
+                if (!same) {
+                    kept.store(false, std::memory_order_relaxed);
                 }
+            });
+            if (kept.load()) {
+                return trimkit::vulkan::STEP_NARROW;
             }
+            *narrow = false;
+        }
+        std::atomic<std::size_t> refused{0};
+        in_blocks(count, [&](std::size_t from, std::size_t to) {
+            const std::size_t first = 3 * (begin + from);
+            const std::size_t bad =
+                rays.wide != nullptr
+                    ? trimkit::copy_coordinates(rays.wide + first, 3 * (to - from), wide + (3 * from))
+                    : trimkit::copy_coordinates(rays.narrow + first, 3 * (to - from), wide + (3 * from));
+            refused.fetch_add(bad, std::memory_order_relaxed);
         });
-        return equal.load();
+        *taken = refused.load() == 0 && *taken;
+        return trimkit::vulkan::STEP_WIDE;
     }
 
-    // A piece of a chunk's rays filled for the device, the cores sharing the
-    // copy; a broadcast array is one row, filled with the first piece
-    static void fill_piece(const Points& origins, const Points& directions, std::uint32_t broadcast,
-                           const trimkit::vulkan::Chunk& chunk, std::size_t first, std::size_t count) {
-        const std::size_t point = 3 * sizeof(double);
-        const bool one_origin = (broadcast & 1U) != 0;
-        const bool one_direction = (broadcast & 2U) != 0;
-        trimkit::in_parallel_without_gil(count, [&](std::size_t from, std::size_t to) {
-            const std::size_t at = chunk.begin + first + from;
-            if (!one_origin) {
-                std::memcpy(chunk.origins + (3 * (first + from)), origins.data() + (3 * at), (to - from) * point);
-            }
-            if (!one_direction) {
-                std::memcpy(chunk.directions + (3 * (first + from)), directions.data() + (3 * at), (to - from) * point);
-            }
-        });
-        if (first == 0 && one_origin) {
-            std::memcpy(chunk.origins, origins.data() + (3 * chunk.begin), point);
-        }
-        if (first == 0 && one_direction) {
-            std::memcpy(chunk.directions, directions.data() + (3 * chunk.begin), point);
-        }
-    }
-
-    // One query of `level` traced on the device over every ray, `consume`
+    // One query of `level` traced on the device over `count` rays, `consume`
     // reading each chunk's answers: false when the scene has no device (no
-    // reason: that is no fallback to warn about), when this top level isn't
-    // on it, or when the device failed (then with the reason), and the CPU
-    // answers. Every ray shares one origin or direction (bit 0, bit 1 of
-    // `broadcast`): the host fills and the device reads one row
+    // reason: that is no fallback to warn about), when there are no rays,
+    // when this top level isn't on it or the device failed (then with the
+    // reason), or when a ray's value is one `read` refuses (no reason: the
+    // caller's `check_rows` raises it), and the CPU answers
     template <typename Consume>
-    bool on_device(const TopLevel& level, const Points& origins, const Points& directions, bool occlusion,
-                   std::size_t most, const Consume& consume, std::string* reason) const {
-        if (!on_device_) {
+    bool on_device(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
+                   bool occlusion, std::size_t most, const Consume& consume, std::string* reason) const {
+        if (!on_device_ || count == 0) {
             return false;
         }
         if (level.direct == nullptr && !level.on_device) {
@@ -789,18 +778,23 @@ private:
         }
         const nb::gil_scoped_release release;
         trimkit::vulkan::Query query;
-        query.scene = &on_device_->scene;
-        query.top = level.direct != nullptr ? nullptr : &level.on_device->top;
+        query.scene = &on_device_->arrays;
+        query.top = level.direct != nullptr ? nullptr : &level.on_device->arrays;
         query.mesh = level.direct != nullptr ? static_cast<std::uint32_t>(level.instances[0].blasIdx) : 0;
         query.occlusion = occlusion;
         query.most = most < trimkit::vulkan::UNBOUNDED ? static_cast<std::uint32_t>(most) : trimkit::vulkan::UNBOUNDED;
-        query.broadcast = (one_row(origins) ? 1U : 0U) | (one_row(directions) ? 2U : 0U);
         query.extent = level.extent;
+        // each array goes as float32 until a value of it isn't one
+        bool narrow[2] = {true, true};
         const trimkit::Exclusively holding(device_lock());
         return trimkit::vulkan::run_query(
-            *on_device_->device, query, origins.shape(0),
-            [&](const trimkit::vulkan::Chunk& chunk, std::size_t first, std::size_t count) {
-                fill_piece(origins, directions, query.broadcast, chunk, first, count);
+            *on_device_->device, query, count,
+            [&](void* chunk_origins, void* chunk_directions, std::size_t begin, std::size_t rays,
+                std::uint32_t* steps) {
+                bool taken = true;
+                steps[0] = fill_rows(origins, chunk_origins, begin, rays, &narrow[0], &taken);
+                steps[1] = fill_rows(directions, chunk_directions, begin, rays, &narrow[1], &taken);
+                return taken;
             },
             consume, reason);
     }
@@ -811,44 +805,53 @@ private:
     // offsets, writes every crossing at its offset and hands them back
     // compacted, a chunk at a time; each is widened into place with its ray
     // made the caller's and its instance mapped through `which`
-    bool device_crossings(const TopLevel& level, const Points& origins, const Points& directions, std::size_t most,
-                          Columns* columns, std::string* reason) const {
-        // the columns grow by each chunk's crossings: one chunk, the usual, sizes them once
+    bool device_crossings(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
+                          std::size_t most, Columns* columns, std::string* reason) const {
+        // room for the usual, as the CPU path reserves: a hit per ray with a
+        // cap of one, else two, a closed surface entered and left
+        const std::size_t usual = std::min<std::size_t>(most, 2);
         std::size_t total = 0;
-        return on_device(
-            level, origins, directions, false, most,
+        const bool answered = on_device(
+            level, origins, directions, count, false, most,
             [&](const trimkit::vulkan::Answers& answers) {
-                columns->resize(total + answers.total);
+                // this chunk's crossings and the usual for every ray after it:
+                // the first chunk sizes the columns for the whole query, and a
+                // later one grows them only when its rays crossed more
+                const std::size_t after = count - (answers.begin + answers.count);
+                const std::size_t room = total + answers.total + (after * usual);
+                if (room > columns->rays.size()) {
+                    columns->resize(room);
+                }
                 std::int64_t* rays_out = trimkit::elements(columns->rays) + total;
                 std::int64_t* instances_out = trimkit::elements(columns->instances) + total;
                 std::int64_t* faces_out = trimkit::elements(columns->faces) + total;
                 double* distances_out = trimkit::elements(columns->distances) + total;
                 const std::int64_t base = static_cast<std::int64_t>(answers.begin);
-                trimkit::in_parallel_without_gil(answers.total, [&](std::size_t from, std::size_t to) {
+                in_blocks(answers.total, [&](std::size_t from, std::size_t to) {
                     for (std::size_t h = from; h < to; h++) {
                         rays_out[h] = base + answers.rays[h];
-                        instances_out[h] = level.direct != nullptr ? level.which[0] : level.which[answers.instances[h]];
-                        faces_out[h] = static_cast<std::int64_t>(answers.faces[h]);
+                        instances_out[h] = level.which[answers.words[2 * h]];
+                        faces_out[h] = static_cast<std::int64_t>(answers.words[(2 * h) + 1]);
                     }
                     std::memcpy(distances_out + from, answers.distances + from, (to - from) * sizeof(double));
                 });
                 total += answers.total;
             },
             reason);
+        columns->resize(total);
+        return answered;
     }
 
     // Every ray's occlusion traced on the device, into `hits`
-    bool device_occlusion(const TopLevel& level, const Points& origins, const Points& directions,
+    bool device_occlusion(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
                           std::vector<std::uint8_t>* hits, std::string* reason) const {
         return on_device(
-            level, origins, directions, true, 1,
+            level, origins, directions, count, true, 1,
             [&](const trimkit::vulkan::Answers& answers) {
                 std::uint8_t* out = hits->data() + answers.begin;
-                trimkit::in_parallel_without_gil(answers.count, [&](std::size_t from, std::size_t to) {
-                    for (std::size_t k = from; k < to; k++) {
-                        out[k] = answers.occlusion[k] != 0 ? 1 : 0;
-                    }
-                });
+                for (std::size_t k = 0; k < answers.count; k++) {
+                    out[k] = answers.occlusion[k] != 0 ? 1 : 0;
+                }
             },
             reason);
     }
@@ -860,7 +863,7 @@ private:
         }
     }
 
-    // Open the process's device and put every mesh on it, as src/trace.comp
+    // Open the process's device and put every mesh on it, as src/vulkan/trace.comp
     // reads them: false with the reason when it can't
     bool open_device(std::string* reason) {
         trimkit::vulkan::Device* device = trimkit::vulkan::shared_device(reason);
@@ -870,58 +873,68 @@ private:
         const nb::gil_scoped_release release;
         static_assert(sizeof(tinybvh::BVH_Double::BVHNode) == 64);
         static_assert(sizeof(Vec) == 3 * sizeof(double));
-        std::vector<char> nodes;
-        std::vector<std::uint64_t> primitives;
-        std::vector<std::uint64_t> corners;
-        std::vector<Vec> vertices;
-        std::vector<trimkit::vulkan::Node32> node32;
-        std::vector<trimkit::vulkan::Tri32> tri32;
+        // every mesh's nodes, leaf slots, corners and vertices, each in one
+        // array: `table` holds where each mesh's begin, `totals` their sizes
         std::vector<std::uint32_t> table(4 * meshes_.size(), 0);
+        std::size_t totals[4] = {0, 0, 0, 0};
         for (std::size_t m = 0; m < meshes_.size(); m++) {
             const MeshBvh* bvh = meshes_[m]->bvh();
             if (bvh == nullptr) {
                 continue;
             }
-            table[4 * m] = static_cast<std::uint32_t>(nodes.size() / 64);
-            table[(4 * m) + 1] = static_cast<std::uint32_t>(primitives.size());
-            table[(4 * m) + 2] = static_cast<std::uint32_t>(corners.size());
-            table[(4 * m) + 3] = static_cast<std::uint32_t>(vertices.size());
-            // uploaded as the bytes tinybvh reads them as
-            const char* node_bytes =
-                reinterpret_cast<const char*>(bvh->bvhNode);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            nodes.insert(nodes.end(), node_bytes, node_bytes + (64 * bvh->usedNodes));
-            primitives.insert(primitives.end(), bvh->primIdx, bvh->primIdx + bvh->idxCount);
-            const std::vector<std::uint64_t>& faces = meshes_[m]->faces();
-            corners.insert(corners.end(), faces.begin(), faces.end());
-            const std::vector<Vec>& points = meshes_[m]->vertices();
-            vertices.insert(vertices.end(), points.begin(), points.end());
-            shadow_nodes(*bvh, &node32);
-            shadow_triangles(*bvh, points, faces, &tri32);
+            const std::size_t sizes[4] = {bvh->usedNodes, bvh->idxCount, meshes_[m]->faces().size(),
+                                          meshes_[m]->vertices().size()};
+            for (std::size_t k = 0; k < 4; k++) {
+                table[(4 * m) + k] = static_cast<std::uint32_t>(totals[k]);
+                totals[k] += sizes[k];
+            }
         }
         // the shader indexes with 32-bit words
-        const std::size_t limit = std::size_t{1} << 32U;
-        if (nodes.size() / 64 >= limit || primitives.size() >= limit || corners.size() >= limit ||
-            vertices.size() >= limit) {
+        if (*std::max_element(totals, totals + 4) >= std::size_t{1} << 32U) {
             *reason = "the meshes have more than 2^32 vertices, faces or nodes together";
             return false;
         }
-        std::unique_ptr<DeviceScene> on_device = std::make_unique<DeviceScene>();
+        std::vector<trimkit::vulkan::Node64> nodes(totals[0]);
+        std::vector<std::uint64_t> corners(totals[2]);
+        std::vector<Vec> vertices(totals[3]);
+        std::vector<trimkit::vulkan::Node32> node32(totals[0]);
+        // a triangle per leaf slot: a slot no leaf reaches stays zero, unread
+        std::vector<trimkit::vulkan::Tri32> tri32(totals[1]);
+        for (std::size_t m = 0; m < meshes_.size(); m++) {
+            const MeshBvh* bvh = meshes_[m]->bvh();
+            if (bvh == nullptr) {
+                continue;
+            }
+            const std::uint32_t* first = table.data() + (4 * m);
+            const std::vector<std::uint64_t>& faces = meshes_[m]->faces();
+            const std::vector<Vec>& points = meshes_[m]->vertices();
+            // the nodes as the bytes tinybvh reads them as
+            std::memcpy(nodes.data() + first[0], bvh->bvhNode, bvh->usedNodes * sizeof(trimkit::vulkan::Node64));
+            std::copy(faces.begin(), faces.end(), corners.data() + first[2]);
+            std::copy(points.begin(), points.end(), vertices.data() + first[3]);
+            trimkit::vulkan::Tree tree{};
+            tree.nodes = nodes.data() + first[0];
+            tree.node_count = bvh->usedNodes;
+            tree.slots = bvh->primIdx;
+            tree.slot_count = bvh->idxCount;
+            tree.limit = faces.size() / 3;
+            tree.depth = trimkit::vulkan::MESH_DEPTH;
+            trimkit::vulkan::Tri32* triangles = tri32.data() + first[1];
+            const bool sound = trimkit::vulkan::walk(
+                tree, node32.data() + first[0],
+                [&](std::size_t slot, std::uint64_t face) { triangles[slot] = triangle32(points, faces, face); },
+                reason);
+            if (!sound) {
+                return false;
+            }
+        }
+        const trimkit::vulkan::Span spans[trimkit::vulkan::SCENE_BUFFERS] = {
+            bytes_of(nodes), bytes_of(corners), bytes_of(vertices), bytes_of(table), bytes_of(node32), bytes_of(tri32),
+        };
+        std::unique_ptr<OnDevice> on_device = std::make_unique<OnDevice>();
         on_device->device = device;
-        trimkit::vulkan::Scene& scene = on_device->scene;
         const trimkit::Exclusively holding(device_lock());
-        if (!trimkit::vulkan::upload(*device, nodes.data(), nodes.size(), &scene.nodes, reason) ||
-            !trimkit::vulkan::upload(*device, primitives.data(), primitives.size() * sizeof(std::uint64_t),
-                                     &scene.primitives, reason) ||
-            !trimkit::vulkan::upload(*device, corners.data(), corners.size() * sizeof(std::uint64_t), &scene.corners,
-                                     reason) ||
-            !trimkit::vulkan::upload(*device, vertices.data(), vertices.size() * sizeof(Vec), &scene.vertices,
-                                     reason) ||
-            !trimkit::vulkan::upload(*device, table.data(), table.size() * sizeof(std::uint32_t), &scene.meshes,
-                                     reason) ||
-            !trimkit::vulkan::upload(*device, node32.data(), node32.size() * sizeof(trimkit::vulkan::Node32),
-                                     &scene.node32, reason) ||
-            !trimkit::vulkan::upload(*device, tri32.data(), tri32.size() * sizeof(trimkit::vulkan::Tri32), &scene.tri32,
-                                     reason)) {
+        if (!trimkit::vulkan::upload(*device, spans, trimkit::vulkan::SCENE_BUFFERS, &on_device->arrays, reason)) {
             return false;
         }
         on_device_ = std::move(on_device);
@@ -930,31 +943,39 @@ private:
 
     // Put a top level on the device beside its scene, or record why it isn't
     void upload_top(TopLevel* top) const {
-        trimkit::vulkan::Device* device = on_device_->device;
-        std::unique_ptr<DeviceTop> on_device = std::make_unique<DeviceTop>();
-        on_device->device = device;
-        trimkit::vulkan::Top& on = on_device->top;
-        const trimkit::Exclusively holding(device_lock());
         const MeshBvh& tlas = *top->tlas;
-        std::vector<double> inverses(16 * top->instances.size());
-        std::vector<std::uint32_t> instance_meshes(top->instances.size());
-        for (std::size_t i = 0; i < top->instances.size(); i++) {
+        const std::size_t count = top->instances.size();
+        std::vector<double> inverses(16 * count);
+        std::vector<std::uint32_t> instance_meshes(count);
+        for (std::size_t i = 0; i < count; i++) {
             for (std::int32_t entry = 0; entry < 16; entry++) {
                 inverses[(16 * i) + static_cast<std::size_t>(entry)] = top->instances[i].invTransform[entry];
             }
             instance_meshes[i] = static_cast<std::uint32_t>(top->instances[i].blasIdx);
         }
-        std::vector<trimkit::vulkan::Node32> node32;
-        shadow_nodes(tlas, &node32);
-        if (trimkit::vulkan::upload(*device, node32.data(), node32.size() * sizeof(trimkit::vulkan::Node32), &on.node32,
-                                    &top->device_reason) &&
-            trimkit::vulkan::upload(*device, tlas.bvhNode, 64 * tlas.usedNodes, &on.nodes, &top->device_reason) &&
-            trimkit::vulkan::upload(*device, tlas.primIdx, tlas.idxCount * sizeof(std::uint64_t), &on.primitives,
-                                    &top->device_reason) &&
-            trimkit::vulkan::upload(*device, inverses.data(), inverses.size() * sizeof(double), &on.inverses,
-                                    &top->device_reason) &&
-            trimkit::vulkan::upload(*device, instance_meshes.data(), instance_meshes.size() * sizeof(std::uint32_t),
-                                    &on.instance_meshes, &top->device_reason)) {
+        const std::vector<trimkit::vulkan::Node64> nodes = nodes_of(tlas);
+        std::vector<trimkit::vulkan::Node32> node32(nodes.size());
+        trimkit::vulkan::Tree tree{};
+        tree.nodes = nodes.data();
+        tree.node_count = nodes.size();
+        tree.slots = tlas.primIdx;
+        tree.slot_count = tlas.idxCount;
+        tree.limit = count;
+        tree.depth = trimkit::vulkan::TOP_DEPTH;
+        if (!trimkit::vulkan::walk(
+                tree, node32.data(), [](std::size_t /*slot*/, std::uint64_t /*instance*/) {}, &top->device_reason)) {
+            return;
+        }
+        const trimkit::vulkan::Span spans[trimkit::vulkan::TOP_BUFFERS] = {
+            bytes_of(nodes),    {tlas.primIdx, tlas.idxCount * sizeof(std::uint64_t)},
+            bytes_of(inverses), bytes_of(instance_meshes),
+            bytes_of(node32),
+        };
+        std::unique_ptr<OnDevice> on_device = std::make_unique<OnDevice>();
+        on_device->device = on_device_->device;
+        const trimkit::Exclusively holding(device_lock());
+        if (trimkit::vulkan::upload(*on_device->device, spans, trimkit::vulkan::TOP_BUFFERS, &on_device->arrays,
+                                    &top->device_reason)) {
             top->on_device = std::move(on_device);
         }
     }
@@ -972,7 +993,7 @@ private:
     mutable nb::ft_mutex last_lock_;
     mutable std::shared_ptr<const TopLevel> last_;
     // the meshes on the device, for a scene built with `use_gpu` that could
-    std::unique_ptr<DeviceScene> on_device_;
+    std::unique_ptr<OnDevice> on_device_;
     // whether this scene has said that the CPU answered for the device
     mutable std::atomic<bool> warned_{false};
 };
@@ -1236,10 +1257,10 @@ Examples
 
 Parameters
 ----------
-origins : (r, 3) float64
-  Where each ray starts.
-directions : (r, 3) float64
-  Each ray's direction, which need not be unit length.
+origins : (r, 3) or (3,) float64 or float32
+  Where each ray starts, or where every ray starts.
+directions : (r, 3) or (3,) float64 or float32
+  Each ray's direction, or every ray's, which need not be unit length.
 instance_matrices : (k, 4, 4) float64, optional
   Each instance's affine transform from its mesh into the scene.
   Defaults to the identity.
@@ -1282,10 +1303,10 @@ Examples
 
 Parameters
 ----------
-origins : (r, 3) float64
-  Where each ray starts.
-directions : (r, 3) float64
-  Each ray's direction, which need not be unit length.
+origins : (r, 3) or (3,) float64 or float32
+  Where each ray starts, or where every ray starts.
+directions : (r, 3) or (3,) float64 or float32
+  Each ray's direction, or every ray's, which need not be unit length.
 instance_matrices : (k, 4, 4) float64, optional
   Each instance's affine transform from its mesh into the scene.
   Defaults to the identity.

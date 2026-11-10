@@ -1,0 +1,154 @@
+// A chunk's crossings laid out for the host, after src/vulkan/trace.comp has
+// counted each ray's and written its first few: four dispatches of this one
+// shader (`step` in the push constants), so nothing per ray visits the host
+// in between.
+//
+// Steps 0 to 2 are an exclusive prefix sum of the counts into each ray's
+// offset:
+//   step 0, one group per block of 1024 counts: the block's sum into `blocks`
+//   step 1, one group: `blocks` scanned in place (exclusive), the chunk's total
+//           of crossings written after the last block and the overflow word
+//           after that cleared
+//   step 2, one group per block: each count's offset, the block's offset plus
+//           the exclusive prefix within the block; a count past `dense`, the
+//           crossings per ray the kernel wrote, raises the overflow word: the
+//           host then traces the chunk again at the offsets
+// Integer adds in a fixed order: the same offsets on every device.
+//
+// Step 3, once the host has read the total and made room, writes the
+// crossings as the host reads them, compacted and in ray order, straight
+// into host memory: one lane per output slot, so consecutive lanes write
+// consecutive addresses (a write over the bus must coalesce: a lane per ray
+// writing its run of crossings measured 50x slower). A slot's ray is found
+// by binary search over the offsets; its crossing is read from where the
+// kernel put it: in the ray's room at `ray * dense + k`, or for a ray that
+// crossed more than its room holds, where the second traversal wrote it, at
+// this same slot.
+// Three columns, 20 bytes a crossing: the ray, counted from the chunk's
+// first, two words (the instance and the face) and the distance. The host
+// widens the words to the caller's int64 (adding the chunk's first ray,
+// mapping the instance through its table) as it copies them into the result,
+// which costs it the same as copying int64 would.
+//
+// Vulkan 1.0: shared memory and barriers, one atomic word, no subgroup
+// operations. Compiled by `uv run scripts generate` into
+// src/vulkan/spirv.hpp
+#version 450
+
+layout(local_size_x = 256) in;
+#define GROUP 256u
+#define PER_LANE 4u
+#define BLOCK (GROUP * PER_LANE)
+
+layout(set = 0, binding = 0, std430) readonly buffer CountBuffer { uint counts[]; };
+layout(set = 0, binding = 1, std430) buffer OffsetBuffer { uint offsets[]; };
+layout(set = 0, binding = 2, std430) buffer BlockBuffer { uint blocks[]; };  // then the total, then the overflow word
+layout(set = 0, binding = 3, std430) readonly buffer RoomWordBuffer { uvec2 room_words[]; };  // instance, face
+layout(set = 0, binding = 4, std430) readonly buffer RoomDistanceBuffer { double room_distances[]; };
+layout(set = 0, binding = 5, std430) readonly buffer MoreWordBuffer { uvec2 more_words[]; };
+layout(set = 0, binding = 6, std430) readonly buffer MoreDistanceBuffer { double more_distances[]; };
+layout(set = 0, binding = 7, std430) writeonly buffer OutRayBuffer { uint out_rays[]; };
+layout(set = 0, binding = 8, std430) writeonly buffer OutWordBuffer { uvec2 out_words[]; };
+layout(set = 0, binding = 9, std430) writeonly buffer OutDistanceBuffer { double out_distances[]; };
+layout(push_constant) uniform Constants {
+    uint count;        // rays in the chunk
+    uint step;         // 0 to 3 as above
+    uint block_count;  // ceil(count / 1024)
+    uint dense;        // crossings per ray its room holds
+};
+
+shared uint partial[GROUP];
+
+// the inclusive prefix of `value` across the group (Hillis-Steele); partial[GROUP - 1] is the total after
+uint scan_group(uint lane, uint value) {
+    partial[lane] = value;
+    barrier();
+    for (uint offset = 1u; offset < GROUP; offset <<= 1u) {
+        const uint below = lane >= offset ? partial[lane - offset] : 0u;
+        barrier();
+        partial[lane] += below;
+        barrier();
+    }
+    return partial[lane];
+}
+
+void write_crossing() {
+    // groups in two dimensions: a device may cap one dimension at 65535
+    const uint slot = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP) + gl_GlobalInvocationID.x;
+    if (slot >= blocks[block_count]) {
+        return;
+    }
+    // the ray whose run holds the slot: the first r with offsets[r + 1] > slot
+    uint low = 0u, high = count - 1u;
+    while (low < high) {
+        const uint mid = (low + high) / 2u;
+        if (offsets[mid + 1u] > slot) {
+            high = mid;
+        } else {
+            low = mid + 1u;
+        }
+    }
+    const uint r = low;
+    out_rays[slot] = r;
+    if (counts[r] > dense) {
+        out_words[slot] = more_words[slot];
+        out_distances[slot] = more_distances[slot];
+    } else {
+        const uint from = r * dense + (slot - offsets[r]);
+        out_words[slot] = room_words[from];
+        out_distances[slot] = room_distances[from];
+    }
+}
+
+void main() {
+    if (step == 3u) {
+        write_crossing();
+        return;
+    }
+    const uint lane = gl_LocalInvocationID.x;
+    const uint block = gl_WorkGroupID.x;
+    if (step == 1u) {
+        uint carry = 0u;
+        for (uint base = 0u; base < block_count; base += GROUP) {
+            const uint i = base + lane;
+            const uint value = i < block_count ? blocks[i] : 0u;
+            const uint inclusive = scan_group(lane, value);
+            if (i < block_count) {
+                blocks[i] = carry + inclusive - value;
+            }
+            carry += partial[GROUP - 1u];
+            barrier();  // every lane has read the total before the next round overwrites it
+        }
+        if (lane == 0u) {
+            blocks[block_count] = carry;
+            blocks[block_count + 1u] = 0u;
+        }
+        return;
+    }
+    // steps 0 and 2: this lane's four consecutive counts of the block
+    uint value[PER_LANE];
+    uint sum = 0u;
+    for (uint k = 0u; k < PER_LANE; k++) {
+        const uint i = block * BLOCK + lane * PER_LANE + k;
+        value[k] = i < count ? counts[i] : 0u;
+        sum += value[k];
+    }
+    const uint inclusive = scan_group(lane, sum);
+    if (step == 0u) {
+        if (lane == GROUP - 1u) {
+            blocks[block] = inclusive;
+        }
+        return;
+    }
+    uint exclusive = blocks[block] + inclusive - sum;
+    for (uint k = 0u; k < PER_LANE; k++) {
+        const uint i = block * BLOCK + lane * PER_LANE + k;
+        if (i < count) {
+            offsets[i] = exclusive;
+        }
+        if (value[k] > dense) {
+            atomicMax(blocks[block_count + 1u], 1u);
+        }
+        exclusive += value[k];
+    }
+}

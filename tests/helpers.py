@@ -2,12 +2,14 @@
 Small numpy-only fixtures and predicates shared by the tests.
 """
 
+import functools
 import math
 import struct
 import sys
 import threading
 import time
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -112,6 +114,61 @@ def box(lo=(0, 0, 0), hi=(1, 1, 1)) -> tuple[np.ndarray, np.ndarray]:
         dtype=np.int64,
     )  # fmt: skip
     return vertices, faces
+
+
+@functools.cache
+def cycloidal() -> tuple[list, np.ndarray, np.ndarray]:
+    """
+    A real assembly, a cycloidal drive in millimetres: 13 meshes placed 72
+    times, 61,442 faces (376,520 as placed), none of them closed. From
+    trimesh's models/cycloidal.3DXML, every coordinate as trimesh loads it.
+    Returns (meshes, instance_matrices, instance_index).
+    """
+    with np.load(Path(__file__).parent / "models" / "cycloidal.npz") as data:
+        vertices = np.split(data["vertices"], np.cumsum(data["vertex_counts"])[:-1])
+        faces = np.split(data["faces"].astype(np.int64), np.cumsum(data["face_counts"])[:-1])
+        meshes = list(zip(map(np.ascontiguousarray, vertices), map(np.ascontiguousarray, faces), strict=True))
+        return meshes, data["instance_matrices"], data["instance_index"].astype(np.int64)
+
+
+def subdivided(mesh) -> tuple[np.ndarray, np.ndarray]:
+    """
+    A mesh with each face split in four at its edges' midpoints, an edge two
+    faces share getting one midpoint.
+    """
+    vertices, faces = mesh
+    edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    unique, inverse = np.unique(edges, axis=0, return_inverse=True)
+    a, b, c = (inverse.reshape(-1, 3) + len(vertices)).T
+    v0, v1, v2 = faces.T
+    split = np.column_stack([v0, a, c, a, v1, b, c, b, v2, a, b, c]).reshape(-1, 3)
+    return np.vstack([vertices, vertices[unique].mean(axis=1)]), split
+
+
+def exploded(meshes, matrices, index, factor: float) -> np.ndarray:
+    """
+    The instances' transforms with each moved away from the middle of them
+    all, `factor` times as far as it was.
+    """
+    placed = np.array([transform(meshes[i][0], m).mean(axis=0) for i, m in zip(index, matrices, strict=True)])
+    moved = matrices.copy()
+    moved[:, :3, 3] += (placed - placed.mean(axis=0)) * (factor - 1.0)
+    return moved
+
+
+def camera(position, target, pixels: int, field_of_view: float = 40.0) -> np.ndarray:
+    """
+    The (pixels * pixels, 3) directions of a pinhole camera at `position`
+    looking at `target` with z up, one per pixel.
+    """
+    forward = np.asarray(target, float) - position
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    span = np.tan(np.radians(field_of_view / 2)) * np.linspace(-1, 1, pixels)
+    u, v = np.meshgrid(span, span)
+    up = np.cross(right, forward)
+    return np.ascontiguousarray((forward + u[..., None] * right + v[..., None] * up).reshape(-1, 3))
 
 
 def instances(meshes, matrices=None, index=None) -> tuple[np.ndarray, np.ndarray]:

@@ -663,18 +663,19 @@ def cmd_update(args) -> None:
     run(tool("git"), "-C", ROOT, "diff", "--stat", "--", "trimkit.toml", "uv.lock")
 
 
-SPIRV = ROOT / "src" / "trace_spirv.hpp"
+SHADERS = ROOT / "src" / "vulkan"
+SPIRV = SHADERS / "spirv.hpp"
 
 
 def shaders() -> list[Path]:
-    # every shader in src: trace.comp, scan.comp and compact.comp
-    return sorted(p for p in builder.tracked_under(ROOT / "src") if p.suffix == ".comp")
+    # every shader: the kernel, trace.comp, and layout.comp, which lays its answers out
+    return sorted(p for p in builder.tracked_under(SHADERS) if p.suffix == ".comp")
 
 
 def shader(write: bool) -> None:
     """
-    Compile every src/*.comp to SPIR-V with the image's glslang and write them
-    as the words src/vulkan.hpp embeds (so no build or wheel needs a shader
+    Compile every src/vulkan/*.comp to SPIR-V with the image's glslang and write them
+    as the words src/vulkan/vulkan.hpp embeds (so no build or wheel needs a shader
     compiler), or fail if the checked-in words drifted from the sources.
     """
     sources = shaders()
@@ -695,10 +696,10 @@ def shader(write: bool) -> None:
             words = ",\n    ".join(rows)
             arrays.append(f"inline constexpr std::uint32_t {name}[] = {{\n    {words},\n}};\n")
     digests = [(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sources]
-    named = "\n".join(f"// src/{name} (sha256 {digest})" for name, digest in digests)
+    named = "\n".join(f"// src/vulkan/{name} (sha256 {digest})" for name, digest in digests)
     text = (
         "// The shaders as SPIR-V, written by `uv run scripts generate`: what\n"
-        "// src/vulkan.hpp hands the device. Never edited by hand.\n"
+        "// src/vulkan/vulkan.hpp hands the device. Never edited by hand.\n"
         f"{named}\n"
         "// clang-format off\n"
         "#pragma once\n\n#include <cstdint>\n\n"
@@ -707,7 +708,7 @@ def shader(write: bool) -> None:
     if write:
         SPIRV.write_text(text)
     elif not SPIRV.exists() or SPIRV.read_text() != text:
-        sys.exit("src/trace_spirv.hpp drifted from src/*.comp; run `uv run scripts generate`")
+        sys.exit("src/vulkan/spirv.hpp drifted from src/vulkan/*.comp; run `uv run scripts generate`")
 
 
 def cmd_shader(args) -> None:

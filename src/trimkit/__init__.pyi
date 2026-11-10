@@ -125,16 +125,16 @@ class RayScene:
         [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]
         """
 
-    def intersect(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, maximum_hits: int | numpy.integer | None = None) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
+    def intersect(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, maximum_hits: int | numpy.integer | None = None) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]]:
         """
         Where each ray crosses the scene's surface, nearest first, from either side.
 
         Parameters
         ----------
-        origins : (r, 3) float64
-          Where each ray starts.
-        directions : (r, 3) float64
-          Each ray's direction, which need not be unit length.
+        origins : (r, 3) or (3,) float64 or float32
+          Where each ray starts, or where every ray starts.
+        directions : (r, 3) or (3,) float64 or float32
+          Each ray's direction, or every ray's, which need not be unit length.
         instance_matrices : (k, 4, 4) float64, optional
           Each instance's affine transform from its mesh into the scene.
           Defaults to the identity.
@@ -173,16 +173,16 @@ class RayScene:
         ([0], [0], [0], [1.0])
         """
 
-    def intersect_any(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None) -> NDArray[numpy.bool_]:
+    def intersect_any(self, origins: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(3), order='C', device='cpu', writable=False)], directions: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float32], dict(shape=(3), order='C', device='cpu', writable=False)], instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None) -> NDArray[numpy.bool_]:
         """
         Whether each ray hits anything, stopping at the first triangle found.
 
         Parameters
         ----------
-        origins : (r, 3) float64
-          Where each ray starts.
-        directions : (r, 3) float64
-          Each ray's direction, which need not be unit length.
+        origins : (r, 3) or (3,) float64 or float32
+          Where each ray starts, or where every ray starts.
+        directions : (r, 3) or (3,) float64 or float32
+          Each ray's direction, or every ray's, which need not be unit length.
         instance_matrices : (k, 4, 4) float64, optional
           Each instance's affine transform from its mesh into the scene.
           Defaults to the identity.

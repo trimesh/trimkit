@@ -12,13 +12,13 @@ Most of the Python packaging ecosystem churn has finally stabilized into `cibuil
 
 There's been many bindings to mostly the same underlying implementations of polygon tessellation ([a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/)), embree ([a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/)), FCL ([a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl)), quadric edge collapse ([a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/)), VHACD ([a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/)), and draco ([a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/)) over the years. It would be nice to stop having to rotate when a binding stops releasing and there's a new Python to support.
 
-Most of the underlying geometry implementations in this package are mature and familiar to trimesh users. Less familiar options are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser, which is simple enough to just do here. `tinybvh` looks well written, benchmarks look good, packaging embree is quite rough, and it provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of FCL that has more accurate convex distances compared to `python-fcl`. `meshoptimizer` is easier to package than `open3d` or `fast-simplification`, small, and it never moves vertices.
+Most of the underlying geometry implementations in this package are mature and currently used by `trimesh` with different bindings. New to the pod are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser. `tinybvh` is the biggest change, and was picked because it looks well written, benchmarks look good, packaging embree has been a continuous source of pain, and it also provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of the flexible collision library (currently used by trimesh as `python-fcl`), that has more accurate convex distances. `meshoptimizer` is well-regarded, and easier to package than `open3d` or `fast-simplification`, small, and it never moves vertices.
 
 The weekly GitHub Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to lint, fuzz, and lock down in one place.
 
 ## Packaging
 
-This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`.
+This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`. It runs `clang` with profile-guided-optimization, and tries to get everything it can out of performance.
 
 This builds `abi3` wheels on `python >= 312`, for Windows, Mac, and Linux. Linux has 4 (`glibc`/`MUSL`,`x86_64`/`aarch64`),  Mac has 2 (`x86_64`/`arm`), and Windows has 3 (`x86_64`/`arm`/`x86`), or 9 wheels per release.
 
@@ -118,18 +118,37 @@ at run time (no wheel links or needs Vulkan, and Vulkan 1.0 is enough). It holds
 the same trees and runs a compute shader that makes every decision tinybvh's
 traversal makes, most of them in float32 behind a proven error bound and the
 rest with tinybvh's own float64 operations (`docs/trace.md`), so it answers the
-same bytes the CPU does. Measured on an RTX 3090 against twenty CPU threads, a
-million rays against a 160k-face mesh: `intersect_any` 25 ms against 44, the
-nearest hit 37 against 59, four crossings per ray 41 against 196, every crossing
-92 against 197; the traversal itself is under 3 ms of that, the rest is the 48 MB
-of rays crossing the bus, so below about 50,000 rays the CPU is quicker. Rays
-that share one origin or one direction upload one row. Rays stream through in chunks the shader
-reads from host memory, each chunk one submission that traces, counts, scans and
-compacts the hits on the device. When no such device can be used, at
-construction or later, the scene warns once (a `UserWarning` naming why) and the
+same bytes the CPU does. Rays go as given: a `(3,)` origin or direction is one
+row for every ray, float32 arrays go as float32, and float64 arrays whose
+values are exactly float32 go at half size. When no such device can be used,
+at construction or later, the scene warns once (a `UserWarning` naming why)
+and the
 CPU answers. `tests/golden.json` holds the hashed answers of an exact corpus
 (dyadic coordinates, integer-length directions, lattice meshes) that every
 platform and the device are checked against: the same answers everywhere.
+
+What the device is worth depends on the rays. `bench/rays.py` on a real
+assembly (`tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k faces),
+a million rays a view, median milliseconds on a busy desktop, twenty CPU
+threads against an RTX 3090:
+
+| a million rays | CPU | device | |
+|---|---|---|---|
+| camera, nearest | 11.6 | 6.4 | 1.8x |
+| camera, any hit | 7.4 | 4.8 | 1.5x |
+| camera with float32 directions, nearest | 11.2 | 4.3 | 2.6x |
+| camera with float32 directions, any hit | 7.1 | 2.6 | 2.7x |
+| orthographic, nearest | 17 | 8 | 2.1x |
+| camera, every crossing | 76 | 68 | 1.1x |
+| the assembly pulled apart 3x (6% of rays hit), camera, nearest | 7.1 | 5.6 | 1.3x |
+| pulled apart, camera, any hit | 4.9 | 4.8 | 1.0x |
+| pulled apart, camera, every crossing | 18.8 | 24.4 | 0.8x |
+
+A camera's float64 directions are 24 MB a million rays, and moving them to the
+device takes about as long as the CPU takes to find that most of them miss:
+that row is the bus, not the tracing, which is under 3 ms. Every crossing is
+the kernel: rays that cross dozens of surfaces hold up the ones beside them.
+Below about 50,000 rays the CPU is quicker.
 
 ### Example
 

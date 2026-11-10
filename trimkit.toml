@@ -175,7 +175,7 @@ tree_sha256 = "3763ccd8c20c9e64a898c1b213261509ce98e911473861ff2e0937a7d8e49b3e"
 spdx = "Apache-2.0 OR MIT"
 copyright = "Copyright 2015-2026 The Khronos Group Inc."
 # the core API declarations only, included with VK_NO_PROTOTYPES: the loader is
-# opened at run time (src/vulkan.hpp), so no wheel links or needs Vulkan
+# opened at run time (src/vulkan/vulkan.hpp), so no wheel links or needs Vulkan
 keep = ["LICENSE.md", "include/vulkan/vulkan_core.h", "include/vulkan/vk_platform.h", "include/vk_video"]
 include = ["vendor/vulkan_headers/include"]
 
@@ -261,7 +261,7 @@ upstreams = ["nanobind", "robin_map"]
 
 [part.bvh]
 upstreams = ["tinybvh", "vulkan_headers"]
-fuzz = ["bvh", "parallel"]
+fuzz = ["bvh", "parallel", "vulkan"]
 
 [part.earcut]
 upstreams = ["earcut"]

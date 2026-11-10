@@ -80,6 +80,37 @@ struct Array {
     bool is_none() const { return object.is_none(); }
 };
 
+// An argument that is a row of float64 or float32 per item, (n, Width), or
+// one row for every item, (Width,): `read_rows` reads it, and the signature
+// shows them all
+template <nb::ssize_t Width>
+struct RowsArgument {
+    nb::handle object;
+};
+
+// What `read_rows` read: `count` rows `stride` values apart, or one row that
+// is every item's (`one`: a count of 1 and a stride of 0), as float64 in
+// `wide` or, for a float32 array taken as it is, in `narrow` (the other is
+// null). Valid while it and the argument are
+template <nb::ssize_t Width>
+struct Rows {
+    In<double, -1, Width> each;
+    In<double, Width> single;
+    In<float, -1, Width> each_narrow;
+    In<float, Width> single_narrow;
+    const double* wide = nullptr;
+    const float* narrow = nullptr;
+    std::size_t count = 0;
+    std::size_t stride = 0;
+    bool one = false;
+    // row `i` as float64: a float32 widens to exactly itself
+    void read(std::size_t i, double* row) const {
+        for (std::size_t w = 0; w < static_cast<std::size_t>(Width); w++) {
+            row[w] = wide != nullptr ? wide[(stride * i) + w] : static_cast<double>(narrow[(stride * i) + w]);
+        }
+    }
+};
+
 // A bool argument: Python's, or numpy's scalar, which is what `array.all()` and
 // every other numpy test returns. Nothing else counts as one: not 0, 1 or None
 struct Flag {
@@ -148,6 +179,8 @@ template <typename T>
 constexpr const char* dtype_name() {
     if constexpr (std::is_same_v<T, double>) {
         return "float64";
+    } else if constexpr (std::is_same_v<T, float>) {
+        return "float32";
     } else if constexpr (std::is_same_v<T, std::int64_t>) {
         return "int64";
     } else if constexpr (std::is_same_v<T, std::uint8_t>) {
@@ -294,6 +327,96 @@ In<T, Shape...> read(nb::handle object, const std::string& name) {
 template <typename T, nb::ssize_t... Shape>
 In<T, Shape...> read(const Array<T, Shape...>& argument, const std::string& name) {
     return read<T, Shape...>(argument.object, name);
+}
+
+// A rows argument, its dtype, shape and layout checked as `read` checks
+// either shape: one dimension is one row for every item, anything else must
+// be a row per item. A float32 array is taken as float32, anything else as
+// `read` takes a float64 array. Its values are not checked here: a caller
+// that copies them checks as it copies (`copy_coordinates`), and one that
+// doesn't calls `check_rows`
+template <nb::ssize_t Width>
+Rows<Width> read_rows(const RowsArgument<Width>& argument, const std::string& name) {
+    Rows<Width> rows;
+    try {
+        // numpy's own count, so a list reads as the array it converts to
+        rows.one = nb::cast<int>(nb::module_::import_("numpy").attr("ndim")(argument.object)) == 1;
+    } catch (const nb::python_error&) {
+        // not an array at all: `read` says so, naming the argument
+        rows.one = false;
+    }
+    const bool narrow =
+        nb::hasattr(argument.object, "dtype") && detail::text(argument.object.attr("dtype")) == "float32";
+    rows.count = 1;
+    if (rows.one && narrow) {
+        rows.single_narrow = detail::view<float, Width>(argument.object, name);
+        rows.narrow = rows.single_narrow.data();
+    } else if (rows.one) {
+        rows.single = detail::view<double, Width>(argument.object, name);
+        rows.wide = rows.single.data();
+    } else if (narrow) {
+        rows.each_narrow = detail::view<float, -1, Width>(argument.object, name);
+        rows.narrow = rows.each_narrow.data();
+        rows.count = rows.each_narrow.shape(0);
+    } else {
+        rows.each = detail::view<double, -1, Width>(argument.object, name);
+        rows.wide = rows.each.data();
+        rows.count = rows.each.shape(0);
+    }
+    rows.stride = rows.one ? 0 : static_cast<std::size_t>(Width);
+    return rows;
+}
+
+// `count` values copied as float64, a float32 widening to exactly itself,
+// and how many of them `read` would refuse: its check (`check_bounded`) made
+// while the values go by anyway. Python-free
+template <typename T>
+std::size_t copy_coordinates(const T* values, std::size_t count, double* out) {
+    std::size_t refused = 0;
+    for (std::size_t i = 0; i < count; i++) {
+        out[i] = static_cast<double>(values[i]);
+        refused += !(std::abs(out[i]) <= COORDINATE_LIMIT) ? 1U : 0U;
+    }
+    return refused;
+}
+
+// `count` values written as float32, and whether every one of them is still
+// itself there: a value `read` takes, exactly a float32, and zero or normal
+// (a device may read a denormal as zero). Python-free
+template <typename T>
+bool narrow_coordinates(const T* values, std::size_t count, float* out) {
+    std::size_t lost = 0;
+    for (std::size_t i = 0; i < count; i++) {
+        const double value = static_cast<double>(values[i]);
+        const float narrowed = static_cast<float>(values[i]);
+        out[i] = narrowed;
+        const double size = std::abs(static_cast<double>(narrowed));
+        const bool same = static_cast<double>(narrowed) == value && size <= COORDINATE_LIMIT &&
+                          (size == 0.0 || size >= static_cast<double>(std::numeric_limits<float>::min()));
+        lost += same ? 0U : 1U;
+    }
+    return lost == 0;
+}
+
+// the values of rows `read_rows` read, refused as `read` refuses them
+template <nb::ssize_t Width>
+void check_rows(const Rows<Width>& rows, const std::string& name) {
+    const std::size_t count = rows.count * static_cast<std::size_t>(Width);
+    if (rows.wide != nullptr) {
+        detail::check_coordinates(rows.wide, count, name);
+        return;
+    }
+    // float32 values are held to the same bound as float64 ones
+    std::size_t refused = 0;
+    {
+        const nb::gil_scoped_release release;
+        for (std::size_t i = 0; i < count; i++) {
+            refused += !(std::abs(static_cast<double>(rows.narrow[i])) <= COORDINATE_LIMIT) ? 1U : 0U;
+        }
+    }
+    if (refused != 0) {
+        value_error(name + " must be finite and within " + COORDINATE_LIMIT_TEXT);
+    }
 }
 
 // Whether an array argument holds exactly `stored`, byte for byte, checked
@@ -540,6 +663,26 @@ struct type_caster<trimkit::Array<T, Shape...>> {
     }
     static handle from_cpp(const Argument& array, rv_policy /*policy*/, cleanup_list* /*cleanup*/) noexcept {
         return array.object.inc_ref();
+    }
+};
+
+// `RowsArgument<Width>` takes any object and shows up as each array it reads
+template <nb::ssize_t Width>
+struct type_caster<trimkit::RowsArgument<Width>> {
+    using Argument = trimkit::RowsArgument<Width>;
+    using Each = make_caster<trimkit::In<double, -1, Width>>;
+    using One = make_caster<trimkit::In<double, Width>>;
+    using EachNarrow = make_caster<trimkit::In<float, -1, Width>>;
+    using OneNarrow = make_caster<trimkit::In<float, Width>>;
+    // cppcheck-suppress unknownMacro ; nanobind's, and cppcheck doesn't read nanobind's headers
+    NB_TYPE_CASTER(Argument, Each::Name + const_name(" | ") + One::Name + const_name(" | ") + EachNarrow::Name +
+                                 const_name(" | ") + OneNarrow::Name)
+    bool from_python(handle source, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept {
+        value.object = source;
+        return true;
+    }
+    static handle from_cpp(const Argument& rows, rv_policy /*policy*/, cleanup_list* /*cleanup*/) noexcept {
+        return rows.object.inc_ref();
     }
 };
 

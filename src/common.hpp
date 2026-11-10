@@ -214,13 +214,24 @@ inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_
 }
 
 // `in_parallel` for code already past the GIL (a device driver, between the
-// chunks it hands a device): the same pool, through the Python-free door
+// chunks it hands a device): the same pool, measuring its first items like
+// any query, so a copy the caller finishes in a fraction of a millisecond
+// wakes nobody. No Ctrl-C poll: the chunks are short
 template <typename Body>
 void in_parallel_without_gil(std::size_t count, const Body& body) {
-    run_ranges(
-        count,
-        [](void* context, std::size_t begin, std::size_t end) { (*static_cast<const Body*>(context))(begin, end); },
-        const_cast<void*>(static_cast<const void*>(&body)));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+    if (count == 0) {
+        return;
+    }
+    parallel::Job job;
+    job.count = count;
+    job.run = [](const void* context, std::size_t begin, std::size_t end) {
+        (*static_cast<const Body*>(context))(begin, end);
+    };
+    job.body = &body;
+    parallel::run_job(job);
+    if (job.error) {
+        std::rethrow_exception(job.error);
+    }
 }
 
 // One holder at a time, for what takes exactly one (a device's queue): a

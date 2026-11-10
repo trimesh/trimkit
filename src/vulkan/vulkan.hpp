@@ -1,27 +1,32 @@
-// Ray queries on a Vulkan device: src/trace.comp (tinybvh's traversals,
+// Ray queries on a Vulkan device: src/vulkan/trace.comp (tinybvh's traversals,
 // filtered in f32 and exact in f64, so the device answers byte for byte what
-// the CPU answers) over a RayScene's meshes, src/scan.comp and src/compact.comp
-// laying its answers out. The loader is opened at run time by name, never
+// the CPU answers) over a RayScene's meshes, and src/vulkan/layout.comp laying
+// its answers out. The loader is opened at run time by name, never
 // linked, so every wheel works on a machine without Vulkan: anything missing
 // or failing is a reason string the caller warns with and answers on the CPU.
 // One device per process, opened on first use and kept; the caller serializes
 // its use (a queue is not thread safe).
-// Rays go through in chunks, two in flight, each one submission and one
-// fence: the kernel reads a chunk's rays straight from the mapped host memory
-// the caller fills piece by piece behind events (so the copy overlaps the
-// tracing; a broadcast bit reads one row for every ray), counts each ray's
-// crossings and, for a small cap, writes them dense; the device scans the
-// counts into offsets; an unbounded query traces again to write every
-// crossing at its offset; and a compaction writes the crossings as the caller
-// reads them, compacted and in order, into mapped host memory. Nothing per
-// ray crosses the host between steps. Python-free: src/bvh.cpp is the only
+// Rays go through in chunks of a quarter million, two in flight: the host
+// fills a chunk's rays into mapped host memory, submits, and fills the next
+// while the device traces this one. Host memory is written only before the
+// submission that reads it: written behind events while a submission ran, a
+// device was measured answering from bytes it had already fetched. The
+// kernel reads the rays where the host put them (as float64 or float32 rows,
+// or one row for every ray), counts each ray's crossings and writes its first DENSE
+// into the ray's own room, and the device scans the counts into offsets:
+// that is a chunk's first submission, and all of an occlusion query. The
+// host reads back one total, makes room for exactly that many crossings, and
+// a second submission writes them as the caller reads them, compacted and in
+// order, into mapped host memory; a chunk with none skips it. Only the rays
+// that crossed more than DENSE times are traced again, there, each writing
+// every crossing at its offset. Python-free: src/bvh.cpp is the only
 // user. Vulkan 1.0 core, no extensions.
 #pragma once
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
-#include "trace_spirv.hpp"
+#include "spirv.hpp"
 
 #if defined(_WIN32)
 // windows.h for the loader's two calls, without its min/max macros and the
@@ -85,10 +90,6 @@ namespace trimkit::vulkan {
     X(vkCmdBindDescriptorSets)             \
     X(vkCmdPushConstants)                  \
     X(vkCmdDispatch)                       \
-    X(vkCreateEvent)                       \
-    X(vkResetEvent)                        \
-    X(vkSetEvent)                          \
-    X(vkCmdWaitEvents)                     \
     X(vkCreateFence)                       \
     X(vkResetFences)                       \
     X(vkQueueSubmit)                       \
@@ -103,17 +104,21 @@ struct Functions {
 #undef TRIMKIT_VULKAN_MEMBER
 };
 
-// the trace shader's bindings, in src/trace.comp's order: the scene's five,
-// the top level's four, a chunk's origins and directions, the crossings'
-// instances, faces and distances, the f32 shadows of the scene's nodes and
-// triangles and of the top level's nodes, counts and offsets
-constexpr std::uint32_t TRACE_BINDINGS = 19;
-// src/scan.comp: counts, offsets, block sums
-constexpr std::uint32_t SCAN_BINDINGS = 3;
-// src/compact.comp: offsets, block sums, the kernel's three hit arrays, the
-// four columns the host reads
-constexpr std::uint32_t COMPACT_BINDINGS = 9;
-constexpr std::uint32_t SETS = 3;  // descriptor sets per chunk in flight: one per shader
+// src/vulkan/trace.comp's bindings, in its order: a scene's arrays (tinybvh's
+// nodes, the corners, the vertices, each mesh's first node, leaf slot, corner
+// and vertex in those, and the f32 images of the nodes and of the triangle
+// in each leaf slot), a top level's (nodes, primitives, inverse transforms,
+// each instance's mesh, the nodes' f32 image), and a chunk's (origins,
+// directions, the crossings' words and distances, counts, offsets)
+constexpr std::uint32_t SCENE_BUFFERS = 6;
+constexpr std::uint32_t TOP_BUFFERS = 5;
+constexpr std::uint32_t CHUNK_BUFFERS = 6;
+constexpr std::uint32_t TRACE_BINDINGS = SCENE_BUFFERS + TOP_BUFFERS + CHUNK_BUFFERS;
+// src/vulkan/layout.comp: counts, offsets, block sums, the kernel's crossings
+// (each ray's room, and those at the offsets: words and distances of each),
+// and the three columns the host reads
+constexpr std::uint32_t LAYOUT_BINDINGS = 10;
+constexpr std::uint32_t SETS = 2;  // descriptor sets per chunk in flight: one per shader
 
 // A node as the shader's f32 filter reads it (docs/trace.md 3): the f64 box
 // rounded to nearest, and for an interior node bit 31 with a mask of which of
@@ -142,49 +147,144 @@ struct Tri32 {
     float spare;
 };
 static_assert(sizeof(Node32) == 32 && sizeof(Tri32) == 64);
-// a chunk's origins and directions as the shader reads them: 3 doubles each,
-// in two arrays, so a caller's own arrays copy in whole
-constexpr std::size_t RAY_DOUBLES = 3;
-// the most rays in one chunk: 96 MB of origins, and with DENSE crossings per
-// ray 128 MB of dense distances, under every device's storage buffer range
-// (lavapipe's is exactly 128 MB). A chunk's buffers grow to what is asked,
-// never shrink
-constexpr std::size_t CHUNK = std::size_t{1} << 22U;
+
+// A node as tinybvh's BVH<double, uint64_t> lays it out and the shader reads
+// it: a leaf has a count, of the slots from `left_first`; an interior node's
+// children are `left_first` and the node after
+struct Node64 {
+    double lo[3];
+    std::uint64_t left_first;
+    double hi[3];
+    std::uint64_t count;
+};
+static_assert(sizeof(Node64) == 64);
+// the deepest leaf src/vulkan/trace.comp's stacks hold a path to: its
+// STACK_SIZE for a mesh, its TOP_STACK_SIZE for a top level
+constexpr std::uint32_t MESH_DEPTH = 64;
+constexpr std::uint32_t TOP_DEPTH = 32;
+
+// A tree to put on the device: its nodes, the slots its leaves index (which
+// hold faces, or a top level's instances), what every slot a leaf reaches
+// must be under, and the deepest leaf the shader can reach
+struct Tree {
+    const Node64* nodes;
+    std::size_t node_count;
+    const std::uint64_t* slots;
+    std::size_t slot_count;
+    std::uint64_t limit;
+    std::uint32_t depth;
+};
+
+// Walk a tree from its root, as the shader will: each node reached gets its
+// f32 image in `node32` (docs/trace.md 3: the box rounded to nearest, and for
+// an interior node which of its children's coordinates tie exactly, which
+// decides their order), and `leaf(slot, value)` is called for each slot of
+// each leaf. Nothing is followed before it is checked: a child is a node, a
+// leaf's slots are slots, a slot's value is under the limit, no node is
+// reached twice and no leaf is deeper than the shader's stack. So the shader
+// reads only what was written here, and a slot no leaf reaches (a split
+// build leaves stale ones) is never read at all. False with the reason for a
+// tree that fails any of it
+template <typename Leaf>
+bool walk(const Tree& tree, Node32* node32, const Leaf& leaf, std::string* reason) {
+    struct Pending {
+        std::uint32_t node;
+        std::uint32_t depth;
+    };
+    Pending stack[MESH_DEPTH + 2];
+    std::size_t pending = 0;
+    std::size_t reached = 0;
+    bool sound = tree.node_count > 0 && tree.node_count < INTERIOR && tree.slot_count < INTERIOR;
+    stack[pending++] = {0, 0};
+    while (sound && pending > 0) {
+        const Pending at = stack[--pending];
+        const Node64& node = tree.nodes[at.node];
+        Node32& image = node32[at.node];
+        for (std::size_t axis = 0; axis < 3; axis++) {
+            image.lo[axis] = static_cast<float>(node.lo[axis]);
+            image.hi[axis] = static_cast<float>(node.hi[axis]);
+        }
+        image.left = static_cast<std::uint32_t>(node.left_first);
+        sound = ++reached <= tree.node_count;
+        if (node.count > 0) {
+            sound = sound && node.left_first <= tree.slot_count && node.count <= tree.slot_count - node.left_first;
+            for (std::uint64_t slot = node.left_first; sound && slot < node.left_first + node.count; slot++) {
+                sound = tree.slots[slot] < tree.limit;
+                if (sound) {
+                    leaf(static_cast<std::size_t>(slot), tree.slots[slot]);
+                }
+            }
+            image.count_word = static_cast<std::uint32_t>(node.count);
+            continue;
+        }
+        if (at.depth == tree.depth) {
+            *reason = "a tree is deeper than the " + std::to_string(tree.depth) + " levels the device traverses";
+            return false;
+        }
+        sound = sound && node.left_first < tree.node_count - 1;
+        if (!sound) {
+            break;
+        }
+        const Node64& a = tree.nodes[node.left_first];
+        const Node64& b = tree.nodes[node.left_first + 1];
+        std::uint32_t ties = 0;
+        for (std::uint32_t axis = 0; axis < 3; axis++) {
+            ties |= (a.lo[axis] == b.lo[axis] ? 1U : 0U) << axis;
+            ties |= (a.hi[axis] == b.hi[axis] ? 1U : 0U) << (3 + axis);
+        }
+        image.count_word = INTERIOR | ties;
+        stack[pending++] = {image.left + 1, at.depth + 1};
+        stack[pending++] = {image.left, at.depth + 1};
+    }
+    if (!sound) {
+        *reason = "a tree is not one the device can traverse";
+    }
+    return sound;
+}
+// the most rays in one chunk: small enough that a million rays are four
+// chunks, so the host's copy of one and reading of another overlap the
+// device's tracing of a third (measured against 2^16 to 2^22)
+constexpr std::size_t CHUNK = std::size_t{1} << 18U;
 constexpr std::uint32_t GROUP_SIZE = 64;
-// the most crossings per ray the kernel writes dense in its counting
-// traversal, so a query capped there traces once; beyond, it traces twice
-constexpr std::uint32_t DENSE = 4;
-constexpr std::uint32_t SCAN_BLOCK = 1024;  // counts per scan block: 4 a lane
-constexpr std::uint32_t COMPACT_GROUP = 256;
-// chunks in flight at once
+// crossings per ray the kernel keeps from its counting traversal, each ray
+// in its own room: only a ray with more is traced again. Rays through a real
+// assembly cross about nine surfaces when they hit it at all: one in ten of
+// those more than 16 (traced again, that cost half as much as the first
+// traversal), one in a thousand more than 32
+constexpr std::uint32_t DENSE = 32;
+constexpr std::uint32_t LAYOUT_GROUP = 256;
+constexpr std::uint32_t SCAN_BLOCK = 4 * LAYOUT_GROUP;  // counts per scan block: 4 a lane
+// chunks in flight at once: the host fills and reads one while the device
+// traces the other (measured 11 to 23% faster than one, at 16M rays)
 constexpr std::size_t SLOTS = 2;
-// a chunk is filled and traced in pieces: the host fills one while the device
-// traces the one before it
-constexpr std::size_t PIECES = 8;
 constexpr std::uint32_t UNBOUNDED = 0xffffffffU;
+
+// How a chunk holds an array of rays' origins or directions, as the words from
+// one ray's row to the next: one float64 row for every ray, a float32 row
+// each, or a float64 row each. The host's fill decides it per array and per
+// chunk, and src/vulkan/trace.comp reads through it
+constexpr std::uint32_t STEP_ONE = 0;
+constexpr std::uint32_t STEP_NARROW = 3;
+constexpr std::uint32_t STEP_WIDE = 6;
 
 struct PushConstants {
     std::uint32_t ray_count;
     std::uint32_t mode;  // 0: one mesh, 1: the top level
     std::uint32_t mesh;
     std::uint32_t occlusion;
-    std::uint32_t most;        // crossings per ray at most
-    std::uint32_t pass_index;  // 0 counts, 1 writes at the offsets, 2 counts and writes dense
-    std::uint32_t ray_first;   // this dispatch's first ray of the chunk
-    std::uint32_t capacity;    // crossings the hit buffers hold
-    std::uint32_t broadcast;   // bit 0: one origin for every ray, bit 1: one direction
-    std::uint32_t padding;     // `extent` is aligned to 8 in the shader too
-    double extent;             // the scene's size
+    std::uint32_t most;            // crossings per ray at most
+    std::uint32_t origin_step;     // words between rays' rows: STEP_ONE, STEP_NARROW or STEP_WIDE
+    std::uint32_t direction_step;  // the same, of the directions
+    std::uint32_t dense;           // crossings per ray its room holds
+    std::uint32_t retrace;         // 1: only the rays with more, each writing every crossing at its offset
+    std::uint32_t spare;           // `extent` is aligned to 8 in the shader too
+    double extent;                 // the scene's size
 };
-struct ScanConstants {
+struct LayoutConstants {
     std::uint32_t count;
-    std::uint32_t step;
+    std::uint32_t step;  // 0 to 2 scan the counts into offsets, 3 writes the crossings out
     std::uint32_t block_count;
-};
-struct CompactConstants {
-    std::uint32_t count;
-    std::uint32_t block_count;
-    std::uint32_t dense;  // slots per ray the kernel wrote dense, 0 for compacted
+    std::uint32_t dense;  // crossings per ray the kernel wrote dense (a count past it raises the overflow word), or 0
 };
 
 struct Buffer {
@@ -200,13 +300,17 @@ struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
-// What one chunk in flight needs. Mapped host memory the CPU caches for what
-// the host writes or reads: the rays, read by the kernel over the bus as it
-// traces (measured faster than copying them to the device first), the
-// occlusion words, the chunk's total of crossings, and the four columns the
-// compaction writes. The device's own memory for what only shaders touch:
-// the counts, their scan, and the crossings as the kernel writes them. Every
-// buffer is grown to the most a chunk has needed, never shrunk
+// What one chunk in flight needs, whichever chunk it holds. Mapped host
+// memory the CPU caches for what the host writes or reads: the rays, read by
+// the kernel over the bus as it traces (measured faster than copying them to
+// the device first), the occlusion words, the chunk's total of crossings,
+// and the three columns the layout writes. The device's own memory for what
+// only shaders touch: the counts, their scan, each ray's room of DENSE
+// crossings, and the crossings of the rays that had more, at their offsets.
+// A crossing is two words, its instance and face, and a distance; in the
+// host's columns its ray too. The ray buffers are a chunk's size from the
+// start; the rest grow to the most a chunk of the query needs, and what grew
+// large is let go when the query ends (`release`)
 struct Slot {
     Buffer origins;
     Buffer directions;
@@ -215,25 +319,19 @@ struct Slot {
     Buffer offsets;
     Buffer blocks;
     Buffer total;
-    std::size_t ray_capacity = 0;  // rays the ray buffers hold
-    Buffer hit_instances;
-    Buffer hit_faces;
-    Buffer hit_distances;
+    Buffer room_words;
+    Buffer room_distances;
+    Buffer more_words;
+    Buffer more_distances;
     Buffer rays;
-    Buffer instances;
-    Buffer faces;
+    Buffer words;
     Buffer distances;
-    std::size_t hit_capacity = 0;  // crossings the hit buffers and columns hold
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    VkEvent events[PIECES] = {};  // set by the host as it fills each piece
     VkDescriptorSet trace_set = VK_NULL_HANDLE;
-    VkDescriptorSet scan_set = VK_NULL_HANDLE;
-    VkDescriptorSet compact_set = VK_NULL_HANDLE;
-    bool pending = false;
-    // the chunk it holds: which rays
-    std::size_t begin = 0;
-    std::size_t count = 0;
+    VkDescriptorSet layout_set = VK_NULL_HANDLE;
+    // how the chunk it holds has its origins and directions: STEP_*
+    std::uint32_t steps[2] = {STEP_WIDE, STEP_WIDE};
 };
 
 struct Device {
@@ -246,16 +344,13 @@ struct Device {
     VkPhysicalDeviceMemoryProperties memory{};
     VkDeviceSize range = 0;  // the largest storage buffer the device binds (lavapipe: 128 MB)
     Pipeline trace;
-    Pipeline scan;
-    Pipeline compact;
+    Pipeline layout;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     // the commands and fence uploads use, and the chunks in flight
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     Slot slots[SLOTS];
-    // what a query of one mesh binds as the top level's buffers: never read
-    Buffer empty;
     int pid = 0;
 };
 
@@ -267,8 +362,12 @@ inline int process_id() {
 #endif
 }
 
-inline std::string failed(const char* what, VkResult result) {
-    return std::string(what) + " failed (VkResult " + std::to_string(static_cast<int>(result)) + ")";
+// whether a Vulkan call succeeded: if not, the reason names it and its result
+inline bool ok(VkResult result, const char* what, std::string* reason) {
+    if (result != VK_SUCCESS) {
+        *reason = std::string(what) + " failed (VkResult " + std::to_string(static_cast<int>(result)) + ")";
+    }
+    return result == VK_SUCCESS;
 }
 
 // the loader's one exported entry point, from whichever library name this
@@ -341,6 +440,7 @@ inline bool make_buffer(const Device& device, VkDeviceSize size, VkBufferUsageFl
         *reason = "a buffer of " + std::to_string(size) + " bytes exceeds the device's storage buffer range";
         return false;
     }
+    const Functions& fn = device.fn;
     Buffer buffer;
     buffer.size = std::max<VkDeviceSize>(size, 16);
     VkBufferCreateInfo info{};
@@ -348,42 +448,29 @@ inline bool make_buffer(const Device& device, VkDeviceSize size, VkBufferUsageFl
     info.size = buffer.size;
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkResult result = device.fn.vkCreateBuffer(device.device, &info, nullptr, &buffer.buffer);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateBuffer", result);
-        return false;
-    }
-    VkMemoryRequirements requirements{};
-    device.fn.vkGetBufferMemoryRequirements(device.device, buffer.buffer, &requirements);
-    const int type = find_memory(device.memory, requirements.memoryTypeBits, required, preferred);
-    if (type < 0) {
-        destroy(device, &buffer);
-        *reason = "no device memory of the kind needed";
-        return false;
-    }
     VkMemoryAllocateInfo allocate{};
     allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocate.allocationSize = requirements.size;
-    allocate.memoryTypeIndex = static_cast<std::uint32_t>(type);
-    result = device.fn.vkAllocateMemory(device.device, &allocate, nullptr, &buffer.memory);
-    if (result != VK_SUCCESS) {
-        destroy(device, &buffer);
-        *reason = failed("vkAllocateMemory", result);
-        return false;
-    }
-    result = device.fn.vkBindBufferMemory(device.device, buffer.buffer, buffer.memory, 0);
-    if (result != VK_SUCCESS) {
-        destroy(device, &buffer);
-        *reason = failed("vkBindBufferMemory", result);
-        return false;
-    }
-    if ((required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
-        result = device.fn.vkMapMemory(device.device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped);
-        if (result != VK_SUCCESS) {
-            destroy(device, &buffer);
-            *reason = failed("vkMapMemory", result);
-            return false;
+    bool made = ok(fn.vkCreateBuffer(device.device, &info, nullptr, &buffer.buffer), "vkCreateBuffer", reason);
+    if (made) {
+        VkMemoryRequirements requirements{};
+        fn.vkGetBufferMemoryRequirements(device.device, buffer.buffer, &requirements);
+        const int type = find_memory(device.memory, requirements.memoryTypeBits, required, preferred);
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = static_cast<std::uint32_t>(type);
+        made = type >= 0;
+        if (!made) {
+            *reason = "no device memory of the kind needed";
         }
+    }
+    const bool mapped = (required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    made = made &&
+           ok(fn.vkAllocateMemory(device.device, &allocate, nullptr, &buffer.memory), "vkAllocateMemory", reason) &&
+           ok(fn.vkBindBufferMemory(device.device, buffer.buffer, buffer.memory, 0), "vkBindBufferMemory", reason) &&
+           (!mapped || ok(fn.vkMapMemory(device.device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped),
+                          "vkMapMemory", reason));
+    if (!made) {
+        destroy(device, &buffer);
+        return false;
     }
     *out = buffer;
     return true;
@@ -394,53 +481,32 @@ constexpr VkBufferUsageFlags TRANSFER = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BU
 constexpr VkBufferUsageFlags STORAGE = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | TRANSFER;
 
 inline bool begin_commands(const Device& device, VkCommandBuffer command, std::string* reason) {
-    VkResult result = device.fn.vkResetCommandBuffer(command, 0);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkResetCommandBuffer", result);
+    if (!ok(device.fn.vkResetCommandBuffer(command, 0), "vkResetCommandBuffer", reason)) {
         return false;
     }
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    result = device.fn.vkBeginCommandBuffer(command, &begin);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkBeginCommandBuffer", result);
-        return false;
-    }
-    return true;
+    return ok(device.fn.vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer", reason);
 }
 
 // end the recorded commands and submit them, to signal `fence`
 inline bool submit_commands(const Device& device, VkCommandBuffer command, VkFence fence, std::string* reason) {
-    VkResult result = device.fn.vkEndCommandBuffer(command);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkEndCommandBuffer", result);
+    if (!ok(device.fn.vkEndCommandBuffer(command), "vkEndCommandBuffer", reason)) {
         return false;
     }
-    result = device.fn.vkResetFences(device.device, 1, &fence);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkResetFences", result);
+    if (!ok(device.fn.vkResetFences(device.device, 1, &fence), "vkResetFences", reason)) {
         return false;
     }
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    result = device.fn.vkQueueSubmit(device.queue, 1, &submit, fence);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkQueueSubmit", result);
-        return false;
-    }
-    return true;
+    return ok(device.fn.vkQueueSubmit(device.queue, 1, &submit, fence), "vkQueueSubmit", reason);
 }
 
 inline bool wait(const Device& device, VkFence fence, std::string* reason) {
-    const VkResult result = device.fn.vkWaitForFences(device.device, 1, &fence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkWaitForFences", result);
-        return false;
-    }
-    return true;
+    return ok(device.fn.vkWaitForFences(device.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", reason);
 }
 
 inline void barrier(const Device& device, VkCommandBuffer command, VkAccessFlags from, VkPipelineStageFlags from_stage,
@@ -490,73 +556,44 @@ inline bool upload(const Device& device, const void* data, std::size_t size, Buf
     return true;
 }
 
-// a capacity grown by doubling to hold `needed`, never shrunk
-inline std::size_t grown(std::size_t capacity, std::size_t needed) {
-    std::size_t next = std::max<std::size_t>(capacity, std::size_t{1} << 16U);
-    while (next < needed) {
-        next *= 2;
-    }
-    return next;
-}
-
-// a mapped host buffer the CPU caches, of `elements` of `size` bytes each
-inline bool make_mapped(const Device& device, std::size_t elements, std::size_t size, Buffer* out,
-                        std::string* reason) {
-    destroy(device, out);
-    return make_buffer(device, VkDeviceSize{elements} * size, STORAGE, HOST, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, out,
-                       reason);
-}
-
-// a buffer in the device's own memory
-inline bool make_local(const Device& device, std::size_t elements, std::size_t size, Buffer* out, std::string* reason) {
-    destroy(device, out);
-    return make_buffer(device, VkDeviceSize{elements} * size, STORAGE, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, out,
-                       reason);
-}
-
-inline std::size_t scan_blocks(std::size_t rays) { return (rays + SCAN_BLOCK - 1) / SCAN_BLOCK; }
-
-// room in a slot's ray buffers for `rays`
-inline bool hold_rays(const Device& device, Slot* slot, std::size_t rays, std::string* reason) {
-    if (rays <= slot->ray_capacity) {
+// Room in `buffer` for `bytes`, mapped host memory the CPU caches or the
+// device's own: kept if it has it, else replaced by one grown by doubling,
+// whose contents are new
+inline bool hold(const Device& device, Buffer* buffer, VkDeviceSize bytes, bool mapped, std::string* reason) {
+    if (bytes <= buffer->size) {
         return true;
     }
-    const std::size_t capacity = grown(slot->ray_capacity, rays);
-    slot->ray_capacity = 0;
-    const std::size_t point = RAY_DOUBLES * sizeof(double);
-    if (!make_mapped(device, capacity, point, &slot->origins, reason) ||
-        !make_mapped(device, capacity, point, &slot->directions, reason) ||
-        !make_mapped(device, capacity, sizeof(std::uint32_t), &slot->occlusion, reason) ||
-        !make_local(device, capacity, sizeof(std::uint32_t), &slot->counts, reason) ||
-        !make_local(device, capacity, sizeof(std::uint32_t), &slot->offsets, reason) ||
-        !make_local(device, scan_blocks(capacity) + 1, sizeof(std::uint32_t), &slot->blocks, reason)) {
-        return false;
+    VkDeviceSize size = std::max<VkDeviceSize>(buffer->size, VkDeviceSize{1} << 16U);
+    while (size < bytes) {
+        size *= 2;
     }
-    slot->ray_capacity = capacity;
-    return true;
+    // doubled past what the device binds, what was asked is still tried
+    size = std::max(bytes, std::min(size, device.range));
+    destroy(device, buffer);
+    return make_buffer(device, size, STORAGE, mapped ? HOST : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                       mapped ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0, buffer, reason);
 }
 
-// room in a slot's hit buffers and columns for `hits` crossings
-inline bool hold_hits(const Device& device, Slot* slot, std::size_t hits, std::string* reason) {
-    if (hits <= slot->hit_capacity) {
-        return true;
+// A buffer a query grew past `KEEP` bytes, made small again: a device holds
+// between queries a full chunk's rooms (allocating them costs a millisecond
+// each, measured), not the columns and offsets of a chunk that crossed more.
+// Kept as it is if the small one can't be made
+constexpr VkDeviceSize KEEP = VkDeviceSize{64} << 20U;
+inline void release(const Device& device, Buffer* buffer) {
+    if (buffer->size <= KEEP) {
+        return;
     }
-    const std::size_t capacity = grown(slot->hit_capacity, hits);
-    slot->hit_capacity = 0;
-    // a crossing is a u32 instance, a u32 face and a double distance, and in
-    // the columns its u32 ray too
-    if (!make_local(device, capacity, 4, &slot->hit_instances, reason) ||
-        !make_local(device, capacity, 4, &slot->hit_faces, reason) ||
-        !make_local(device, capacity, 8, &slot->hit_distances, reason) ||
-        !make_mapped(device, capacity, 4, &slot->rays, reason) ||
-        !make_mapped(device, capacity, 4, &slot->instances, reason) ||
-        !make_mapped(device, capacity, 4, &slot->faces, reason) ||
-        !make_mapped(device, capacity, 8, &slot->distances, reason)) {
-        return false;
+    Buffer small;
+    std::string ignored;
+    if (hold(device, &small, 1, buffer->mapped != nullptr, &ignored)) {
+        destroy(device, buffer);
+        *buffer = small;
     }
-    slot->hit_capacity = capacity;
-    return true;
 }
+
+constexpr std::size_t scan_blocks(std::size_t rays) { return (rays + SCAN_BLOCK - 1) / SCAN_BLOCK; }
+// src/vulkan/layout.comp finds a scan block in one dimension of groups, which a device may cap at 65535
+static_assert(scan_blocks(CHUNK) <= 32768);
 
 // a shader as a pipeline: `bindings` storage buffers in one set and
 // `push_bytes` of push constants
@@ -568,9 +605,7 @@ inline bool make_pipeline(const Device& device, const std::uint32_t* code, std::
     shader_info.codeSize = code_bytes;
     shader_info.pCode = code;
     VkShaderModule shader = VK_NULL_HANDLE;
-    VkResult result = fn.vkCreateShaderModule(device.device, &shader_info, nullptr, &shader);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateShaderModule", result);
+    if (!ok(fn.vkCreateShaderModule(device.device, &shader_info, nullptr, &shader), "vkCreateShaderModule", reason)) {
         return false;
     }
     std::vector<VkDescriptorSetLayoutBinding> layout_bindings(bindings);
@@ -584,9 +619,8 @@ inline bool make_pipeline(const Device& device, const std::uint32_t* code, std::
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = bindings;
     layout_info.pBindings = layout_bindings.data();
-    result = fn.vkCreateDescriptorSetLayout(device.device, &layout_info, nullptr, &out->set_layout);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateDescriptorSetLayout", result);
+    if (!ok(fn.vkCreateDescriptorSetLayout(device.device, &layout_info, nullptr, &out->set_layout),
+            "vkCreateDescriptorSetLayout", reason)) {
         return false;
     }
     VkPushConstantRange range{};
@@ -598,9 +632,8 @@ inline bool make_pipeline(const Device& device, const std::uint32_t* code, std::
     pipeline_layout_info.pSetLayouts = &out->set_layout;
     pipeline_layout_info.pushConstantRangeCount = 1;
     pipeline_layout_info.pPushConstantRanges = &range;
-    result = fn.vkCreatePipelineLayout(device.device, &pipeline_layout_info, nullptr, &out->layout);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreatePipelineLayout", result);
+    if (!ok(fn.vkCreatePipelineLayout(device.device, &pipeline_layout_info, nullptr, &out->layout),
+            "vkCreatePipelineLayout", reason)) {
         return false;
     }
     VkComputePipelineCreateInfo pipeline_info{};
@@ -610,22 +643,22 @@ inline bool make_pipeline(const Device& device, const std::uint32_t* code, std::
     pipeline_info.stage.module = shader;
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = out->layout;
-    result = fn.vkCreateComputePipelines(device.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &out->pipeline);
+    const VkResult result =
+        fn.vkCreateComputePipelines(device.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &out->pipeline);
     fn.vkDestroyShaderModule(device.device, shader, nullptr);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateComputePipelines", result);
-        return false;
-    }
-    return true;
+    return ok(result, "vkCreateComputePipelines", reason);
 }
 
-// What src/trace.comp needs of a device beyond Vulkan 1.0's floor, or null:
+// What src/vulkan/trace.comp needs of a device beyond Vulkan 1.0's floor, or null:
 // double precision, a compute queue (which may carry transfers whether or not
 // it says so), and the bindings in one set (the floor is 4)
 inline const char* lacking(const VkPhysicalDeviceProperties& properties, const VkPhysicalDeviceFeatures& features,
                            const std::vector<VkQueueFamilyProperties>& queues, std::uint32_t* family) {
     if (features.shaderFloat64 != VK_TRUE) {
         return "no float64";
+    }
+    if (features.robustBufferAccess != VK_TRUE) {
+        return "no robust buffer access";
     }
     if (properties.limits.maxPerStageDescriptorStorageBuffers < TRACE_BINDINGS) {
         return "too few storage buffers";
@@ -666,14 +699,13 @@ inline bool open(Device* device, std::string* reason) {
     VkInstanceCreateInfo instance_info{};
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &application;
-    VkResult result = fn.vkCreateInstance(&instance_info, nullptr, &device->instance);
-    if (result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+    const VkResult created = fn.vkCreateInstance(&instance_info, nullptr, &device->instance);
+    if (created == VK_ERROR_INCOMPATIBLE_DRIVER) {
         // what a loader with no driver behind it says
         *reason = "no Vulkan driver is installed";
         return false;
     }
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateInstance", result);
+    if (!ok(created, "vkCreateInstance", reason)) {
         return false;
     }
 #define TRIMKIT_VULKAN_LOAD(name)                                                              \
@@ -686,16 +718,13 @@ inline bool open(Device* device, std::string* reason) {
 #undef TRIMKIT_VULKAN_LOAD
 
     std::uint32_t count = 0;
-    result = fn.vkEnumeratePhysicalDevices(device->instance, &count, nullptr);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkEnumeratePhysicalDevices", result);
+    if (!ok(fn.vkEnumeratePhysicalDevices(device->instance, &count, nullptr), "vkEnumeratePhysicalDevices", reason)) {
         return false;
     }
     std::vector<VkPhysicalDevice> candidates(count);
     if (count > 0) {
-        result = fn.vkEnumeratePhysicalDevices(device->instance, &count, candidates.data());
-        if (result != VK_SUCCESS) {
-            *reason = failed("vkEnumeratePhysicalDevices", result);
+        if (!ok(fn.vkEnumeratePhysicalDevices(device->instance, &count, candidates.data()),
+                "vkEnumeratePhysicalDevices", reason)) {
             return false;
         }
     }
@@ -740,14 +769,15 @@ inline bool open(Device* device, std::string* reason) {
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures wanted{};
     wanted.shaderFloat64 = VK_TRUE;
+    // a shader's access past a buffer's end reads or writes inside the buffer
+    // or nothing: a wrong answer the tests see, never another buffer's memory
+    wanted.robustBufferAccess = VK_TRUE;
     VkDeviceCreateInfo device_info{};
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &wanted;
-    result = fn.vkCreateDevice(device->physical, &device_info, nullptr, &device->device);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateDevice", result);
+    if (!ok(fn.vkCreateDevice(device->physical, &device_info, nullptr, &device->device), "vkCreateDevice", reason)) {
         return false;
     }
 #define TRIMKIT_VULKAN_LOAD(name)                                                          \
@@ -763,30 +793,26 @@ inline bool open(Device* device, std::string* reason) {
     // the shaders, their bindings and their pipelines
     if (!make_pipeline(*device, TRACE_SPIRV, sizeof(TRACE_SPIRV), TRACE_BINDINGS, sizeof(PushConstants), &device->trace,
                        reason) ||
-        !make_pipeline(*device, SCAN_SPIRV, sizeof(SCAN_SPIRV), SCAN_BINDINGS, sizeof(ScanConstants), &device->scan,
-                       reason) ||
-        !make_pipeline(*device, COMPACT_SPIRV, sizeof(COMPACT_SPIRV), COMPACT_BINDINGS, sizeof(CompactConstants),
-                       &device->compact, reason)) {
+        !make_pipeline(*device, LAYOUT_SPIRV, sizeof(LAYOUT_SPIRV), LAYOUT_BINDINGS, sizeof(LayoutConstants),
+                       &device->layout, reason)) {
         return false;
     }
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = (TRACE_BINDINGS + SCAN_BINDINGS + COMPACT_BINDINGS) * SLOTS;
+    pool_size.descriptorCount = (TRACE_BINDINGS + LAYOUT_BINDINGS) * SLOTS;
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool_info.maxSets = SETS * SLOTS;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
-    result = fn.vkCreateDescriptorPool(device->device, &pool_info, nullptr, &device->descriptor_pool);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateDescriptorPool", result);
+    if (!ok(fn.vkCreateDescriptorPool(device->device, &pool_info, nullptr, &device->descriptor_pool),
+            "vkCreateDescriptorPool", reason)) {
         return false;
     }
     VkDescriptorSetLayout layouts[SETS * SLOTS];
     for (std::size_t s = 0; s < SLOTS; s++) {
         layouts[(SETS * s)] = device->trace.set_layout;
-        layouts[(SETS * s) + 1] = device->scan.set_layout;
-        layouts[(SETS * s) + 2] = device->compact.set_layout;
+        layouts[(SETS * s) + 1] = device->layout.set_layout;
     }
     VkDescriptorSet sets[SETS * SLOTS]{};
     VkDescriptorSetAllocateInfo set_info{};
@@ -794,21 +820,18 @@ inline bool open(Device* device, std::string* reason) {
     set_info.descriptorPool = device->descriptor_pool;
     set_info.descriptorSetCount = SETS * SLOTS;
     set_info.pSetLayouts = layouts;
-    result = fn.vkAllocateDescriptorSets(device->device, &set_info, sets);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkAllocateDescriptorSets", result);
+    if (!ok(fn.vkAllocateDescriptorSets(device->device, &set_info, sets), "vkAllocateDescriptorSets", reason)) {
         return false;
     }
 
     // commands: one buffer for uploads and one per chunk in flight, each
-    // reset on its own, a fence for each, and a chunk's events
+    // reset on its own, and a fence for each
     VkCommandPoolCreateInfo command_pool_info{};
     command_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     command_pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     command_pool_info.queueFamilyIndex = device->queue_family;
-    result = fn.vkCreateCommandPool(device->device, &command_pool_info, nullptr, &device->command_pool);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateCommandPool", result);
+    if (!ok(fn.vkCreateCommandPool(device->device, &command_pool_info, nullptr, &device->command_pool),
+            "vkCreateCommandPool", reason)) {
         return false;
     }
     VkCommandBuffer commands[SLOTS + 1]{};
@@ -817,46 +840,45 @@ inline bool open(Device* device, std::string* reason) {
     command_info.commandPool = device->command_pool;
     command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     command_info.commandBufferCount = SLOTS + 1;
-    result = fn.vkAllocateCommandBuffers(device->device, &command_info, commands);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkAllocateCommandBuffers", result);
+    if (!ok(fn.vkAllocateCommandBuffers(device->device, &command_info, commands), "vkAllocateCommandBuffers", reason)) {
         return false;
     }
     VkFenceCreateInfo fence_info{};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkEventCreateInfo event_info{};
-    event_info.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
     device->command = commands[SLOTS];
-    result = fn.vkCreateFence(device->device, &fence_info, nullptr, &device->fence);
-    if (result != VK_SUCCESS) {
-        *reason = failed("vkCreateFence", result);
+    if (!ok(fn.vkCreateFence(device->device, &fence_info, nullptr, &device->fence), "vkCreateFence", reason)) {
         return false;
     }
     for (std::size_t s = 0; s < SLOTS; s++) {
         Slot& slot = device->slots[s];
         slot.command = commands[s];
         slot.trace_set = sets[SETS * s];
-        slot.scan_set = sets[(SETS * s) + 1];
-        slot.compact_set = sets[(SETS * s) + 2];
-        result = fn.vkCreateFence(device->device, &fence_info, nullptr, &slot.fence);
-        if (result != VK_SUCCESS) {
-            *reason = failed("vkCreateFence", result);
+        slot.layout_set = sets[(SETS * s) + 1];
+        if (!ok(fn.vkCreateFence(device->device, &fence_info, nullptr, &slot.fence), "vkCreateFence", reason)) {
             return false;
         }
-        for (VkEvent& event : slot.events) {
-            result = fn.vkCreateEvent(device->device, &event_info, nullptr, &event);
-            if (result != VK_SUCCESS) {
-                *reason = failed("vkCreateEvent", result);
+        // a chunk's rays and counts, and something to bind for the rest
+        const VkDeviceSize word = sizeof(std::uint32_t);
+        const VkDeviceSize point = 3 * sizeof(double);
+        if (!hold(*device, &slot.origins, CHUNK * point, true, reason) ||
+            !hold(*device, &slot.directions, CHUNK * point, true, reason) ||
+            !hold(*device, &slot.occlusion, CHUNK * word, true, reason) ||
+            !hold(*device, &slot.counts, CHUNK * word, false, reason) ||
+            !hold(*device, &slot.offsets, CHUNK * word, false, reason) ||
+            !hold(*device, &slot.blocks, (scan_blocks(CHUNK) + 2) * word, false, reason) ||
+            !hold(*device, &slot.total, 2 * word, true, reason)) {
+            return false;
+        }
+        for (Buffer* buffer : {&slot.room_words, &slot.room_distances, &slot.more_words, &slot.more_distances}) {
+            if (!hold(*device, buffer, 1, false, reason)) {
                 return false;
             }
         }
-        if (!make_mapped(*device, 1, sizeof(std::uint32_t), &slot.total, reason) ||
-            !hold_rays(*device, &slot, 1, reason) || !hold_hits(*device, &slot, 1, reason)) {
-            return false;
+        for (Buffer* buffer : {&slot.rays, &slot.words, &slot.distances}) {
+            if (!hold(*device, buffer, 1, true, reason)) {
+                return false;
+            }
         }
-    }
-    if (!upload(*device, nullptr, 0, &device->empty, reason)) {
-        return false;
     }
     device->pid = process_id();
     return true;
@@ -888,64 +910,49 @@ inline Device* shared_device(std::string* reason) {
     return &opened.device;
 }
 
-// A scene's meshes on the device, as src/trace.comp reads them: tinybvh's
-// nodes and geometry for the exact path, their f32 shadows for the filter
-struct Scene {
-    Buffer nodes;
-    Buffer primitives;
-    Buffer corners;
-    Buffer vertices;
-    Buffer meshes;
-    Buffer node32;
-    Buffer tri32;
+// one array to put on the device: its bytes
+struct Span {
+    const void* data;
+    std::size_t size;
 };
 
-// A top level on the device: its nodes, instance indices, inverse
-// transforms, each instance's mesh, and its nodes' f32 shadow
-struct Top {
-    Buffer nodes;
-    Buffer primitives;
-    Buffer inverses;
-    Buffer instance_meshes;
-    Buffer node32;
+// A scene's meshes, or a top level, on the device: its arrays in the order
+// src/vulkan/trace.comp binds them, SCENE_BUFFERS or TOP_BUFFERS of them
+struct Arrays {
+    Buffer buffers[SCENE_BUFFERS];
 };
 
-inline void destroy(const Device& device, Scene* scene) {
-    for (Buffer* buffer : {&scene->nodes, &scene->primitives, &scene->corners, &scene->vertices, &scene->meshes,
-                           &scene->node32, &scene->tri32}) {
-        destroy(device, buffer);
+// `count` arrays uploaded as the first buffers of `out`: false with the
+// reason, what was made left for `destroy`
+inline bool upload(const Device& device, const Span* spans, std::uint32_t count, Arrays* out, std::string* reason) {
+    for (std::uint32_t b = 0; b < count; b++) {
+        if (!upload(device, spans[b].data, spans[b].size, &out->buffers[b], reason)) {
+            return false;
+        }
     }
+    return true;
 }
 
-inline void destroy(const Device& device, Top* top) {
-    for (Buffer* buffer : {&top->nodes, &top->primitives, &top->inverses, &top->instance_meshes, &top->node32}) {
-        destroy(device, buffer);
+inline void destroy(const Device& device, Arrays* arrays) {
+    for (Buffer& buffer : arrays->buffers) {
+        destroy(device, &buffer);
     }
 }
 
 // What one query traces: the scene, and either one mesh directly or the top
 // level; whether it only asks if anything is hit; how many crossings per ray
-// at most; and whether every ray shares one origin or one direction (bits 0
-// and 1), so the host fills and the device reads one row
+// at most
 struct Query {
-    const Scene* scene = nullptr;
-    const Top* top = nullptr;  // null traces `mesh` directly
+    const Arrays* scene = nullptr;
+    const Arrays* top = nullptr;  // null traces `mesh` directly
     std::uint32_t mesh = 0;
     bool occlusion = false;
     std::uint32_t most = UNBOUNDED;
-    std::uint32_t broadcast = 0;
     double extent = 0.0;
 };
 
-// a query capped at DENSE crossings traces once, writing them dense
-inline bool dense(const Query& query) { return !query.occlusion && query.most <= DENSE; }
-
-// piece `p` of a chunk of `count` rays: its first ray and how many
-inline void piece_of(std::size_t count, std::size_t p, std::size_t* first, std::size_t* piece) {
-    const std::size_t size = (count + PIECES - 1) / PIECES;
-    *first = std::min(count, p * size);
-    *piece = std::min(count, *first + size) - *first;
-}
+// crossings per ray a chunk's counting traversal keeps
+inline std::uint32_t room_width(const Query& query) { return std::min(query.most, DENSE); }
 
 // `count` buffers bound to `set`, in binding order
 inline void bind_set(const Device& device, VkDescriptorSet set, const Buffer* const* buffers, std::uint32_t count) {
@@ -965,37 +972,28 @@ inline void bind_set(const Device& device, VkDescriptorSet set, const Buffer* co
 }
 
 // bind what a query reads and the slot's own buffers (which may have regrown)
-// to the slot's three sets: before each chunk is recorded
-inline void bind(const Device& device, const Slot& slot, const Query& query) {
-    const Top* top = query.top;
-    const Buffer* trace[TRACE_BINDINGS] = {
-        &query.scene->nodes,
-        &query.scene->primitives,
-        &query.scene->corners,
-        &query.scene->vertices,
-        &query.scene->meshes,
-        top != nullptr ? &top->nodes : &device.empty,
-        top != nullptr ? &top->primitives : &device.empty,
-        top != nullptr ? &top->inverses : &device.empty,
-        top != nullptr ? &top->instance_meshes : &device.empty,
-        &slot.origins,
-        &slot.directions,
-        &slot.hit_instances,
-        &slot.hit_faces,
-        &slot.hit_distances,
-        &query.scene->node32,
-        &query.scene->tri32,
-        top != nullptr ? &top->node32 : &device.empty,
-        query.occlusion ? &slot.occlusion : &slot.counts,
-        &slot.offsets,
-    };
-    const Buffer* scan[SCAN_BINDINGS] = {&slot.counts, &slot.offsets, &slot.blocks};
-    const Buffer* compact[COMPACT_BINDINGS] = {&slot.offsets,   &slot.blocks,        &slot.hit_instances,
-                                               &slot.hit_faces, &slot.hit_distances, &slot.rays,
-                                               &slot.instances, &slot.faces,         &slot.distances};
+// to the slot's two sets, before each submission is recorded. The kernel
+// writes crossings to each ray's room, or tracing again, to the offsets
+inline void bind(const Device& device, const Slot& slot, const Query& query, bool retrace) {
+    const Buffer* trace[TRACE_BINDINGS];
+    std::uint32_t b = 0;
+    for (const Buffer& buffer : query.scene->buffers) {
+        trace[b++] = &buffer;
+    }
+    // a query of one mesh never reads a top level: any buffer stands in
+    for (std::uint32_t i = 0; i < TOP_BUFFERS; i++) {
+        trace[b++] = query.top != nullptr ? &query.top->buffers[i] : &query.scene->buffers[0];
+    }
+    for (const Buffer* buffer : {&slot.origins, &slot.directions, retrace ? &slot.more_words : &slot.room_words,
+                                 retrace ? &slot.more_distances : &slot.room_distances,
+                                 query.occlusion ? &slot.occlusion : &slot.counts, &slot.offsets}) {
+        trace[b++] = buffer;
+    }
+    const Buffer* layout[LAYOUT_BINDINGS] = {
+        &slot.counts,     &slot.offsets,        &slot.blocks, &slot.room_words, &slot.room_distances,
+        &slot.more_words, &slot.more_distances, &slot.rays,   &slot.words,      &slot.distances};
     bind_set(device, slot.trace_set, trace, TRACE_BINDINGS);
-    bind_set(device, slot.scan_set, scan, SCAN_BINDINGS);
-    bind_set(device, slot.compact_set, compact, COMPACT_BINDINGS);
+    bind_set(device, slot.layout_set, layout, LAYOUT_BINDINGS);
 }
 
 // `groups` groups of a pipeline, in two dimensions: a device may cap one
@@ -1010,196 +1008,181 @@ inline void dispatch(const Device& device, VkCommandBuffer command, const Pipeli
     device.fn.vkCmdDispatch(command, width, height, 1);
 }
 
-// the kernel over rays [first, first + count) of the slot's chunk. Every
-// count here is under 2^32: a chunk has at most CHUNK rays, and its crossings
-// are indexed with 32-bit words on the device (an offset of 4 billion
-// crossings in one chunk would be 80 GB of answers)
-inline void trace_rays(const Device& device, const Slot& slot, const Query& query, std::size_t first, std::size_t count,
-                       std::uint32_t pass_index, std::size_t capacity) {
+// the kernel over the `count` rays of the slot's chunk. Every count here is
+// under 2^32: a chunk has at most CHUNK rays, and its crossings are indexed
+// with 32-bit words on the device (an offset of 4 billion crossings in one
+// chunk would be 80 GB of answers)
+inline void trace_rays(const Device& device, const Slot& slot, const Query& query, std::size_t count, bool retrace) {
     PushConstants constants{};
     constants.ray_count = static_cast<std::uint32_t>(count);
     constants.mode = query.top != nullptr ? 1 : 0;
     constants.mesh = query.mesh;
     constants.occlusion = query.occlusion ? 1 : 0;
     constants.most = query.most;
-    constants.pass_index = pass_index;
-    constants.ray_first = static_cast<std::uint32_t>(first);
-    constants.capacity = static_cast<std::uint32_t>(capacity);
-    constants.broadcast = query.broadcast;
+    constants.origin_step = slot.steps[0];
+    constants.direction_step = slot.steps[1];
+    constants.dense = room_width(query);
+    constants.retrace = retrace ? 1 : 0;
     constants.extent = query.extent;
     dispatch(device, slot.command, device.trace, slot.trace_set, &constants, sizeof(constants),
              (count + GROUP_SIZE - 1) / GROUP_SIZE);
 }
 
-// Record and submit a chunk's commands. From the start: each piece's kernel
-// behind the event the host sets once it has filled the piece (counting, and
-// writing dense when `dense`); for an occlusion query that is all. Then the
-// scan of the counts, with the chunk's total copied to host memory; for a
-// query past DENSE the kernel again over the whole chunk, writing every
-// crossing at its offset up to the hit buffers' capacity; and the compaction
-// of the crossings into the host's columns. `traced` false skips the pieces
-// and the scan: the hit buffers were short and have grown, so only the
-// writing and the compaction run again
-inline bool record_chunk(const Device& device, Slot& slot, const Query& query, bool traced, std::string* reason) {
+// A chunk's first submission, the host having filled its `count` rays: the
+// kernel, counting each ray's crossings and writing its first DENSE to its
+// room; for an occlusion query that is all. Then the scan of the counts into
+// offsets, which raises the overflow word when a ray had more, and the
+// chunk's total and that word copied to host memory
+inline bool record_trace(const Device& device, const Slot& slot, const Query& query, std::size_t count,
+                         std::string* reason) {
     if (!begin_commands(device, slot.command, reason)) {
         return false;
     }
-    const std::size_t count = slot.count;
-    const std::size_t dense_slots = dense(query) ? count * query.most : 0;
-    if (!traced) {
-        for (std::size_t p = 0; p < PIECES; p++) {
-            std::size_t first = 0;
-            std::size_t piece = 0;
-            piece_of(count, p, &first, &piece);
-            if (piece == 0) {
-                break;
-            }
-            device.fn.vkResetEvent(device.device, slot.events[p]);
-            // the host's writes of the piece's rays, visible to the kernel
-            VkMemoryBarrier filled{};
-            filled.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            filled.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            device.fn.vkCmdWaitEvents(slot.command, 1, &slot.events[p], VK_PIPELINE_STAGE_HOST_BIT,
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1, &filled, 0, nullptr, 0, nullptr);
-            trace_rays(device, slot, query, first, piece, dense_slots != 0 ? 2 : 0, dense_slots);
-        }
-        if (query.occlusion) {
-            return submit_commands(device, slot.command, slot.fence, reason);
-        }
-        const std::size_t blocks = scan_blocks(count);
-        ScanConstants scan{};
-        scan.count = static_cast<std::uint32_t>(count);
-        scan.block_count = static_cast<std::uint32_t>(blocks);
-        compute_barrier(device, slot.command);
-        dispatch(device, slot.command, device.scan, slot.scan_set, &scan, sizeof(scan), blocks);
-        compute_barrier(device, slot.command);
-        scan.step = 1;
-        dispatch(device, slot.command, device.scan, slot.scan_set, &scan, sizeof(scan), 1);
-        barrier(device, slot.command, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkBufferCopy region{};
-        region.srcOffset = blocks * sizeof(std::uint32_t);
-        region.size = sizeof(std::uint32_t);
-        device.fn.vkCmdCopyBuffer(slot.command, slot.blocks.buffer, slot.total.buffer, 1, &region);
-        scan.step = 2;
-        dispatch(device, slot.command, device.scan, slot.scan_set, &scan, sizeof(scan), blocks);
-        compute_barrier(device, slot.command);
+    trace_rays(device, slot, query, count, false);
+    if (query.occlusion) {
+        return submit_commands(device, slot.command, slot.fence, reason);
     }
-    if (dense_slots == 0) {
-        trace_rays(device, slot, query, 0, count, 1, slot.hit_capacity);
+    const std::size_t blocks = scan_blocks(count);
+    LayoutConstants layout{};
+    layout.count = static_cast<std::uint32_t>(count);
+    layout.block_count = static_cast<std::uint32_t>(blocks);
+    layout.dense = room_width(query);
+    for (const std::size_t groups : {blocks, std::size_t{1}, blocks}) {
         compute_barrier(device, slot.command);
+        dispatch(device, slot.command, device.layout, slot.layout_set, &layout, sizeof(layout), groups);
+        layout.step++;
     }
-    CompactConstants compact{};
-    compact.count = static_cast<std::uint32_t>(count);
-    compact.block_count = static_cast<std::uint32_t>(scan_blocks(count));
-    compact.dense = dense_slots != 0 ? query.most : 0;
-    const std::size_t slots = dense_slots != 0 ? dense_slots : slot.hit_capacity;
-    dispatch(device, slot.command, device.compact, slot.compact_set, &compact, sizeof(compact),
-             (slots + COMPACT_GROUP - 1) / COMPACT_GROUP);
+    // the total and the overflow word, after the last block
+    barrier(device, slot.command, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferCopy region{};
+    region.srcOffset = blocks * sizeof(std::uint32_t);
+    region.size = 2 * sizeof(std::uint32_t);
+    device.fn.vkCmdCopyBuffer(slot.command, slot.blocks.buffer, slot.total.buffer, 1, &region);
     return submit_commands(device, slot.command, slot.fence, reason);
 }
 
-// A chunk's rays as the caller fills them, a piece at a time: 3 doubles each,
-// the chunk starting at ray `begin` of the query
-struct Chunk {
-    double* origins;
-    double* directions;
-    std::size_t begin;
-};
+// A chunk's second submission, for its `total` crossings, the host having
+// made room for them: with `overflow`, the kernel again for the rays that
+// crossed more than their room holds, each writing every crossing at its
+// offset; then a lane per crossing writing it into the host's columns
+inline bool record_layout(const Device& device, const Slot& slot, const Query& query, std::size_t count,
+                          std::size_t total, bool overflow, std::string* reason) {
+    if (!begin_commands(device, slot.command, reason)) {
+        return false;
+    }
+    if (overflow) {
+        trace_rays(device, slot, query, count, true);
+        compute_barrier(device, slot.command);
+    }
+    LayoutConstants layout{};
+    layout.count = static_cast<std::uint32_t>(count);
+    layout.step = 3;
+    layout.block_count = static_cast<std::uint32_t>(scan_blocks(count));
+    layout.dense = room_width(query);
+    dispatch(device, slot.command, device.layout, slot.layout_set, &layout, sizeof(layout),
+             (total + LAYOUT_GROUP - 1) / LAYOUT_GROUP);
+    return submit_commands(device, slot.command, slot.fence, reason);
+}
 
 // A chunk's answers as the caller reads them
 struct Answers {
-    std::size_t begin;
-    std::size_t count;
+    std::size_t begin;               // the chunk's first ray of the query
+    std::size_t count;               // and how many
     const std::uint32_t* occlusion;  // an occlusion query: 1 or 0 per ray
     std::size_t total;               // else the chunk's crossings, nearest first by ray:
     const std::uint32_t* rays;       // the ray, counted from the chunk's first,
-    const std::uint32_t* instances;  // the instance in the top level (0 for one mesh),
-    const std::uint32_t* faces;      // the face, and the distance in the scene's units
-    const double* distances;
+    const std::uint32_t* words;      // two words: the instance in the top level (0 for one mesh) and the face,
+    const double* distances;         // and the distance in the scene's units
 };
 
-// One query over `count` rays, a chunk at a time with two in flight. After a
-// chunk is submitted, `fill(chunk, first, piece)` writes each piece's rays
-// (the device waits for each); `consume(answers)` reads a chunk's answers,
-// in order. False with the reason on any failure
+// One query over `count` rays, chunk k in slot k % SLOTS: `fill(origins,
+// directions, begin, n, steps)` writes a chunk's rays before the chunk is
+// submitted, each array as the STEP_* it names in `steps`, or returns false
+// to end the query there (rays it won't hand a device: no reason is given),
+// and `consume(answers)` reads each
+// chunk's answers, in order, while the chunks after it run. False with the
+// reason on any failure, with nothing left running on the device either way
 template <typename Fill, typename Consume>
 bool run_query(Device& device, const Query& query, std::size_t count, const Fill& fill, const Consume& consume,
                std::string* reason) {
-    const auto finish = [&](Slot& slot) -> bool {
-        slot.pending = false;
-        if (!wait(device, slot.fence, reason)) {
+    const auto rays_of = [&](std::size_t chunk) { return std::min(CHUNK, count - (chunk * CHUNK)); };
+    const VkDeviceSize word = sizeof(std::uint32_t);
+    // chunk `chunk` filled and submitted
+    const auto start = [&](std::size_t chunk) -> bool {
+        Slot& slot = device.slots[chunk % SLOTS];
+        const std::size_t n = rays_of(chunk);
+        // each ray's room, which an occlusion query never writes
+        const VkDeviceSize room = query.occlusion ? 0 : VkDeviceSize{n} * room_width(query);
+        if (!hold(device, &slot.room_words, room * 2 * word, false, reason) ||
+            !hold(device, &slot.room_distances, room * sizeof(double), false, reason)) {
+            return false;
+        }
+        bind(device, slot, query, false);
+        return fill(slot.origins.mapped, slot.directions.mapped, chunk * CHUNK, n, slot.steps) &&
+               record_trace(device, slot, query, n, reason);
+    };
+    // chunk `chunk` waited for, and with `read` its crossings laid out and its answers consumed
+    const auto finish = [&](std::size_t chunk, bool read) -> bool {
+        Slot& slot = device.slots[chunk % SLOTS];
+        if (!wait(device, slot.fence, reason) || !read) {
             return false;
         }
         Answers answers{};
-        answers.begin = slot.begin;
-        answers.count = slot.count;
+        answers.begin = chunk * CHUNK;
+        answers.count = rays_of(chunk);
         answers.occlusion = static_cast<const std::uint32_t*>(slot.occlusion.mapped);
-        if (!query.occlusion) {
-            answers.total = *static_cast<const std::uint32_t*>(slot.total.mapped);
-            if (answers.total > slot.hit_capacity) {
-                // the guess was short: room for what was counted, and the
-                // writing traversal and the compaction again
-                if (!hold_hits(device, &slot, answers.total, reason)) {
-                    return false;
-                }
-                bind(device, slot, query);
-                if (!record_chunk(device, slot, query, true, reason) || !wait(device, slot.fence, reason)) {
-                    return false;
-                }
+        const std::uint32_t* total = static_cast<const std::uint32_t*>(slot.total.mapped);
+        if (!query.occlusion && total[0] != 0) {
+            answers.total = total[0];
+            const bool overflow = total[1] != 0;
+            // room for exactly the crossings counted: the columns, and for a
+            // ray past its own room, every crossing at its offset
+            const VkDeviceSize more = overflow ? answers.total : 0;
+            if (!hold(device, &slot.rays, answers.total * word, true, reason) ||
+                !hold(device, &slot.words, answers.total * 2 * word, true, reason) ||
+                !hold(device, &slot.distances, answers.total * sizeof(double), true, reason) ||
+                !hold(device, &slot.more_words, more * 2 * word, false, reason) ||
+                !hold(device, &slot.more_distances, more * sizeof(double), false, reason)) {
+                return false;
+            }
+            bind(device, slot, query, true);
+            if (!record_layout(device, slot, query, answers.count, answers.total, overflow, reason) ||
+                !wait(device, slot.fence, reason)) {
+                return false;
             }
             answers.rays = static_cast<const std::uint32_t*>(slot.rays.mapped);
-            answers.instances = static_cast<const std::uint32_t*>(slot.instances.mapped);
-            answers.faces = static_cast<const std::uint32_t*>(slot.faces.mapped);
+            answers.words = static_cast<const std::uint32_t*>(slot.words.mapped);
             answers.distances = static_cast<const double*>(slot.distances.mapped);
         }
         consume(answers);
         return true;
     };
-    std::size_t chunks = 0;
-    for (std::size_t begin = 0; begin < count; begin += CHUNK, chunks++) {
-        Slot& slot = device.slots[chunks % SLOTS];
-        if (slot.pending && !finish(slot)) {
-            return false;
+    const std::size_t chunks = (count + CHUNK - 1) / CHUNK;
+    std::size_t started = 0;
+    std::size_t finished = 0;
+    bool working = true;
+    while (working && started < chunks) {
+        // a slot is free once the chunk SLOTS before this one has finished
+        if (started - finished == SLOTS) {
+            working = finish(finished++, true);
         }
-        const std::size_t n = std::min(CHUNK, count - begin);
-        // room for the rays, and for the crossings: exactly the dense slots,
-        // or the guess for an unbounded query, a closed surface entered and
-        // left, grown by what earlier chunks needed
-        if (!hold_rays(device, &slot, n, reason) ||
-            !hold_hits(device, &slot, dense(query) ? n * query.most : 2 * n, reason)) {
-            return false;
-        }
-        slot.begin = begin;
-        slot.count = n;
-        bind(device, slot, query);
-        if (!record_chunk(device, slot, query, false, reason)) {
-            return false;
-        }
-        slot.pending = true;
-        Chunk chunk{};
-        chunk.origins = static_cast<double*>(slot.origins.mapped);
-        chunk.directions = static_cast<double*>(slot.directions.mapped);
-        chunk.begin = begin;
-        // every event is set whatever a piece holds: the device waits for each
-        for (std::size_t p = 0; p < PIECES; p++) {
-            std::size_t first = 0;
-            std::size_t piece = 0;
-            piece_of(n, p, &first, &piece);
-            fill(chunk, first, piece);
-            device.fn.vkSetEvent(device.device, slot.events[p]);
+        if (working) {
+            working = start(started);
+            started += working ? 1 : 0;
         }
     }
-    // the older chunk first
-    for (std::size_t s = 0; s < SLOTS; s++) {
-        Slot& slot = device.slots[(chunks + s) % SLOTS];
-        if (slot.pending && !finish(slot)) {
-            return false;
+    // the chunks still in flight, oldest first: waited for even after a failure
+    while (finished < started) {
+        working = finish(finished++, working) && working;
+    }
+    for (Slot& slot : device.slots) {
+        for (Buffer* buffer : {&slot.room_words, &slot.room_distances, &slot.more_words, &slot.more_distances,
+                               &slot.rays, &slot.words, &slot.distances}) {
+            release(device, buffer);
         }
     }
-    return true;
+    return working;
 }
 
 }  // namespace trimkit::vulkan

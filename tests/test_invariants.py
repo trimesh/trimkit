@@ -423,8 +423,12 @@ def test_safe_conversions_warn_and_match(name):
                 # the same values as the exact dtype (narrowing rounded them)
                 same = np.asarray(wrong).astype(array.dtype).reshape(array.shape)
                 expected = _results(function(**{**arguments, argument: _replace(value, path, same)}))
-                with pytest.warns(UserWarning, match=f"{argument}.*converted to {array.dtype.name}"):
+                if argument in ("origins", "directions") and np.asarray(wrong).dtype == np.float32:
+                    # rays are float64 or float32: taken as they are (a warning here is an error)
                     got = _results(function(**given))
+                else:
+                    with pytest.warns(UserWarning, match=f"{argument}.*converted to {array.dtype.name}"):
+                        got = _results(function(**given))
                 for a, b in zip(got, expected, strict=True):
                     same = np.array_equal(a, b, equal_nan=True) if isinstance(a, np.ndarray) else a == b
                     assert same, (argument, how)

@@ -10,11 +10,11 @@
 // together; until then it is held as a certified interval. The crossing loop
 // runs here too: every crossing of a ray is tinybvh's nearest hit asked again
 // from just past the one before, exactly as src/bvh.cpp decides it on the
-// CPU. Bindings 14 to 16 are the f32 shadows of the nodes and triangles that
-// src/bvh.cpp's shadow_nodes and shadow_triangles build. Comments on each
+// CPU. Bindings 4, 5 and 10 are the f32 images of the nodes and triangles
+// that src/vulkan/vulkan.hpp's `walk` and src/bvh.cpp's `triangle32` build. Comments on each
 // filtered decision name the docs/trace.md section deriving its bound.
-// Compiled by `uv run scripts generate` into src/trace_spirv.hpp;
-// src/vulkan.hpp dispatches it.
+// Compiled by `uv run scripts generate` into src/vulkan/spirv.hpp;
+// src/vulkan/vulkan.hpp dispatches it.
 #version 460
 #extension GL_ARB_gpu_shader_fp64 : require
 
@@ -25,34 +25,37 @@
 // 32 bytes. 64-bit indices are read as the low word of a uvec2: the device
 // path takes meshes under 2^32 vertices and faces, src/bvh.cpp checks
 layout(set = 0, binding = 0, std430) readonly buffer NodeBuffer { uvec4 nodes[]; };
-layout(set = 0, binding = 1, std430) readonly buffer PrimitiveBuffer { uvec2 primitives[]; };
-layout(set = 0, binding = 2, std430) readonly buffer CornerBuffer { uvec2 corners[]; };
-layout(set = 0, binding = 3, std430) readonly buffer VertexBuffer { double vertices[]; };
-layout(set = 0, binding = 4, std430) readonly buffer MeshBuffer { uvec4 meshes[]; };
+layout(set = 0, binding = 1, std430) readonly buffer CornerBuffer { uvec2 corners[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VertexBuffer { double vertices[]; };
+layout(set = 0, binding = 3, std430) readonly buffer MeshBuffer { uvec4 meshes[]; };
 // The top level: its nodes in the same layout, its primitives (instance
 // indices), and per instance the inverse transform (16 doubles, row major as
 // tinybvh keeps it) and the mesh it places
-layout(set = 0, binding = 5, std430) readonly buffer TopNodeBuffer { uvec4 top_nodes[]; };
-layout(set = 0, binding = 6, std430) readonly buffer TopPrimitiveBuffer { uvec2 top_primitives[]; };
-layout(set = 0, binding = 7, std430) readonly buffer InverseBuffer { double inverses[]; };
-layout(set = 0, binding = 8, std430) readonly buffer InstanceMeshBuffer { uint instance_meshes[]; };
-// One chunk of rays: origins and directions, 3 doubles each, read from the
-// host's own memory (a `broadcast` bit reads row 0 for every ray). Pass 0
-// counts each ray's crossings into `counts` (for occlusion, 1 or 0);
-// src/scan.comp turns the counts into each ray's offset in `hit_offsets`, and
-// pass 1 writes the crossings, nearest first, from that offset: the instance
-// in the top level (0 for one mesh), the face, and the distance in the
-// scene's units; a crossing past `capacity` is counted, not written. Pass 2
-// does both in one traversal for a small `most`: the count, and the
-// crossings dense from `r * most`; src/compact.comp gathers them. Each
-// crossing's ray follows from the counts, so none is written
-layout(set = 0, binding = 9, std430) readonly buffer OriginBuffer { double origins[]; };
-layout(set = 0, binding = 10, std430) readonly buffer DirectionBuffer { double directions[]; };
-layout(set = 0, binding = 11, std430) writeonly buffer InstanceBuffer { uint hit_instances[]; };
-layout(set = 0, binding = 12, std430) writeonly buffer FaceBuffer { uint hit_faces[]; };
-layout(set = 0, binding = 13, std430) writeonly buffer DistanceBuffer { double distances[]; };
-layout(set = 0, binding = 17, std430) writeonly buffer CountBuffer { uint counts[]; };
-layout(set = 0, binding = 18, std430) readonly buffer OffsetBuffer { uint hit_offsets[]; };
+layout(set = 0, binding = 6, std430) readonly buffer TopNodeBuffer { uvec4 top_nodes[]; };
+layout(set = 0, binding = 7, std430) readonly buffer TopPrimitiveBuffer { uvec2 top_primitives[]; };
+layout(set = 0, binding = 8, std430) readonly buffer InverseBuffer { double inverses[]; };
+layout(set = 0, binding = 9, std430) readonly buffer InstanceMeshBuffer { uint instance_meshes[]; };
+// One chunk of rays: origins and directions, read from the host's own memory
+// as words, each array laid out as its `step` says, the words from one ray's
+// row to the next: 6, a float64 row each; 3, a float32 row each, which the
+// host chose because every value is exactly a float32 (and zero or normal),
+// so widening it here gives the same double; 0, one float64 row for every
+// ray. Each
+// ray's crossings are counted into `counts` (for occlusion, 1 or 0) and the
+// first `dense` of them written to the ray's room, from `r * dense`, nearest
+// first: two words, the instance in the top level (0 for one mesh) and the
+// face, and the distance in the scene's units. src/vulkan/layout.comp turns
+// the counts into each ray's offset in `hit_offsets`; then, with `retrace`,
+// a ray that crossed more than its room holds is traced again and writes
+// every crossing from that offset, into room for exactly the chunk's counted
+// total (other rays return at once). Each crossing's ray follows from the
+// counts, so none is written
+layout(set = 0, binding = 11, std430) readonly buffer OriginBuffer { uint origins[]; };
+layout(set = 0, binding = 12, std430) readonly buffer DirectionBuffer { uint directions[]; };
+layout(set = 0, binding = 13, std430) writeonly buffer HitBuffer { uvec2 hit_words[]; };
+layout(set = 0, binding = 14, std430) writeonly buffer DistanceBuffer { double distances[]; };
+layout(set = 0, binding = 15, std430) buffer CountBuffer { uint counts[]; };
+layout(set = 0, binding = 16, std430) readonly buffer OffsetBuffer { uint hit_offsets[]; };
 // The f32 shadow of a node, indexed like `nodes`: the box rounded to nearest,
 // the same leftFirst, and for a leaf its triangle count; for an interior node
 // bit 31 and a 6-bit tie mask saying which f64 box coordinates its two children
@@ -78,26 +81,25 @@ struct Tri32 {
     vec3 n;
     float spare;
 };
-layout(set = 0, binding = 14, std430) readonly buffer Node32Buffer { Node32 node32[]; };
-layout(set = 0, binding = 15, std430) readonly buffer Tri32Buffer { Tri32 tri32[]; };
-layout(set = 0, binding = 16, std430) readonly buffer TopNode32Buffer { Node32 top_node32[]; };
+layout(set = 0, binding = 4, std430) readonly buffer Node32Buffer { Node32 node32[]; };
+layout(set = 0, binding = 5, std430) readonly buffer Tri32Buffer { Tri32 tri32[]; };
+layout(set = 0, binding = 10, std430) readonly buffer TopNode32Buffer { Node32 top_node32[]; };
 
 // `mode`: 0 traces one mesh (`mesh`), 1 the top level; `occlusion`: 1 answers
 // only whether anything is hit; `most`: the most crossings per ray;
-// `pass_index`: 0 counts, 1 writes at the offsets, 2 counts and writes dense;
-// `capacity`: crossings the hit buffers hold; `broadcast`: bit 0 every ray
-// starts at origins[0], bit 1 every ray goes along directions[0]
+// `origin_step`, `direction_step`: how the chunk holds each array, as above;
+// `dense`: the crossings per ray its room holds;
+// `retrace`: 1 traces only the rays with more, each writing at its offset
 layout(push_constant) uniform Constants {
-    uint ray_count;  // rays in this dispatch, from `ray_first` of the chunk
+    uint ray_count;  // rays in the chunk
     uint mode;
     uint mesh;
     uint occlusion;
     uint most;
-    uint pass_index;
-    uint ray_first;
-    uint capacity;
-    uint broadcast;
-    uint padding;
+    uint origin_step;
+    uint direction_step;
+    uint dense;
+    uint retrace;
     double extent;  // the scene's size, in its units
 };
 
@@ -153,6 +155,15 @@ float abs_sum(vec3 v) { return abs(v.x) + abs(v.y) + abs(v.z); }
 float round_up(float x) { return (x > 0.0 ? x * (1.0 + 2.0 * TWO_U) : x * (1.0 - 2.0 * TWO_U)) + FLOOR; }
 float round_down(float x) { return (x > 0.0 ? x * (1.0 - 2.0 * TWO_U) : x * (1.0 + 2.0 * TWO_U)) - FLOOR; }
 bool sign_bit(double x) { return (unpackDouble2x32(x).y & 0x80000000u) != 0u; }
+// +0 or -0, by its bits
+bool is_zero(double x) {
+    const uvec2 words = unpackDouble2x32(x);
+    return ((words.y & 0x7fffffffu) | words.x) == 0u;
+}
+// x moved 8 ulps and the flush floor down, or up: past what a float conversion in either
+// rounding mode and this arithmetic's own rounding can move it (3.6)
+float well_below(float x) { return (x > 0.0 ? x * (1.0 - 8.0 * TWO_U) : x * (1.0 + 8.0 * TWO_U)) - FLOOR; }
+float well_above(float x) { return (x > 0.0 ? x * (1.0 + 8.0 * TWO_U) : x * (1.0 - 8.0 * TWO_U)) + FLOOR; }
 
 // tinybvh_safercp: a reciprocal bounded to +-2^1000, with x's sign bit as
 // copysign gives it: a -0.0 component makes a negative bound
@@ -174,6 +185,9 @@ struct Ray {
     double Sx, Sy, Sz;  // tinybvh's shear constants in f64
     vec3 O32, D32, rD32, ro32;
     bvec3 positive;     // tinybvh's posX/Y/Z: the sign bit of D clear
+    bvec3 zero;         // D is +-0 on this axis: decided by where O lies between the planes (3.6)
+    vec3 in_lo, in_hi;    // on a zero axis O32 well below and well above; else +inf and -inf
+    vec3 out_lo, out_hi;  // on a zero axis O32 well above and well below; else +inf and -inf
     float Sx32, Sy32;
     float omega;        // max |O32|
     float slab_bound;   // E: every f32 slab value is within E of its f64 value (3.2)
@@ -209,10 +223,18 @@ Ray make_ray(double ox, double oy, double oz, double dx, double dy, double dz, v
 
     ray.O32 = vec3(float(ox), float(oy), float(oz));
     ray.D32 = vec3(float(dx), float(dy), float(dz));
+    // A zero component (3.6) takes no part in the slab arithmetic: its reciprocal here is 0
+    ray.zero = bvec3(is_zero(dx), is_zero(dy), is_zero(dz));
     // Reciprocal (3.1): rD32 = 1/D32 certified by its residual r = rD32*D32 - 1, |r| <= 4u,
     // which puts rD32 within 7u of tinybvh's f64 reciprocal relative to itself
-    ray.rD32 = 1.0 / ray.D32;
-    precise vec3 residual = fma(ray.rD32, ray.D32, vec3(-1.0));
+    ray.rD32 = mix(1.0 / ray.D32, vec3(0.0), ray.zero);
+    precise vec3 residual = mix(fma(ray.rD32, ray.D32, vec3(-1.0)), vec3(0.0), ray.zero);
+    const vec3 lowered = vec3(well_below(ray.O32.x), well_below(ray.O32.y), well_below(ray.O32.z));
+    const vec3 raised = vec3(well_above(ray.O32.x), well_above(ray.O32.y), well_above(ray.O32.z));
+    ray.in_lo = mix(vec3(infinity()), lowered, ray.zero);
+    ray.in_hi = mix(vec3(-infinity()), raised, ray.zero);
+    ray.out_lo = mix(vec3(infinity()), raised, ray.zero);
+    ray.out_hi = mix(vec3(-infinity()), lowered, ray.zero);
     ray.ro32 = ray.O32 * ray.rD32;
     ray.Sx32 = pick(ray.D32, kx) * pick(ray.rD32, kz);
     ray.Sy32 = pick(ray.D32, ky) * pick(ray.rD32, kz);
@@ -224,10 +246,14 @@ Ray make_ray(double ox, double oy, double oz, double dx, double dy, double dz, v
     vec3 arD = abs(ray.rD32), aro = abs(ray.ro32);
     vec3 E = TWO_U * (11.0 * (B * arD + aro)) + FLOOR * (B + 2.0 * arD + ray.omega + 5.0);
     ray.slab_bound = max(max(E.x, E.y), E.z);
-    // Guards (3.5): a zero or tiny direction component (tinybvh clamps its reciprocal), a
-    // slab product that could overflow, or a non-finite bound: every decision exact
+    // Guards (3.5, 3.6): a tiny direction component (tinybvh clamps its reciprocal), a slab
+    // product that could overflow, a non-finite bound, every component zero, or a zero
+    // component whose origin is 2^24 or more from the frame's own (there tinybvh's O * 2^1000
+    // overflows): every decision exact
     bool ok = all(lessThanEqual(abs(residual), vec3(RESIDUAL_LIMIT))) && all(lessThan(B * arD + aro, vec3(SLAB_RANGE)))
-              && all(greaterThanEqual(abs(ray.D32), vec3(TINY_DIRECTION))) && !isinf(ray.slab_bound) && !isnan(ray.slab_bound);
+              && all(greaterThanEqual(mix(abs(ray.D32), vec3(1.0), ray.zero), vec3(TINY_DIRECTION)))
+              && !all(ray.zero) && all(lessThan(mix(vec3(0.0), ao, ray.zero), vec3(16777216.0)))
+              && !isinf(ray.slab_bound) && !isnan(ray.slab_bound);
     ray.exact_only = !ok;
     return ray;
 }
@@ -355,8 +381,18 @@ bool child_test(bool top, uint c1, uint c2, uint tie_mask, const Ray ray, const 
     Node32 b = top ? top_node32[c2] : node32[c2];
     vec3 entry_a = mix(a.hi, a.lo, ray.positive), exit_a = mix(a.lo, a.hi, ray.positive);
     vec3 entry_b = mix(b.hi, b.lo, ray.positive), exit_b = mix(b.lo, b.hi, ray.positive);
-    vec3 t1a = entry_a * ray.rD32 - ray.ro32, t2a = exit_a * ray.rD32 - ray.ro32;
-    vec3 t1b = entry_b * ray.rD32 - ray.ro32, t2b = exit_b * ray.rD32 - ray.ro32;
+    // A zero axis (3.6) leaves the slab arithmetic: -inf and +inf never decide a max or a min
+    vec3 t1a = mix(entry_a * ray.rD32 - ray.ro32, vec3(-infinity()), ray.zero);
+    vec3 t2a = mix(exit_a * ray.rD32 - ray.ro32, vec3(infinity()), ray.zero);
+    vec3 t1b = mix(entry_b * ray.rD32 - ray.ro32, vec3(-infinity()), ray.zero);
+    vec3 t2b = mix(exit_b * ray.rD32 - ray.ro32, vec3(infinity()), ray.zero);
+    // and decides by where the origin lies between that axis's planes: certainly outside is a
+    // miss whatever the other axes say, certainly inside leaves the decision to them, and
+    // within the margin of a plane is not certain. Without a zero axis: never outside, inside
+    bool out_a = any(greaterThan(a.lo, ray.out_lo)) || any(lessThan(a.hi, ray.out_hi));
+    bool out_b = any(greaterThan(b.lo, ray.out_lo)) || any(lessThan(b.hi, ray.out_hi));
+    bool in_a = all(lessThan(a.lo, ray.in_lo)) && all(greaterThan(a.hi, ray.in_hi));
+    bool in_b = all(lessThan(b.lo, ray.in_lo)) && all(greaterThan(b.hi, ray.in_hi));
     float tmina = max(max(t1a.x, t1a.y), max(t1a.z, 0.0));
     float tminb = max(max(t1b.x, t1b.y), max(t1b.z, 0.0));
     float tmaxa = min(min(t2a.x, t2a.y), min(t2a.z, best.t32));
@@ -367,9 +403,9 @@ bool child_test(bool top, uint c1, uint c2, uint tie_mask, const Ray ray, const 
     float E = ray.slab_bound;
     float gap_bound = E + max(E, best.hit_bound);
     float gap_a = tmaxa - tmina, gap_b = tmaxb - tminb;
-    bool sure = abs(gap_a) > gap_bound && abs(gap_b) > gap_bound;
-    hit1 = gap_a > 0.0;
-    hit2 = gap_b > 0.0;
+    bool sure = (out_a || (in_a && abs(gap_a) > gap_bound)) && (out_b || (in_b && abs(gap_b) > gap_bound));
+    hit1 = !out_a && gap_a > 0.0;
+    hit2 = !out_b && gap_b > 0.0;
     swap = false;
     if (sure && hit1 && hit2) {
         // Order (3.4): dist1 > dist2 is certain when the f32 difference exceeds 2E
@@ -678,6 +714,12 @@ bool trace_top(uint lane, const Ray ray, bool occlusion, inout Best best) {
     return false;
 }
 
+// component `c` of ray `r` of an array of rays laid out by `step`: a float32 word widened, or
+// the two words of a float64, low word first
+#define RAY_VALUE(words, step, r, c)                                                                    \
+    ((step) == 3u ? double(uintBitsToFloat(words[(r) * 3u + (c)]))                                      \
+                  : packDouble2x32(uvec2(words[(r) * (step) + 2u * (c)], words[(r) * (step) + 2u * (c) + 1u])))
+
 double direction_length(double dx, double dy, double dz) {
     const double x = abs(dx), y = abs(dy), z = abs(dz);
     const double largest = x < y ? (y < z ? z : y) : (x < z ? z : x);
@@ -692,29 +734,31 @@ double direction_length(double dx, double dy, double dz) {
 }
 
 void main() {
-    const uint local = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP_SIZE) + gl_GlobalInvocationID.x;
+    // groups in two dimensions: a device may cap one dimension at 65535
+    const uint r = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP_SIZE) + gl_GlobalInvocationID.x;
     const uint lane = gl_LocalInvocationIndex;
-    if (local >= ray_count) {
+    if (r >= ray_count) {
         return;
     }
-    const uint r = ray_first + local;
+    // tracing again: only a ray with more crossings than its room held
+    if (retrace != 0u && counts[r] <= dense) {
+        return;
+    }
     const bool top = mode != 0u;
     // the world ray's shadow is bounded by the tree it traverses first: the top level's
     // root, or the one mesh's
     const vec3 B = root_box(top ? top_node32[0] : node32[meshes[mesh].x]);
-    const uint o = (broadcast & 1u) != 0u ? 0u : r * 3u;
-    const uint d = (broadcast & 2u) != 0u ? 0u : r * 3u;
-    const double ox = origins[o], oy = origins[o + 1u], oz = origins[o + 2u];
-    const double dx = directions[d], dy = directions[d + 1u], dz = directions[d + 2u];
+    const double ox = RAY_VALUE(origins, origin_step, r, 0u), oy = RAY_VALUE(origins, origin_step, r, 1u);
+    const double oz = RAY_VALUE(origins, origin_step, r, 2u);
+    const double dx = RAY_VALUE(directions, direction_step, r, 0u), dy = RAY_VALUE(directions, direction_step, r, 1u);
+    const double dz = RAY_VALUE(directions, direction_step, r, 2u);
     // the direction's length, as src/bvh.cpp's `length` measures it (libstdc++'s
     // hypot written out: the same IEEE operations here and there), which the
     // scene's size and the distances are in
     const double scale = direction_length(dx, dy, dz);
     if (scale == 0.0LF) {
         // a ray without a direction goes nowhere and hits nothing
-        if (pass_index != 1u) {
-            counts[r] = 0u;
-        }
+        counts[r] = 0u;
         return;
     }
     // the scene's size in the direction's units, as the CPU divides it
@@ -736,7 +780,7 @@ void main() {
     // found, unless the traversal started there
     precise double along = 0.0LF, step = 0.0LF, last_t = 0.0LF;
     uint last_instance = MISS, last_face = MISS, emitted = 0u;
-    const uint at = pass_index == 1u ? hit_offsets[r] : r * most;
+    const uint at = retrace != 0u ? hit_offsets[r] : r * dense;
     while (emitted < most) {
         precise double mx = ox + dx * along, my = oy + dy * along, mz = oz + dz * along;
         const Ray ray = make_ray(mx, my, mz, dx, dy, dz, B);
@@ -776,10 +820,9 @@ void main() {
                 t = along + best.t;
             }
         }
-        if (pass_index != 0u && at + emitted < capacity) {
+        if (retrace != 0u || emitted < dense) {
             // the distance in the scene's units: t * scale, as the CPU multiplies
-            hit_instances[at + emitted] = instance;
-            hit_faces[at + emitted] = best.face;
+            hit_words[at + emitted] = uvec2(instance, best.face);
             precise double scaled = t * scale;
             distances[at + emitted] = scaled;
         }
@@ -790,7 +833,5 @@ void main() {
         step = RELATIVE_STEP * max(scene, abs(t));
         along = t + step;
     }
-    if (pass_index != 1u) {
-        counts[r] = emitted;
-    }
+    counts[r] = emitted;
 }

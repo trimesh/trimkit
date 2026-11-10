@@ -1,6 +1,6 @@
 # The device traversal's error bounds
 
-Why `src/trace.comp` answers byte for byte what tinybvh answers on the CPU while
+Why `src/vulkan/trace.comp` answers byte for byte what tinybvh answers on the CPU while
 running most of its arithmetic in f32: the model, every filtered decision's bound,
 and what is assumed. The shader's comments name these sections; the f32 shadow
 data the bounds rely on is built by `shadow_nodes` and `shadow_triangles` in
@@ -10,17 +10,26 @@ identical; zero mismatches in instance, face and the 64 bits of the distance on
 about 4 million random and adversarial rays, with and without instances
 (tests/test_gpu.py and tests/test_golden.py keep checking).
 
-How the kernel is driven (src/vulkan.hpp): rays go to the device in chunks of
-up to 4M, two in flight, each chunk one submission. The shader reads the rays
-from mapped host memory, filled a piece at a time behind events so the copy
-overlaps the tracing; when every ray shares one origin or one direction the host
-fills one row and the shader reads it for all (`broadcast`). One traversal per
-ray counts its crossings (the crossing loop of src/bvh.cpp's `settle`, run in
-the shader) and, for `maximum_hits` up to 4, writes them dense in the same pass;
-src/scan.comp turns the counts into offsets on the device, an unbounded query
-traces again writing each crossing at its offset, and src/compact.comp writes
-the crossings compacted and in ray order into mapped host columns the host
-widens to int64. Nothing per ray crosses the host between those steps.
+How the kernel is driven (src/vulkan/vulkan.hpp): rays go to the device in chunks of
+a quarter million, two in flight so the host fills one and reads another while
+the device traces a third. The host writes a chunk's rays into mapped host
+memory, checking each value as it copies it, and then submits; the shader reads
+them from there. Host memory is never written while a submission that reads it
+runs: an earlier scheme filled a chunk piece by piece behind events while it
+traced, and an RTX 3090 answered a piece's first ray from bytes it had fetched
+before the host wrote them, whenever a piece began inside a 32-byte block the
+piece before ended in (tests/test_gpu.py pins it). Each array of rays is laid
+out by one word, the words from one ray's row to the next: 0 for one row for
+every ray, 3 for float32 rows (the array was float32, or every value of it is
+exactly one, zero or normal), 6 for float64 rows. One traversal per ray counts
+its crossings (the crossing loop of src/bvh.cpp's `settle`, run in the shader)
+and writes its first 32 into the ray's own room; src/vulkan/layout.comp turns
+the counts into offsets on the device, raising a word when a ray had more. The
+host reads back the chunk's total and that word, makes room for exactly that
+many crossings, and a second submission traces again only the rays that
+crossed more than 32 times, each writing every crossing at its offset, then
+writes the crossings compacted and in ray order into mapped host columns the
+host widens to int64. A chunk with no crossings skips the second submission.
 
 ## 1. Summary
 
@@ -56,7 +65,7 @@ mismatches in prim or in the bits of t on 1M random rays and on every adversaria
 ### 2.1 What the CPU computes
 IEEE-754 binary64, round to nearest even, unit roundoff u64 = 2^-53, no FMA
 (`-ffp-contract=off`; tinybvh's `tinybvh_fma(double)` is `a * b + c`), denormals kept
-(a denormal result has absolute error <= 2^-1075). Every f64 expression in `src/trace.comp`'s
+(a denormal result has absolute error <= 2^-1075). Every f64 expression in `src/vulkan/trace.comp`'s
 exact paths is the same expression in the same order marked `precise`, so the device computes
 the same bits (verified on 10M rays before the filter was added).
 
@@ -131,8 +140,8 @@ with `|e| <= 5.1u`, and with `D' = D (1 + d)`, `|d| <= u`, and tinybvh's `rD = (
 ```
 |rD' - rD| <= 5.1u/|D'| + 1.01u/|D| + u64/|D| <= 6.3u |rD'|          (3.1a)
 ```
-The shader uses 7u. Rays failing the residual test (D_k = +-0 gives rD' = +-inf and r = NaN;
-tinybvh clamps those) run every decision exact (`exact_only`).
+The shader uses 7u. A component `D_k = +-0` is not divided at all (3.6); a ray failing the
+residual test on any other component runs every decision exact (`exact_only`).
 
 ### 3.2 The slab bound E
 Per axis k let B_k = max(|root.lo'_k|, |root.hi'_k|) from the f32 root box. Rounding is
@@ -199,13 +208,50 @@ One child certain hit and the other uncertain, or either uncertain: the whole pa
 f64 ray state is kept in registers for it).
 
 ### 3.5 Per-ray guards (`exact_only`)
-All decisions of a ray are exact when any of: the residual test fails (D_k = +-0, NaN, or an
-inaccurate division); `B_k |rD'_k| + |ro'_k| >= 2^125` for some k (the slab products could
-overflow, which the model excludes: then `|b' rD'| <= 2^125` and `|t'| <= 2^126`); some
-`|D'_k| < 2^-100` (a denormal `D'_kx` flushed inside `Sx' = D'_kx rD'_kz` would cost up to
-`L |rD'_kz|`, which with `|D'_kz| >= 2^-100` is below 2^-26 = 0.25u and is absorbed in 4.2;
-below that it is not); E not finite. Axis-aligned rays therefore run exact (slow but
-identical); the adversarial sets include 20000 of them.
+All decisions of a ray are exact when any of: the residual test fails on a non-zero component
+(NaN, or an inaccurate division); `B_k |rD'_k| + |ro'_k| >= 2^125` for some k (the slab
+products could overflow, which the model excludes: then `|b' rD'| <= 2^125` and
+`|t'| <= 2^126`); some non-zero `|D'_k| < 2^-100` (a denormal `D'_kx` flushed inside
+`Sx' = D'_kx rD'_kz` would cost up to `L |rD'_kz|`, which with `|D'_kz| >= 2^-100` is below
+2^-26 = 0.25u and is absorbed in 4.2; below that it is not); E not finite; every component
+zero; or a zero component with `|O'_k| >= 2^24` (3.6).
+
+### 3.6 A zero direction component
+Axis-aligned rays are the common case of an orthographic view, so a component `D_k = +-0`
+(by its f64 bits: a tiny non-zero one is 3.5's) is certified separately, without its slab
+arithmetic. tinybvh computes that axis with `R = +-2^1000` (its clamped reciprocal, the sign
+the zero's), `ro = fl(O_k R)` and `t = fl(b R - ro)` for the entry and exit planes b.
+
+With `|O_k| < 2^24`, `O_k R` is exact and finite, so t is never NaN: `b R` is exact or an
+infinity of b's sign, and the difference has the sign of `(b - O_k) R`, zero only for
+`b = O_k`.
+
+*The margin.* The shader has `O'_k = float(O_k)`, converted in a rounding mode Vulkan does
+not fix, and `lo'_k`, `hi'_k` rounded to nearest on the host. Let `below(x)` and `above(x)`
+move x by 8 ulps and 2^-120, as the shader computes them (two operations, each within an
+ulp, and operands flushed by less than 2^-126). Then `lo'_k < below(O'_k)` puts a float
+strictly between `lo'_k` and `O'_k`: so `lo_k` is under the midpoint above `lo'_k`, `O_k` is
+over the float below `O'_k`, and `O_k - lo_k` exceeds half an ulp of a float, at least
+2^-150. The same for `hi'_k > above(O'_k)`, and for the two outside comparisons.
+
+*Certainly inside*, `lo'_k < below(O'_k)` and `hi'_k > above(O'_k)`: tinybvh's entry value
+on the axis is at most `-2^850` and its exit value at least `2^850`, for either sign of the
+zero (a negative zero swaps the planes and the sign of R together). Some component is not
+zero, and its exit value is under 2^127 (3.5), so the axis decides neither
+`tmin = max(.., 0)` nor `tmax = min(.., hit.t)`: both are those of the other axes, and E
+bounds them as before. The shader gives the axis `-inf` and `+inf`, which decide neither.
+
+*Certainly outside*, `lo'_k > above(O'_k)` or `hi'_k < below(O'_k)`: tinybvh's entry and exit
+values on the axis are both at least `2^850` or both at most `-2^850`, so `tmin >= 2^850`
+over a `tmax < 2^127`, or `tmax <= -2^850 < 0 <= tmin`: a miss, whatever the other axes say.
+
+*Otherwise* the origin is within the margin of a plane, and the pair of children is tested
+exactly.
+
+The tie proofs of 3.4 never name a zero axis: its entry value `-inf` is never within E of
+`tmin`. The triangle test needs nothing new: `D'_k = D_k = 0` exactly, a zero `D'_kx` makes
+`Sx' = 0 = Sx` exactly (so 4.2's bound holds with room), and `kz` is the largest component,
+never a zero one unless all three are (3.5).
 
 ## 4. The triangle test: rejection
 
@@ -450,8 +496,8 @@ both excluded from certificates (5.1), so exact.
   inputs; a flushed denormal in `min(t2', hit32)` or `max(t1', 0)` would move the value by
   < 2^-126, which every bound's FLOOR term (>= 2^-120) exceeds.
 - Not covered by the certificates (always exact, correct but at f64 speed): rays with a
-  direction component of exactly 0, of magnitude below 2^-100, or whose slab products exceed
-  2^125; rays with |O| so large that the bound exceeds the triangles (around 1e3 to 1e4 scene
+  non-zero direction component of magnitude below 2^-100, with a zero one and an origin 2^24
+  or more out on that axis, or whose slab products exceed 2^125; rays with |O| so large that the bound exceeds the triangles (around 1e3 to 1e4 scene
   extents on this mesh) run their triangle tests exact; rays through vertices and edges run
   the hit triangle(s) exact (that is the correct fallback, not a gap).
 - Host-side bounds (`radius`, `nu`) are computed in f64 by `shadow_triangles` and inflated by
