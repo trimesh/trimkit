@@ -693,6 +693,10 @@ def shader(write: bool) -> None:
             words = memoryview(binary.read_bytes()).cast("I")
             rows = [", ".join(f"0x{w:08x}" for w in words[i : i + 8]) for i in range(0, len(words), 8)]
             name = f"{source.stem.upper()}_SPIRV"
+            # the numbers a shader defines, as the host must agree with them
+            defines = re.findall(r"^#define (\w+) (\d+)u?$", source.read_text(), flags=re.MULTILINE)
+            for define, value in defines:
+                arrays.append(f"inline constexpr std::uint32_t {source.stem.upper()}_{define} = {value};\n")
             words = ",\n    ".join(rows)
             arrays.append(f"inline constexpr std::uint32_t {name}[] = {{\n    {words},\n}};\n")
     digests = [(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sources]

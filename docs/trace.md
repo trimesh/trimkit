@@ -2,34 +2,31 @@
 
 Why `src/vulkan/trace.comp` answers byte for byte what tinybvh answers on the CPU while
 running most of its arithmetic in f32: the model, every filtered decision's bound,
-and what is assumed. The shader's comments name these sections; the f32 shadow
-data the bounds rely on is built by `shadow_nodes` and `shadow_triangles` in
-src/bvh.cpp. Measured on an RTX 3090 (2026-11): 2.7 ms per million rays against
-10.3 ms for the all-f64 kernel and 2.3 ms for a pure-f32 kernel that is not
-identical; zero mismatches in instance, face and the 64 bits of the distance on
-about 4 million random and adversarial rays, with and without instances
-(tests/test_gpu.py and tests/test_golden.py keep checking).
+and what is assumed. The shader's comments name these sections. The f32 data the
+bounds rely on is built on the host: each node's image by `node_images` in
+src/vulkan/vulkan.hpp, each triangle's by `triangle32` in src/bvh.cpp.
+
+Checked, not assumed: tests/test_gpu.py compares the device with the CPU byte for
+byte on random and adversarial rays, with and without instances, and
+tests/test_golden.py holds both to one corpus of hashed answers. What it costs
+against the CPU is `bench/rays.py`; the README has its table.
 
 How the kernel is driven (src/vulkan/vulkan.hpp): rays go to the device in chunks of
-a quarter million, two in flight so the host fills one and reads another while
-the device traces a third. The host writes a chunk's rays into mapped host
-memory, checking each value as it copies it, and then submits; the shader reads
-them from there. Host memory is never written while a submission that reads it
-runs: an earlier scheme filled a chunk piece by piece behind events while it
-traced, and an RTX 3090 answered a piece's first ray from bytes it had fetched
-before the host wrote them, whenever a piece began inside a 32-byte block the
-piece before ended in (tests/test_gpu.py pins it). Each array of rays is laid
-out by one word, the words from one ray's row to the next: 0 for one row for
-every ray, 3 for float32 rows (the array was float32, or every value of it is
-exactly one, zero or normal), 6 for float64 rows. One traversal per ray counts
-its crossings (the crossing loop of src/bvh.cpp's `settle`, run in the shader)
-and writes its first 32 into the ray's own room; src/vulkan/layout.comp turns
-the counts into offsets on the device, raising a word when a ray had more. The
-host reads back the chunk's total and that word, makes room for exactly that
-many crossings, and a second submission traces again only the rays that
-crossed more than 32 times, each writing every crossing at its offset, then
-writes the crossings compacted and in ray order into mapped host columns the
-host widens to int64. A chunk with no crossings skips the second submission.
+a quarter million, two in flight, each chunk one submission. The host writes a
+chunk's rays into mapped host memory, checking each value as it copies it, and
+then submits; the shader reads them from there. Host memory is written only
+before the submission that reads it. Each array of rays is laid out by one word,
+the words from one ray's row to the next: 0 for one row for every ray, 3 for
+float32 rows (the array was float32, or every value of it is exactly one, zero
+or normal), 6 for float64 rows. The kernel runs each ray's whole crossing loop
+(src/bvh.cpp's `crossings`, operation for operation), counts its crossings and
+appends each one to the chunk's log on the device, in whatever order the lanes
+run. src/vulkan/layout.comp scans the counts into offsets, gives each log entry
+its slot in ray order, and writes the crossings into mapped host columns, a lane
+per slot; the dispatches that do that are sized by the device from its own
+count. The host reads the count back and widens the columns into the result.
+When more crossings were counted than the log holds, nothing was laid out: the
+host makes the log large enough and submits the chunk again.
 
 ## 1. Summary
 
@@ -37,7 +34,7 @@ Reference: `BVH<double, uint64_t>::IntersectOctant` / `IsOccludedOctant` with
 `WATERTIGHT_TRITEST` (Woop's test), compiled without FMA contraction. Every decision that
 traversal makes is a comparison of f64 values:
 
-| decision | tinybvh | apex |
+| decision | tinybvh | the kernel |
 |---|---|---|
 | child hit: `tmax >= tmin` | f64 slab test | f32 slab test + bound E (3.2); exact if the gap is within the bound |
 | child order: `dist1 > dist2` | f64 | f32 + 2E; equality proofs for ties (3.4); exact otherwise |
@@ -55,10 +52,7 @@ not at acceptance (where the lanes of a warp disagree about whether they need it
 warp-level f64 instruction costs the same with one lane active as with thirty-two), but at
 the end of the traversal, all lanes together. Until then the accepted triangle is held as a
 certified interval around an accurate f32 estimate; a decision the interval cannot settle
-resolves it on the spot. Measured on the RTX 3090: apex is 1.17x the pure-f32 kernel at 1M
-rays (1.24x at 100k, 1.11x at 10M), 3.3 to 4.2x faster than the exact kernel, with zero
-mismatches in prim or in the bits of t on 1M random rays and on every adversarial set
-(padded and unpadded trees), nearest and occlusion.
+resolves it on the spot.
 
 ## 2. The arithmetic model
 
@@ -378,7 +372,7 @@ n64_x = fl64(fl64(e1_y e2_z) - fl64(e1_z e2_y)):
 |n'_x - n_x| <= that + u |n64_x|
 nu = max_k [4 u64 (|e1_i||e2_j| + |e1_j||e2_i|) + 2 u64 |n64_k| + u |n64_k|] * (1 + 2^-20), rounded up
 ```
-(`shadow_triangles` in src/bvh.cpp; the `(1 + 2^-20)` covers that arithmetic's own rounding.)
+(`triangle32` in src/bvh.cpp; the `(1 + 2^-20)` covers that arithmetic's own rounding.)
 
 Shadows: `C' = fl(v0' - O')` (`|C'_k - C_k| <= alpha = 2.02uM + 3L`, where here C_k is the exact
 real difference; `|C'_k| <= 1.02M`), `D' = fl32(D)` (`|D'_k - D_k| <= u|D_k|`, no flush in
@@ -500,14 +494,13 @@ both excluded from certificates (5.1), so exact.
   or more out on that axis, or whose slab products exceed 2^125; rays with |O| so large that the bound exceeds the triangles (around 1e3 to 1e4 scene
   extents on this mesh) run their triangle tests exact; rays through vertices and edges run
   the hit triangle(s) exact (that is the correct fallback, not a gap).
-- Host-side bounds (`radius`, `nu`) are computed in f64 by `shadow_triangles` and inflated by
+- Host-side bounds (`radius`, `nu`) are computed in f64 by `triangle32` and inflated by
   `(1 + 2^-20)` and one `nextafter`; this covers that arithmetic's own roundings.
-- The identity argument assumes the scene has fewer than 2^32 vertices, faces and nodes
-  together (indices are read as the low word of tinybvh's u64; src/bvh.cpp refuses the
-  device past that), and a chunk fewer than 2^32 crossings (offsets are u32).
+- Indices are 32-bit on the device. `node_images` refuses a tree of 2^31 nodes or leaf
+  slots, and arrays past what the device binds are refused at upload, so the CPU answers
+  those scenes. A chunk is assumed to have fewer than 2^32 crossings (its count is u32).
 - The top level (`trace_top`) carries the ray into each instance's frame in f64 exactly as
   tinybvh does and filters the instance's mesh like a lone one; an f32 instance transform
   with its own bounds was not done. Also not done: a BVH4 regrouping (it could not replicate
-  the interior order); ray sorting and persistent threads (orthogonal to the filter, would
-  move apex and pure32 together).
+  the interior order); ray sorting and persistent threads (orthogonal to the filter).
 

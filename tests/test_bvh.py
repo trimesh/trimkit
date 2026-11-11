@@ -717,6 +717,21 @@ def test_all_hits_on_axis_aligned_rays_far_out(x):
     same((every[0], every[1], every[2], every[3]), (ray, first[0], first[1], first[2]))
 
 
+def test_one_row_is_every_rays():
+    # a (3,) origin or direction is every ray's: the answers of the array that
+    # repeats it; one row of a (1, 3) is one ray, never every ray's
+    scene = scene_of(*sphere(20, 40))
+    rng = np.random.default_rng(5)
+    origins = rng.normal(size=(500, 3)) * 2.0
+    direction = np.array([0.03, -0.02, -1.0])
+    expected = scene.intersect(origins, np.tile(direction, (500, 1)))
+    assert len(expected[0]) > 0
+    same(expected, scene.intersect(origins, direction))
+    assert len(scene.intersect(np.zeros((0, 3)), direction)[0]) == 0
+    with pytest.raises(ValueError, match="same number of rays"):
+        scene.intersect(origins[:1], np.tile(direction, (500, 1)))
+
+
 def test_hit_counts_tell_inside_from_outside():
     # a closed mesh is crossed an odd number of times from inside and an even
     # number from outside, whichever way a ray goes: so hit counts are a

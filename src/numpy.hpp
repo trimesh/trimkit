@@ -88,8 +88,8 @@ struct RowsArgument {
     nb::handle object;
 };
 
-// What `read_rows` read: `count` rows `stride` values apart, or one row that
-// is every item's (`one`: a count of 1 and a stride of 0), as float64 in
+// What `read_rows` read: `count` rows, or one row that is every item's
+// (`one`, with a count of 1), as float64 in
 // `wide` or, for a float32 array taken as it is, in `narrow` (the other is
 // null). Valid while it and the argument are
 template <nb::ssize_t Width>
@@ -101,12 +101,12 @@ struct Rows {
     const double* wide = nullptr;
     const float* narrow = nullptr;
     std::size_t count = 0;
-    std::size_t stride = 0;
     bool one = false;
     // row `i` as float64: a float32 widens to exactly itself
     void read(std::size_t i, double* row) const {
+        const std::size_t first = one ? 0 : static_cast<std::size_t>(Width) * i;
         for (std::size_t w = 0; w < static_cast<std::size_t>(Width); w++) {
-            row[w] = wide != nullptr ? wide[(stride * i) + w] : static_cast<double>(narrow[(stride * i) + w]);
+            row[w] = wide != nullptr ? wide[first + w] : static_cast<double>(narrow[first + w]);
         }
     }
 };
@@ -196,6 +196,10 @@ inline bool aligned(const void* data, std::size_t alignment) {
     return reinterpret_cast<std::uintptr_t>(data) % alignment == 0;
 }
 
+// Whether a coordinate is one no array may hold: beyond the limit, an
+// infinity or not a number. One comparison, false for all three. Python-free
+inline bool refused(double value) { return !(std::abs(value) <= COORDINATE_LIMIT); }
+
 // Refuse any value whose magnitude isn't at most `limit`: one comparison,
 // false for NaN and infinity too, counted without branching so the scan
 // vectorizes, and run without the GIL.
@@ -213,9 +217,23 @@ void check_bounded(const T* values, std::size_t count, T limit, const std::strin
     }
 }
 
+// what a refused coordinate raises, naming its argument
+[[noreturn]] inline void refuse_coordinates(const std::string& name) {
+    value_error(name + " must be finite and within " + COORDINATE_LIMIT_TEXT);
+}
+
 // float64 values, refused unless within COORDINATE_LIMIT
 inline void check_coordinates(const double* values, std::size_t count, const std::string& name) {
-    check_bounded(values, count, COORDINATE_LIMIT, name, (std::string(" and within ") + COORDINATE_LIMIT_TEXT).c_str());
+    std::size_t bad = 0;
+    {
+        const nb::gil_scoped_release release;
+        for (std::size_t i = 0; i < count; i++) {
+            bad += refused(values[i]) ? 1U : 0U;
+        }
+    }
+    if (bad != 0) {
+        refuse_coordinates(name);
+    }
 }
 
 }  // namespace detail
@@ -363,21 +381,20 @@ Rows<Width> read_rows(const RowsArgument<Width>& argument, const std::string& na
         rows.wide = rows.each.data();
         rows.count = rows.each.shape(0);
     }
-    rows.stride = rows.one ? 0 : static_cast<std::size_t>(Width);
     return rows;
 }
 
 // `count` values copied as float64, a float32 widening to exactly itself,
-// and how many of them `read` would refuse: its check (`check_bounded`) made
+// and how many of them `read` would refuse: its check (`detail::refused`) made
 // while the values go by anyway. Python-free
 template <typename T>
 std::size_t copy_coordinates(const T* values, std::size_t count, double* out) {
-    std::size_t refused = 0;
+    std::size_t bad = 0;
     for (std::size_t i = 0; i < count; i++) {
         out[i] = static_cast<double>(values[i]);
-        refused += !(std::abs(out[i]) <= COORDINATE_LIMIT) ? 1U : 0U;
+        bad += detail::refused(out[i]) ? 1U : 0U;
     }
-    return refused;
+    return bad;
 }
 
 // `count` values written as float32, and whether every one of them is still
@@ -391,7 +408,7 @@ bool narrow_coordinates(const T* values, std::size_t count, float* out) {
         const float narrowed = static_cast<float>(values[i]);
         out[i] = narrowed;
         const double size = std::abs(static_cast<double>(narrowed));
-        const bool same = static_cast<double>(narrowed) == value && size <= COORDINATE_LIMIT &&
+        const bool same = static_cast<double>(narrowed) == value && !detail::refused(value) &&
                           (size == 0.0 || size >= static_cast<double>(std::numeric_limits<float>::min()));
         lost += same ? 0U : 1U;
     }
@@ -407,15 +424,15 @@ void check_rows(const Rows<Width>& rows, const std::string& name) {
         return;
     }
     // float32 values are held to the same bound as float64 ones
-    std::size_t refused = 0;
+    std::size_t bad = 0;
     {
         const nb::gil_scoped_release release;
         for (std::size_t i = 0; i < count; i++) {
-            refused += !(std::abs(static_cast<double>(rows.narrow[i])) <= COORDINATE_LIMIT) ? 1U : 0U;
+            bad += detail::refused(static_cast<double>(rows.narrow[i])) ? 1U : 0U;
         }
     }
-    if (refused != 0) {
-        value_error(name + " must be finite and within " + COORDINATE_LIMIT_TEXT);
+    if (bad != 0) {
+        detail::refuse_coordinates(name);
     }
 }
 

@@ -127,28 +127,38 @@ CPU answers. `tests/golden.json` holds the hashed answers of an exact corpus
 (dyadic coordinates, integer-length directions, lattice meshes) that every
 platform and the device are checked against: the same answers everywhere.
 
-What the device is worth depends on the rays. `bench/rays.py` on a real
-assembly (`tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k faces),
-a million rays a view, median milliseconds on a busy desktop, twenty CPU
-threads against an RTX 3090:
+What the device is worth depends on the rays. `python bench/rays.py` times a
+real assembly (`tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k
+faces) as loaded and pulled apart, so fewer rays hit anything. A batch is one
+camera's rays, one origin for all of them; times are the median over eight
+cameras, in milliseconds a batch, twenty CPU threads against an RTX 3090:
 
-| a million rays | CPU | device | |
-|---|---|---|---|
-| camera, nearest | 11.6 | 6.4 | 1.8x |
-| camera, any hit | 7.4 | 4.8 | 1.5x |
-| camera with float32 directions, nearest | 11.2 | 4.3 | 2.6x |
-| camera with float32 directions, any hit | 7.1 | 2.6 | 2.7x |
-| orthographic, nearest | 17 | 8 | 2.1x |
-| camera, every crossing | 76 | 68 | 1.1x |
-| the assembly pulled apart 3x (6% of rays hit), camera, nearest | 7.1 | 5.6 | 1.3x |
-| pulled apart, camera, any hit | 4.9 | 4.8 | 1.0x |
-| pulled apart, camera, every crossing | 18.8 | 24.4 | 0.8x |
+| rays | pulled apart | hitting | nearest: CPU ms | device ms | ratio | any hit: CPU ms | device ms | ratio | every crossing: CPU ms | device ms | ratio |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10,000 | 1x | 12% | 1.15 | 0.76 | 1.5x | 0.97 | 0.34 | 2.8x | 6.89 | 14.92 | 0.5x |
+| 10,000 | 2x | 11% | 1.07 | 0.63 | 1.7x | 0.97 | 0.35 | 2.7x | 4.19 | 6.95 | 0.6x |
+| 10,000 | 5x | 3% | 0.70 | 0.56 | 1.3x | 0.83 | 0.31 | 2.7x | 1.10 | 1.58 | 0.7x |
+| 99,856 | 1x | 12% | 6.56 | 2.03 | 3.2x | 3.91 | 0.96 | 4.1x | 32.06 | 19.27 | 1.7x |
+| 99,856 | 2x | 11% | 3.33 | 1.38 | 2.4x | 2.16 | 1.08 | 2.0x | 16.37 | 10.45 | 1.6x |
+| 99,856 | 5x | 3% | 3.03 | 1.42 | 2.1x | 2.70 | 1.06 | 2.6x | 5.19 | 3.60 | 1.4x |
+| 1,000,000 | 1x | 12% | 41.92 | 23.83 | 1.8x | 22.29 | 12.68 | 1.8x | 278.95 | 53.38 | 5.2x |
+| 1,000,000 | 2x | 11% | 23.61 | 5.27 | 4.5x | 24.08 | 6.14 | 3.9x | 120.42 | 33.60 | 3.6x |
+| 1,000,000 | 5x | 3% | 22.79 | 9.60 | 2.4x | 12.41 | 8.00 | 1.6x | 26.62 | 11.95 | 2.2x |
+| 4,000,000 | 1x | 12% | 149.07 | 40.80 | 3.7x | 74.13 | 27.32 | 2.7x | 961.98 | 149.94 | 6.4x |
+| 4,000,000 | 2x | 11% | 94.65 | 59.87 | 1.6x | 71.08 | 25.71 | 2.8x | 503.76 | 86.69 | 5.8x |
+| 4,000,000 | 5x | 3% | 76.79 | 49.11 | 1.6x | 48.68 | 25.34 | 1.9x | 113.30 | 36.72 | 3.1x |
 
+That run shared the machine with other work (a load of about 30 on its twenty
+threads), which slows the CPU's column far more than the device's: on a quieter
+run the million-ray rows of the assembly as loaded were about 12 ms against 6
+for the nearest hit and 7 against 5 for any hit. Three things hold either way.
 A camera's float64 directions are 24 MB a million rays, and moving them to the
-device takes about as long as the CPU takes to find that most of them miss:
-that row is the bus, not the tracing, which is under 3 ms. Every crossing is
-the kernel: rays that cross dozens of surfaces hold up the ones beside them.
-Below about 50,000 rays the CPU is quicker.
+device takes about as long as the CPU takes to find that most of them miss, so
+a sparse scene gains least; float32 directions go at half that. Every crossing
+runs each ray's crossings one after another on its own lane, so a small batch
+with long rays is slower on the device than on the CPU, and a large one much
+faster. And the device's answers are the CPU's, which the bench checks before
+it times anything.
 
 ### Example
 

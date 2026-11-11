@@ -24,7 +24,7 @@
 // (src/vulkan/trace.comp) that makes every decision tinybvh's traversal makes,
 // most in f32 behind a proven bound and the rest with tinybvh's own f64
 // operations, so the same bytes come back; the crossing loop below
-// (`settle`) runs in the shader too, written the same way. A device that
+// (`crossings`) runs in the shader too, written the same way. A device that
 // can't be used, now or later, is a warning once, and the CPU answers.
 
 #include "common.hpp"
@@ -199,46 +199,34 @@ trimkit::vulkan::Tri32 triangle32(const std::vector<Vec>& vertices, const std::v
     return image;
 }
 
-// a tree's nodes copied as the device reads them
-std::vector<trimkit::vulkan::Node64> nodes_of(const tinybvh::BVH_Double& bvh) {
-    static_assert(sizeof(tinybvh::BVH_Double::BVHNode) == sizeof(trimkit::vulkan::Node64));
-    std::vector<trimkit::vulkan::Node64> nodes(bvh.usedNodes);
-    std::memcpy(nodes.data(), bvh.bvhNode, nodes.size() * sizeof(trimkit::vulkan::Node64));
-    return nodes;
+// a device takes one submitter at a time
+trimkit::Exclusive& device_lock() {
+    static trimkit::Exclusive lock;
+    return lock;
 }
 
 // A scene's meshes, or one top level, on the device: uploaded once from the
-// trees the CPU traces, freed with the scene or top level they mirror
-struct OnDevice {
+// trees the CPU traces, freed with the scene or top level they mirror, as a
+// query uses the device: one at a time, and only in the process that opened
+// it (a forked child holds the parent's handles, which are not its to free)
+struct DeviceArrays {
     trimkit::vulkan::Device* device = nullptr;
     trimkit::vulkan::Arrays arrays;
-    OnDevice() = default;
-    OnDevice(const OnDevice&) = delete;
-    OnDevice& operator=(const OnDevice&) = delete;
-    ~OnDevice() { trimkit::vulkan::destroy(*device, &arrays); }
+    DeviceArrays() = default;
+    DeviceArrays(const DeviceArrays&) = delete;
+    DeviceArrays& operator=(const DeviceArrays&) = delete;
+    ~DeviceArrays() {
+        if (device->pid == trimkit::vulkan::process_id()) {
+            const trimkit::Exclusively holding(device_lock());
+            trimkit::vulkan::destroy(*device, &arrays);
+        }
+    }
 };
-
-// `body(from, to)` over [0, count), the cores sharing it a block at a time: for
-// a few bytes copied per item, which one at a time is too little for the pool
-// to measure (and the first of them takes a page fault)
-template <typename Body>
-void in_blocks(std::size_t count, const Body& body) {
-    constexpr std::size_t BLOCK = 4096;
-    trimkit::in_parallel_without_gil((count + BLOCK - 1) / BLOCK, [&](std::size_t first, std::size_t last) {
-        body(first * BLOCK, std::min(count, last * BLOCK));
-    });
-}
 
 // a vector's bytes, to upload
 template <typename T>
 trimkit::vulkan::Span bytes_of(const std::vector<T>& values) {
     return {values.data(), values.size() * sizeof(T)};
-}
-
-// a device takes one submitter at a time
-trimkit::Exclusive& device_lock() {
-    static trimkit::Exclusive lock;
-    return lock;
 }
 
 // One hit as `intersect` reports it
@@ -250,7 +238,7 @@ struct Hit {
 };
 
 // The four columns `intersect` answers, each written once; the device fills
-// them a chunk at a time, into room sized by its first chunk
+// them a chunk at a time, growing them as a vector grows
 struct Columns {
     std::vector<trimkit::Unset<std::int64_t>> rays;
     std::vector<trimkit::Unset<std::int64_t>> instances;
@@ -262,25 +250,6 @@ struct Columns {
         faces.resize(total);
         distances.resize(total);
     }
-};
-
-// A ray's progress through its crossings, see RayScene::settle
-struct Crossing {
-    double along = 0.0;  // how far the origin has moved along the ray
-    double step = 0.0;   // the move past the last hit
-    double last_t = 0.0;
-    std::int64_t last_instance = -1;
-    std::int64_t last_face = -1;
-    std::size_t count = 0;
-};
-
-// What one traversal found for a ray: nothing, or a face of an instance (a
-// row of the top level's instances) at a distance in the direction's units
-struct Found {
-    bool hit = false;
-    std::uint64_t instance = 0;
-    std::uint64_t face = 0;
-    double t = 0.0;
 };
 
 // One mesh of a RayScene, built once however often the scene places it
@@ -363,7 +332,7 @@ struct TopLevel {
     double extent = 0.0;
     const RayMesh* direct = nullptr;
     // the top level on the device when the scene traces there, or why not
-    std::unique_ptr<OnDevice> on_device;
+    std::unique_ptr<DeviceArrays> device_top;
     std::string device_reason;
     // declared last, so it is destroyed before the instances it points into
     std::unique_ptr<MeshBvh> tlas;
@@ -566,7 +535,7 @@ private:
             top->tlas->Build(top->instances.data(), top->instances.size(), meshes, blas_.size());
             pad(*top->tlas, placement.extent);
         }
-        if (on_device_ && top->tlas) {
+        if (device_meshes_ && top->tlas) {
             const nb::gil_scoped_release release;
             upload_top(top.get());
         }
@@ -640,57 +609,9 @@ private:
     // the triangle found: exactly what a cap of one hit reports for it,
     // whatever else the ray crossed first.
     //
-    // `settle` takes what one traversal found and decides: emit a crossing,
-    // move past a repeat, or stop. `crossings` runs that for one ray on the
-    // CPU; `device_crossings` for every ray at once, tracing on the device
-    template <typename Emit>
-    bool settle(const TopLevel& level, const Vec& origin, const Vec& direction, double scene, std::size_t most,
-                const Found& found, Crossing* state, const Emit& emit) const {
-        if (!found.hit) {
-            return false;
-        }
-        const std::int64_t instance =
-            level.direct != nullptr ? level.which[0] : level.which[static_cast<std::size_t>(found.instance)];
-        const std::int64_t face = static_cast<std::int64_t>(found.face);
-        if (instance == state->last_instance && face == state->last_face) {
-            // found again from the rounding: farther past it, and past the
-            // whole scene is nothing left to find
-            state->step *= 2.0;
-            if (state->step > scene) {
-                return false;
-            }
-            state->along = state->last_t + state->step;
-            return true;
-        }
-        // the distance from the ray's own origin: what the traversal measured
-        // when it started there, else measured again by tinybvh's triangle
-        // test from there, in the mesh's frame as the top level carries rays
-        // there (a grazing hit the moved origin found and the original misses
-        // keeps the moved origin's distance)
-        double t = found.t;
-        if (state->along != 0.0) {
-            const MeshBvh* mesh = level.direct != nullptr ? level.direct->bvh() : nullptr;
-            tinybvh::RayEx exact(origin, direction);
-            if (level.direct == nullptr) {
-                const tinybvh::BLASInstanceEx& placed = level.instances[static_cast<std::size_t>(found.instance)];
-                mesh = meshes_[static_cast<std::size_t>(placed.blasIdx)]->bvh();
-                exact = tinybvh::RayEx(tinybvh::tinybvh_transform_point(origin, placed.invTransform),
-                                       tinybvh::tinybvh_transform_vector(direction, placed.invTransform));
-            }
-            const std::uint64_t* corners = mesh->vertIdx + (3 * found.face);
-            mesh->IntersectTri(exact, found.face, mesh->verts, corners[0], corners[1], corners[2]);
-            t = exact.hit.t < BVH_DBL_FAR ? exact.hit.t : state->along + found.t;
-        }
-        emit(instance, face, t);
-        state->count++;
-        state->last_instance = instance;
-        state->last_face = face;
-        state->last_t = t;
-        state->step = RELATIVE_STEP * std::max(scene, std::abs(t));
-        state->along = t + state->step;
-        return state->count < most;
-    }
-
+    // `crossings` does that for one ray on the CPU, calling `emit(instance,
+    // face, t)` for each; src/vulkan/trace.comp does the same for every ray
+    // of a chunk on the device, operation for operation
     template <typename Emit>
     void crossings(const TopLevel& level, const double* o, const double* d, double length_of_d, std::size_t most,
                    const Emit& emit) const {
@@ -699,23 +620,63 @@ private:
         const Vec direction(d[0], d[1], d[2]);
         // in the direction's units: the scene's size
         const double scene = level.extent / length_of_d;
-        Crossing state;
-        bool more = true;
-        while (more) {
-            tinybvh::RayEx ray(origin + (direction * state.along), direction);
+        double along = 0.0;  // how far the origin has moved along the ray
+        double step = 0.0;   // the move past the last hit
+        double last_t = 0.0;
+        std::int64_t last_instance = -1;
+        std::int64_t last_face = -1;
+        std::size_t count = 0;
+        while (count < most) {
+            tinybvh::RayEx ray(origin + (direction * along), direction);
             bvh->Intersect(ray);
-            Found found;
-            found.hit = ray.hit.t < BVH_DBL_FAR;
-            found.instance = ray.hit.inst;
-            found.face = ray.hit.prim;
-            found.t = ray.hit.t;
-            more = settle(level, origin, direction, scene, most, found, &state, emit);
+            if (!(ray.hit.t < BVH_DBL_FAR)) {
+                break;
+            }
+            const std::size_t placed_at = static_cast<std::size_t>(ray.hit.inst);
+            const std::int64_t instance = level.direct != nullptr ? level.which[0] : level.which[placed_at];
+            const std::int64_t face = static_cast<std::int64_t>(ray.hit.prim);
+            if (instance == last_instance && face == last_face) {
+                // found again from the rounding: farther past it, and past the
+                // whole scene is nothing left to find
+                step *= 2.0;
+                if (step > scene) {
+                    break;
+                }
+                along = last_t + step;
+                continue;
+            }
+            // the distance from the ray's own origin: what the traversal measured
+            // when it started there, else measured again by tinybvh's triangle
+            // test from there, in the mesh's frame as the top level carries rays
+            // there (a grazing hit the moved origin found and the original misses
+            // keeps the moved origin's distance)
+            double t = ray.hit.t;
+            if (along != 0.0) {
+                const MeshBvh* mesh = level.direct != nullptr ? level.direct->bvh() : nullptr;
+                tinybvh::RayEx exact(origin, direction);
+                if (level.direct == nullptr) {
+                    const tinybvh::BLASInstanceEx& placed = level.instances[placed_at];
+                    mesh = meshes_[static_cast<std::size_t>(placed.blasIdx)]->bvh();
+                    exact = tinybvh::RayEx(tinybvh::tinybvh_transform_point(origin, placed.invTransform),
+                                           tinybvh::tinybvh_transform_vector(direction, placed.invTransform));
+                }
+                const std::uint64_t* corners = mesh->vertIdx + (3 * ray.hit.prim);
+                mesh->IntersectTri(exact, ray.hit.prim, mesh->verts, corners[0], corners[1], corners[2]);
+                t = exact.hit.t < BVH_DBL_FAR ? exact.hit.t : along + ray.hit.t;
+            }
+            emit(instance, face, t);
+            count++;
+            last_instance = instance;
+            last_face = face;
+            last_t = t;
+            step = RELATIVE_STEP * std::max(scene, std::abs(t));
+            along = t + step;
         }
     }
 
     // `count` of a query's origins or directions from `begin`, written for
     // the device as a chunk's, the cores sharing the pass, and how it wrote
-    // them (trimkit::vulkan::STEP_*): one row for every ray; float32 rows
+    // them (trimkit::vulkan::STRIDE_*): one row for every ray; float32 rows
     // while `*narrow` holds, which the first value that isn't exactly a
     // float32 ends for the rest of the query; else float64 rows. `*taken` is
     // cleared by a value `read` refuses: the one look these values get on
@@ -727,12 +688,18 @@ private:
             double row[3];
             rays.read(0, row);
             *taken = trimkit::copy_coordinates(row, 3, wide) == 0 && *taken;
-            return trimkit::vulkan::STEP_ONE;
+            return trimkit::vulkan::STRIDE_ONE;
+        }
+        // float64 rays that are not float32 nearly always show it in their
+        // first values: a look at those before the whole chunk is written narrow
+        if (*narrow && rays.wide != nullptr) {
+            float probe[PROBE];
+            *narrow = trimkit::narrow_coordinates(rays.wide + (3 * begin), std::min(3 * count, PROBE), probe);
         }
         if (*narrow) {
             std::atomic<bool> kept{true};
             float* out = static_cast<float*>(chunk);
-            in_blocks(count, [&](std::size_t from, std::size_t to) {
+            trimkit::in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
                 const std::size_t first = 3 * (begin + from);
                 const bool same =
                     rays.wide != nullptr
@@ -743,12 +710,12 @@ private:
                 }
             });
             if (kept.load()) {
-                return trimkit::vulkan::STEP_NARROW;
+                return trimkit::vulkan::STRIDE_NARROW;
             }
             *narrow = false;
         }
         std::atomic<std::size_t> refused{0};
-        in_blocks(count, [&](std::size_t from, std::size_t to) {
+        trimkit::in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
             const std::size_t first = 3 * (begin + from);
             const std::size_t bad =
                 rays.wide != nullptr
@@ -757,7 +724,7 @@ private:
             refused.fetch_add(bad, std::memory_order_relaxed);
         });
         *taken = refused.load() == 0 && *taken;
-        return trimkit::vulkan::STEP_WIDE;
+        return trimkit::vulkan::STRIDE_WIDE;
     }
 
     // One query of `level` traced on the device over `count` rays, `consume`
@@ -765,21 +732,37 @@ private:
     // reason: that is no fallback to warn about), when there are no rays,
     // when this top level isn't on it or the device failed (then with the
     // reason), or when a ray's value is one `read` refuses (no reason: the
-    // caller's `check_rows` raises it), and the CPU answers
+    // caller's `check_rows` raises it), and the CPU answers. Ctrl-C is looked
+    // for between chunks and raised from here
     template <typename Consume>
-    bool on_device(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
-                   bool occlusion, std::size_t most, const Consume& consume, std::string* reason) const {
-        if (!on_device_ || count == 0) {
+    bool trace_on_device(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
+                         bool occlusion, std::size_t most, const Consume& consume, std::string* reason) const {
+        if (!device_meshes_ || count == 0) {
             return false;
         }
-        if (level.direct == nullptr && !level.on_device) {
+        if (level.direct == nullptr && !level.device_top) {
             *reason = level.device_reason;
             return false;
         }
-        const nb::gil_scoped_release release;
+        trimkit::Interrupt interrupt;
+        bool answered = false;
+        {
+            const nb::gil_scoped_release release;
+            answered = trace_chunks(level, origins, directions, count, occlusion, most, &interrupt, consume, reason);
+        }
+        if (interrupt.interrupted()) {
+            throw nb::python_error();
+        }
+        return answered;
+    }
+
+    template <typename Consume>
+    bool trace_chunks(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
+                      bool occlusion, std::size_t most, trimkit::Interrupt* interrupt, const Consume& consume,
+                      std::string* reason) const {
         trimkit::vulkan::Query query;
-        query.scene = &on_device_->arrays;
-        query.top = level.direct != nullptr ? nullptr : &level.on_device->arrays;
+        query.scene = &device_meshes_->arrays;
+        query.top = level.direct != nullptr ? nullptr : &level.device_top->arrays;
         query.mesh = level.direct != nullptr ? static_cast<std::uint32_t>(level.instances[0].blasIdx) : 0;
         query.occlusion = occlusion;
         query.most = most < trimkit::vulkan::UNBOUNDED ? static_cast<std::uint32_t>(most) : trimkit::vulkan::UNBOUNDED;
@@ -788,46 +771,38 @@ private:
         bool narrow[2] = {true, true};
         const trimkit::Exclusively holding(device_lock());
         return trimkit::vulkan::run_query(
-            *on_device_->device, query, count,
+            *device_meshes_->device, query, count,
             [&](void* chunk_origins, void* chunk_directions, std::size_t begin, std::size_t rays,
-                std::uint32_t* steps) {
-                bool taken = true;
-                steps[0] = fill_rows(origins, chunk_origins, begin, rays, &narrow[0], &taken);
-                steps[1] = fill_rows(directions, chunk_directions, begin, rays, &narrow[1], &taken);
+                std::uint32_t* strides) {
+                bool taken = !interrupt->poll();
+                strides[0] = fill_rows(origins, chunk_origins, begin, rays, &narrow[0], &taken);
+                strides[1] = fill_rows(directions, chunk_directions, begin, rays, &narrow[1], &taken);
                 return taken;
             },
             consume, reason);
     }
 
     // Every ray's crossings traced on the device, into the columns: the device
-    // counts each ray's crossings (its traversal, and the moves past each hit,
-    // exactly as `crossings` does them on the CPU), scans the counts into
-    // offsets, writes every crossing at its offset and hands them back
-    // compacted, a chunk at a time; each is widened into place with its ray
+    // runs each ray's loop as `crossings` does on the CPU and hands back a
+    // chunk's crossings in ray order; each is widened into place with its ray
     // made the caller's and its instance mapped through `which`
     bool device_crossings(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
                           std::size_t most, Columns* columns, std::string* reason) const {
-        // room for the usual, as the CPU path reserves: a hit per ray with a
-        // cap of one, else two, a closed surface entered and left
-        const std::size_t usual = std::min<std::size_t>(most, 2);
         std::size_t total = 0;
-        const bool answered = on_device(
+        const bool answered = trace_on_device(
             level, origins, directions, count, false, most,
             [&](const trimkit::vulkan::Answers& answers) {
-                // this chunk's crossings and the usual for every ray after it:
-                // the first chunk sizes the columns for the whole query, and a
-                // later one grows them only when its rays crossed more
-                const std::size_t after = count - (answers.begin + answers.count);
-                const std::size_t room = total + answers.total + (after * usual);
-                if (room > columns->rays.size()) {
-                    columns->resize(room);
+                // the columns grow as a vector does, to twice what they held
+                const std::size_t needed = total + answers.total;
+                if (needed > columns->rays.size()) {
+                    columns->resize(std::max(needed, 2 * columns->rays.size()));
                 }
                 std::int64_t* rays_out = trimkit::elements(columns->rays) + total;
                 std::int64_t* instances_out = trimkit::elements(columns->instances) + total;
                 std::int64_t* faces_out = trimkit::elements(columns->faces) + total;
                 double* distances_out = trimkit::elements(columns->distances) + total;
                 const std::int64_t base = static_cast<std::int64_t>(answers.begin);
-                in_blocks(answers.total, [&](std::size_t from, std::size_t to) {
+                trimkit::in_blocks_without_gil(answers.total, [&](std::size_t from, std::size_t to) {
                     for (std::size_t h = from; h < to; h++) {
                         rays_out[h] = base + answers.rays[h];
                         instances_out[h] = level.which[answers.words[2 * h]];
@@ -845,7 +820,7 @@ private:
     // Every ray's occlusion traced on the device, into `hits`
     bool device_occlusion(const TopLevel& level, const Rays& origins, const Rays& directions, std::size_t count,
                           std::vector<std::uint8_t>* hits, std::string* reason) const {
-        return on_device(
+        return trace_on_device(
             level, origins, directions, count, true, 1,
             [&](const trimkit::vulkan::Answers& answers) {
                 std::uint8_t* out = hits->data() + answers.begin;
@@ -889,11 +864,6 @@ private:
                 totals[k] += sizes[k];
             }
         }
-        // the shader indexes with 32-bit words
-        if (*std::max_element(totals, totals + 4) >= std::size_t{1} << 32U) {
-            *reason = "the meshes have more than 2^32 vertices, faces or nodes together";
-            return false;
-        }
         std::vector<trimkit::vulkan::Node64> nodes(totals[0]);
         std::vector<std::uint64_t> corners(totals[2]);
         std::vector<Vec> vertices(totals[3]);
@@ -912,32 +882,33 @@ private:
             std::memcpy(nodes.data() + first[0], bvh->bvhNode, bvh->usedNodes * sizeof(trimkit::vulkan::Node64));
             std::copy(faces.begin(), faces.end(), corners.data() + first[2]);
             std::copy(points.begin(), points.end(), vertices.data() + first[3]);
-            trimkit::vulkan::Tree tree{};
-            tree.nodes = nodes.data() + first[0];
-            tree.node_count = bvh->usedNodes;
-            tree.slots = bvh->primIdx;
-            tree.slot_count = bvh->idxCount;
-            tree.limit = faces.size() / 3;
-            tree.depth = trimkit::vulkan::MESH_DEPTH;
-            trimkit::vulkan::Tri32* triangles = tri32.data() + first[1];
-            const bool sound = trimkit::vulkan::walk(
-                tree, node32.data() + first[0],
-                [&](std::size_t slot, std::uint64_t face) { triangles[slot] = triangle32(points, faces, face); },
-                reason);
-            if (!sound) {
+            const trimkit::vulkan::Tree tree{
+                nodes.data() + first[0], bvh->usedNodes,   bvh->primIdx,
+                bvh->idxCount,           faces.size() / 3, trimkit::vulkan::TRACE_STACK_SIZE};
+            const trimkit::vulkan::Node32* images = node32.data() + first[0];
+            if (!trimkit::vulkan::node_images(tree, node32.data() + first[0], reason)) {
                 return false;
+            }
+            // a triangle for each slot of each leaf the walk reached: the slots it checked
+            trimkit::vulkan::Tri32* triangles = tri32.data() + first[1];
+            for (std::size_t n = 0; n < bvh->usedNodes; n++) {
+                const std::uint32_t slots =
+                    (images[n].count_word & trimkit::vulkan::INTERIOR) != 0 ? 0 : images[n].count_word;
+                for (std::uint32_t slot = images[n].left; slot < images[n].left + slots; slot++) {
+                    triangles[slot] = triangle32(points, faces, bvh->primIdx[slot]);
+                }
             }
         }
         const trimkit::vulkan::Span spans[trimkit::vulkan::SCENE_BUFFERS] = {
             bytes_of(nodes), bytes_of(corners), bytes_of(vertices), bytes_of(table), bytes_of(node32), bytes_of(tri32),
         };
-        std::unique_ptr<OnDevice> on_device = std::make_unique<OnDevice>();
-        on_device->device = device;
+        std::unique_ptr<DeviceArrays> arrays = std::make_unique<DeviceArrays>();
+        arrays->device = device;
         const trimkit::Exclusively holding(device_lock());
-        if (!trimkit::vulkan::upload(*device, spans, trimkit::vulkan::SCENE_BUFFERS, &on_device->arrays, reason)) {
+        if (!trimkit::vulkan::upload(*device, spans, trimkit::vulkan::SCENE_BUFFERS, &arrays->arrays, reason)) {
             return false;
         }
-        on_device_ = std::move(on_device);
+        device_meshes_ = std::move(arrays);
         return true;
     }
 
@@ -953,17 +924,12 @@ private:
             }
             instance_meshes[i] = static_cast<std::uint32_t>(top->instances[i].blasIdx);
         }
-        const std::vector<trimkit::vulkan::Node64> nodes = nodes_of(tlas);
+        std::vector<trimkit::vulkan::Node64> nodes(tlas.usedNodes);
+        std::memcpy(nodes.data(), tlas.bvhNode, nodes.size() * sizeof(trimkit::vulkan::Node64));
         std::vector<trimkit::vulkan::Node32> node32(nodes.size());
-        trimkit::vulkan::Tree tree{};
-        tree.nodes = nodes.data();
-        tree.node_count = nodes.size();
-        tree.slots = tlas.primIdx;
-        tree.slot_count = tlas.idxCount;
-        tree.limit = count;
-        tree.depth = trimkit::vulkan::TOP_DEPTH;
-        if (!trimkit::vulkan::walk(
-                tree, node32.data(), [](std::size_t /*slot*/, std::uint64_t /*instance*/) {}, &top->device_reason)) {
+        const trimkit::vulkan::Tree tree{nodes.data(),  nodes.size(), tlas.primIdx,
+                                         tlas.idxCount, count,        trimkit::vulkan::TRACE_TOP_STACK_SIZE};
+        if (!trimkit::vulkan::node_images(tree, node32.data(), &top->device_reason)) {
             return;
         }
         const trimkit::vulkan::Span spans[trimkit::vulkan::TOP_BUFFERS] = {
@@ -971,15 +937,17 @@ private:
             bytes_of(inverses), bytes_of(instance_meshes),
             bytes_of(node32),
         };
-        std::unique_ptr<OnDevice> on_device = std::make_unique<OnDevice>();
-        on_device->device = on_device_->device;
+        std::unique_ptr<DeviceArrays> arrays = std::make_unique<DeviceArrays>();
+        arrays->device = device_meshes_->device;
         const trimkit::Exclusively holding(device_lock());
-        if (trimkit::vulkan::upload(*on_device->device, spans, trimkit::vulkan::TOP_BUFFERS, &on_device->arrays,
+        if (trimkit::vulkan::upload(*arrays->device, spans, trimkit::vulkan::TOP_BUFFERS, &arrays->arrays,
                                     &top->device_reason)) {
-            top->on_device = std::move(on_device);
+            top->device_top = std::move(arrays);
         }
     }
 
+    // values of a chunk looked at before it is written as float32
+    static constexpr std::size_t PROBE = 4096;
     // the step past a hit, in units of the scene's size or the distance reached
     static constexpr double RELATIVE_STEP = 9.094947017729282e-13;  // 2^-40
 
@@ -993,7 +961,7 @@ private:
     mutable nb::ft_mutex last_lock_;
     mutable std::shared_ptr<const TopLevel> last_;
     // the meshes on the device, for a scene built with `use_gpu` that could
-    std::unique_ptr<OnDevice> on_device_;
+    std::unique_ptr<DeviceArrays> device_meshes_;
     // whether this scene has said that the CPU answered for the device
     mutable std::atomic<bool> warned_{false};
 };

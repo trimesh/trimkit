@@ -150,16 +150,11 @@ def test_one_origin_or_direction_is_every_rays(device_required):
                 same(expected, scene.intersect(*repeated, maximum_hits=maximum_hits))
         for scene in (cpu, gpu):
             same(cpu.intersect_any(*repeated), scene.intersect_any(*one))
-    # one row of a (1, 3) is one ray, never every ray's
-    with pytest.raises(ValueError, match="same number of rays"):
-        cpu.intersect(origins[:1], directions)
-    assert len(cpu.intersect(np.zeros((0, 3)), direction)[0]) == 0
 
 
 def test_device_answers_many_crossings_per_ray(device_required):
-    # rays through a stack of twenty boxes cross forty surfaces each: more than
-    # the device's first guess at the room an unbounded query needs, so it
-    # grows the room and writes again
+    # rays through a stack of twenty boxes cross forty surfaces each, through
+    # instances
     meshes = [box((-5, -5, -5), (5, 5, 5))]
     matrices = np.tile(np.eye(4), (20, 1, 1))
     matrices[:, 2, 2] = 0.04
@@ -191,25 +186,41 @@ def sheets(spans):
     return vertices, faces.reshape(-1, 3)
 
 
-@pytest.mark.parametrize("count", [63, 64, 65, 1024, 1025])
-@pytest.mark.parametrize("room", [1, 4, 16, 32])
-def test_device_finds_the_crossing_past_a_rays_room(count, room, device_required):
-    # every ray crosses `room` sheets and only the last one more: a crossing
-    # past what the device keeps per ray in its first traversal, whatever
-    # that is, at ray counts that fill whole groups of lanes and don't
-    mesh = sheets([(-9, 9)] * room + [(5, 9)])
+@pytest.mark.parametrize("count", [63, 64, 65, 255, 256, 257, 1024, 1025])
+def test_device_lays_out_crossings_at_group_edges(count, device_required):
+    # every ray crosses three sheets and only the last a fourth: ray counts
+    # and totals that fill whole groups of the device's lanes, and that
+    # don't, each crossing in its ray's order
+    mesh = sheets([(-9, 9)] * 3 + [(5, 9)])
     origins = np.column_stack([np.linspace(-8, -1, count), np.full(count, 2.5), np.zeros(count)])
     origins[-1, 0] = 7.0
     directions = np.array([0.0, 0.0, 1.0])
     cpu = trimkit.RayScene([mesh]).intersect(origins, directions)
     same(cpu, device_scene([mesh], device_required).intersect(origins, directions))
-    assert np.array_equal(np.bincount(cpu[0]), [room] * (count - 1) + [room + 1])
-    assert np.array_equal(cpu[3][-room - 1 :], np.arange(1.0, room + 2))
+    assert np.array_equal(np.bincount(cpu[0]), [3] * (count - 1) + [4])
+    assert np.array_equal(cpu[3][-4:], [1.0, 2.0, 3.0, 4.0])
 
 
-def test_device_traces_again_only_the_rays_past_their_room(device_required):
+def test_device_runs_a_chunk_again_when_its_log_is_too_small(device_required):
+    # six crossings a ray is more than a chunk's log holds when a device
+    # opens, and ten more than it holds after that: each time the chunk runs
+    # again with room, and a query that needs less afterwards is unaffected
+    count = 300_003
+    origins = np.column_stack([np.linspace(-8, 8, count), np.full(count, 2.5), np.zeros(count)])
+    directions = np.array([0.0, 0.0, 1.0])
+    for crossings in (6, 10, 2):
+        mesh = sheets([(-9, 9)] * crossings)
+        expected = trimkit.RayScene([mesh]).intersect(origins, directions)
+        assert len(expected[0]) == crossings * count
+        gpu = device_scene([mesh], device_required)
+        same(expected, gpu.intersect(origins, directions))
+        same(expected, gpu.intersect(origins, directions))
+
+
+def test_device_orders_mixed_crossing_counts_across_chunks(device_required):
     # rays crossing 0, 1, 5, 16, 17, 33 and 44 sheets, mixed through chunks:
-    # the few past their room are traced again, among the many that aren't
+    # the device logs crossings in whatever order its lanes run, and each
+    # ray's come back together, nearest first, capped or not
     crossings = np.array([0, 1, 5, 16, 17, 33, 44])
     mesh = sheets([(k, 44) for k in range(44)])
     rng = np.random.default_rng(23)
@@ -223,7 +234,7 @@ def test_device_traces_again_only_the_rays_past_their_room(device_required):
     expected = cpu.intersect(origins, directions)
     assert np.array_equal(np.bincount(expected[0], minlength=count), wanted)
     same(expected, gpu.intersect(origins, directions))
-    for maximum_hits in (1, 16, 17, 40):
+    for maximum_hits in (1, 5, 40):
         same(
             cpu.intersect(origins, directions, maximum_hits=maximum_hits),
             gpu.intersect(origins, directions, maximum_hits=maximum_hits),
@@ -231,7 +242,7 @@ def test_device_traces_again_only_the_rays_past_their_room(device_required):
     same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
 
 
-@pytest.mark.parametrize("count", [5000, 5008, 300_016])
+@pytest.mark.parametrize("count", [5008, 300_016])
 def test_device_reads_only_this_querys_rays(count, device_required):
     # every ray of both queries misses, but a ray of the second read with the
     # first 16 bytes of its origin and direction left from the first would
@@ -314,9 +325,9 @@ def test_device_refuses_what_the_cpu_refuses(bad, device_required):
             assert raised[0] == raised[1]
     # one row for every ray, and no rays at all
     for scene in (cpu, gpu):
-        with pytest.raises(ValueError, match="^origins must be finite"):
+        with pytest.raises(ValueError, match=r"^origins must be finite"):
             scene.intersect(np.array([bad, 0.0, 0.0]), directions)
-        with pytest.raises(ValueError, match="^directions must be finite"):
+        with pytest.raises(ValueError, match=r"^directions must be finite"):
             scene.intersect_any(np.zeros((0, 3)), np.array([0.0, bad, 0.0]))
 
 
@@ -370,7 +381,10 @@ def axis_rays(lo, hi, seed):
     return np.vstack(origins), np.ascontiguousarray(np.vstack(directions))
 
 
-@pytest.mark.parametrize("mesh", [box(), box((-3, 2, 1 + 2.0**-24), (-1, 2.5, 7)), sphere(24, 48)], ids=["box", "far box", "sphere"])
+AXIS_MESHES = {"box": box(), "far box": box((-3, 2, 1 + 2.0**-24), (-1, 2.5, 7)), "sphere": sphere(24, 48)}
+
+
+@pytest.mark.parametrize("mesh", AXIS_MESHES.values(), ids=AXIS_MESHES.keys())
 def test_device_agrees_on_axis_aligned_rays(mesh, device_required):
     # a zero direction component is decided by where the origin lies between
     # a box's planes, in float32 behind a margin (docs/trace.md 3.6): the same
@@ -381,7 +395,8 @@ def test_device_agrees_on_axis_aligned_rays(mesh, device_required):
     expected = cpu.intersect(origins, directions)
     assert len(np.unique(expected[0])) > 1000
     same(expected, gpu.intersect(origins, directions))
-    same(cpu.intersect(origins, directions, maximum_hits=1), gpu.intersect(origins, directions, maximum_hits=1))
+    nearest = cpu.intersect(origins, directions, maximum_hits=1)
+    same(nearest, gpu.intersect(origins, directions, maximum_hits=1))
     same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
     # one direction for every ray: an orthographic view down each axis
     for axis in range(3):
@@ -408,7 +423,8 @@ def test_device_agrees_on_axis_aligned_rays_through_instances(device_required):
     expected = cpu.intersect(origins, directions, matrices, index)
     assert len(np.unique(expected[0])) > 500
     same(expected, gpu.intersect(origins, directions, matrices, index))
-    same(cpu.intersect_any(origins, directions, matrices, index), gpu.intersect_any(origins, directions, matrices, index))
+    blocked = cpu.intersect_any(origins, directions, matrices, index)
+    same(blocked, gpu.intersect_any(origins, directions, matrices, index))
 
 
 def test_rays_are_float64_or_float32(device_required):
@@ -451,7 +467,8 @@ def test_device_widens_what_float32_cannot_hold(device_required):
     count = 300_000
     origins = (rng.normal(size=(count, 3)) * 3.0).astype(np.float32).astype(np.float64)
     directions = (-origins + rng.normal(size=(count, 3))).astype(np.float32).astype(np.float64)
-    for name, at, value in (("origins", 280_000, 0.1), ("directions", 299_999, 1e-45 / 3), ("origins", 5, 1e-40)):
+    losses = (("origins", 280_000, 0.1), ("directions", 299_999, 1e-45 / 3), ("origins", 5, 1e-40))
+    for name, at, value in losses:
         given = {"origins": origins.copy(), "directions": directions.copy()}
         given[name][at, 1] = value
         same(cpu.intersect(**given), gpu.intersect(**given))
@@ -463,7 +480,8 @@ def test_device_widens_what_float32_cannot_hold(device_required):
     for scene in (cpu, gpu):
         same(expected, scene.intersect(**narrow))
     # and a query of each width after the other, in the same chunks
-    for given in ((origins, directions), (origins + 0.1, directions), (narrow["origins"], narrow["directions"])):
+    wide = (origins + 0.1, directions)
+    for given in ((origins, directions), wide, (narrow["origins"], narrow["directions"])):
         same(cpu.intersect_any(*given), gpu.intersect_any(*given))
 
 

@@ -6,8 +6,8 @@
 // docs/trace.md), and only an undecided one runs tinybvh's own f64 operations,
 // mirrored operation for operation with `precise` (no fused multiply-add, as
 // the CPU build with -ffp-contract=off). The exact distance of the accepted
-// hit is computed once, after the traversal, with every lane of the warp
-// together; until then it is held as a certified interval. The crossing loop
+// hit is computed once, after the traversal; until then it is held as a
+// certified interval. The crossing loop
 // runs here too: every crossing of a ray is tinybvh's nearest hit asked again
 // from just past the one before, exactly as src/bvh.cpp decides it on the
 // CPU. Bindings 4, 5 and 10 are the f32 images of the nodes and triangles
@@ -19,44 +19,17 @@
 #extension GL_ARB_gpu_shader_fp64 : require
 
 // Every mesh of the scene, concatenated: `meshes` holds each one's offsets
-// into the four arrays, in elements (node, primitive, vertex index, vertex).
+// into the four arrays, in elements (node, leaf slot, vertex index, vertex).
 // A node is tinybvh's 64 bytes: aabbMin (3 doubles), leftFirst (u64), aabbMax
 // (3 doubles), triCount (u64), read as 4 uvec4 since std430 aligns a dvec3 to
-// 32 bytes. 64-bit indices are read as the low word of a uvec2: the device
-// path takes meshes under 2^32 vertices and faces, src/bvh.cpp checks
+// 32 bytes. 64-bit indices are read as the low word of a uvec2: the host
+// puts on the device only trees whose indices fit (src/vulkan/vulkan.hpp's
+// `node_images`)
 layout(set = 0, binding = 0, std430) readonly buffer NodeBuffer { uvec4 nodes[]; };
 layout(set = 0, binding = 1, std430) readonly buffer CornerBuffer { uvec2 corners[]; };
 layout(set = 0, binding = 2, std430) readonly buffer VertexBuffer { double vertices[]; };
 layout(set = 0, binding = 3, std430) readonly buffer MeshBuffer { uvec4 meshes[]; };
-// The top level: its nodes in the same layout, its primitives (instance
-// indices), and per instance the inverse transform (16 doubles, row major as
-// tinybvh keeps it) and the mesh it places
-layout(set = 0, binding = 6, std430) readonly buffer TopNodeBuffer { uvec4 top_nodes[]; };
-layout(set = 0, binding = 7, std430) readonly buffer TopPrimitiveBuffer { uvec2 top_primitives[]; };
-layout(set = 0, binding = 8, std430) readonly buffer InverseBuffer { double inverses[]; };
-layout(set = 0, binding = 9, std430) readonly buffer InstanceMeshBuffer { uint instance_meshes[]; };
-// One chunk of rays: origins and directions, read from the host's own memory
-// as words, each array laid out as its `step` says, the words from one ray's
-// row to the next: 6, a float64 row each; 3, a float32 row each, which the
-// host chose because every value is exactly a float32 (and zero or normal),
-// so widening it here gives the same double; 0, one float64 row for every
-// ray. Each
-// ray's crossings are counted into `counts` (for occlusion, 1 or 0) and the
-// first `dense` of them written to the ray's room, from `r * dense`, nearest
-// first: two words, the instance in the top level (0 for one mesh) and the
-// face, and the distance in the scene's units. src/vulkan/layout.comp turns
-// the counts into each ray's offset in `hit_offsets`; then, with `retrace`,
-// a ray that crossed more than its room holds is traced again and writes
-// every crossing from that offset, into room for exactly the chunk's counted
-// total (other rays return at once). Each crossing's ray follows from the
-// counts, so none is written
-layout(set = 0, binding = 11, std430) readonly buffer OriginBuffer { uint origins[]; };
-layout(set = 0, binding = 12, std430) readonly buffer DirectionBuffer { uint directions[]; };
-layout(set = 0, binding = 13, std430) writeonly buffer HitBuffer { uvec2 hit_words[]; };
-layout(set = 0, binding = 14, std430) writeonly buffer DistanceBuffer { double distances[]; };
-layout(set = 0, binding = 15, std430) buffer CountBuffer { uint counts[]; };
-layout(set = 0, binding = 16, std430) readonly buffer OffsetBuffer { uint hit_offsets[]; };
-// The f32 shadow of a node, indexed like `nodes`: the box rounded to nearest,
+// The f32 image of a node, indexed like `nodes`: the box rounded to nearest,
 // the same leftFirst, and for a leaf its triangle count; for an interior node
 // bit 31 and a 6-bit tie mask saying which f64 box coordinates its two children
 // share exactly (bit k: aabbMin[k], bit 3+k: aabbMax[k]). 32 bytes
@@ -66,7 +39,7 @@ struct Node32 {
     vec3 hi;
     uint count_word;
 };
-// The f32 shadow of a primitive slot, indexed like `primitives`: the face's
+// The f32 image of the triangle in a leaf slot, indexed like tinybvh's primIdx: the face's
 // corners in tinybvh's i0, i1, i2 order rounded to nearest, `radius` the largest
 // f64 coordinate magnitude of the three rounded up, the face index, the normal
 // (p1 - p0) x (p2 - p0) in f64 rounded to nearest with `nu` bounding its error
@@ -83,33 +56,56 @@ struct Tri32 {
 };
 layout(set = 0, binding = 4, std430) readonly buffer Node32Buffer { Node32 node32[]; };
 layout(set = 0, binding = 5, std430) readonly buffer Tri32Buffer { Tri32 tri32[]; };
+// The top level: its nodes in the same layout, its primitives (instance
+// indices), and per instance the inverse transform (16 doubles, row major as
+// tinybvh keeps it) and the mesh it places
+layout(set = 0, binding = 6, std430) readonly buffer TopNodeBuffer { uvec4 top_nodes[]; };
+layout(set = 0, binding = 7, std430) readonly buffer TopPrimitiveBuffer { uvec2 top_primitives[]; };
+layout(set = 0, binding = 8, std430) readonly buffer InverseBuffer { double inverses[]; };
+layout(set = 0, binding = 9, std430) readonly buffer InstanceMeshBuffer { uint instance_meshes[]; };
 layout(set = 0, binding = 10, std430) readonly buffer TopNode32Buffer { Node32 top_node32[]; };
+// One chunk of rays: origins and directions, read from the host's own memory
+// as words, each array laid out as its `step` says, the words from one ray's
+// row to the next: 6, a float64 row each; 3, a float32 row each, which the
+// host chose because every value is exactly a float32 (and zero or normal),
+// so widening it here gives the same double; 0, one float64 row for every
+// ray. Each ray's crossings are counted into `counts` (for occlusion, 1 or
+// 0), and each crossing is appended to the chunk's log wherever it has room
+// next (`header[0]` counts them): four words, the ray, the crossing's place
+// along it, the instance in the top level (0 for one mesh) and the face, and
+// the distance in the scene's units. A crossing past the log's `capacity` is
+// counted, not written: the host then runs the chunk again with room.
+// src/vulkan/layout.comp puts the log in ray order
+layout(set = 0, binding = 11, std430) readonly buffer OriginBuffer { uint origins[]; };
+layout(set = 0, binding = 12, std430) readonly buffer DirectionBuffer { uint directions[]; };
+layout(set = 0, binding = 13, std430) writeonly buffer LogWordBuffer { uvec4 log_words[]; };
+layout(set = 0, binding = 14, std430) writeonly buffer LogDistanceBuffer { double log_distances[]; };
+layout(set = 0, binding = 15, std430) writeonly buffer CountBuffer { uint counts[]; };
+layout(set = 0, binding = 16, std430) buffer HeaderBuffer { uint header[]; };
 
 // `mode`: 0 traces one mesh (`mesh`), 1 the top level; `occlusion`: 1 answers
 // only whether anything is hit; `most`: the most crossings per ray;
-// `origin_step`, `direction_step`: how the chunk holds each array, as above;
-// `dense`: the crossings per ray its room holds;
-// `retrace`: 1 traces only the rays with more, each writing at its offset
+// `origin_stride`, `direction_stride`: how the chunk holds each array, as above;
+// `capacity`: the crossings the chunk's log holds
 layout(push_constant) uniform Constants {
     uint ray_count;  // rays in the chunk
-    uint mode;
+    uint top_level;
     uint mesh;
     uint occlusion;
     uint most;
-    uint origin_step;
-    uint direction_step;
-    uint dense;
-    uint retrace;
+    uint origin_stride;
+    uint direction_stride;
+    uint capacity;
     double extent;  // the scene's size, in its units
 };
 
-#define GROUP_SIZE 64
+#define GROUP 64
 #define STACK_SIZE 64
-layout(local_size_x = GROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = GROUP, local_size_y = 1, local_size_z = 1) in;
 // a mesh traversal's stack, one per lane, interleaved so a step's pushes land in
 // consecutive banks; the top level's is small and private
-shared uint shared_stack[STACK_SIZE * GROUP_SIZE];
-#define STACK_AT(i) shared_stack[(i) * GROUP_SIZE + lane]
+shared uint shared_stack[STACK_SIZE * GROUP];
+#define STACK_AT(i) shared_stack[(i) * GROUP + lane]
 #define TOP_STACK_SIZE 32
 
 const double BVH_DBL_FAR = 1e300LF;
@@ -176,6 +172,8 @@ double safe_reciprocal(double x) {
 }
 
 double node_word(uvec4 q, uint pair) { return packDouble2x32(pair == 0u ? q.xy : q.zw); }
+// row `index` of the top level's nodes or the meshes', four to a node
+uvec4 node_row(bool top, uint index) { return top ? top_nodes[index] : nodes[index]; }
 
 // A ray in some frame (the world's, or an instance's after transform_ray): the
 // f64 values tinybvh's exact tests need, and the f32 shadow with its bounds
@@ -287,14 +285,14 @@ Ray carried_ray(uint i, const Ray ray, uint mesh_index) {
 }
 
 // The current best hit. Resolved: t is tinybvh's exact distance and t32 its f32 rounding.
-// Pending: the face in `slot` of `mesh`, reached through `instance`, is certified accepted
+// Pending: the face of `mesh`, reached through `instance`, is certified accepted
 // by tinybvh's test and its exact distance lies within hit_bound of t32 (docs/trace.md 5); it is
 // computed only when a decision needs it or the traversal ends. Distances are in the world
 // ray's units in every frame (the carried direction is not normalised), so one interval
 // serves across instances.
 struct Best {
     double t;
-    uint face, instance, mesh, slot;
+    uint face, instance, mesh;
     bool resolved;
     float t32;
     float hit_bound;  // |t32 - t| <= hit_bound (0 for the miss sentinel, 3.3)
@@ -306,29 +304,26 @@ Best no_hit() {
     best.face = MISS;
     best.instance = MISS;
     best.mesh = MISS;
-    best.slot = MISS;
     best.resolved = true;
     best.t32 = infinity();  // min(.., 1e300) and min(.., inf) agree on every finite f32 (3.3)
     best.hit_bound = 0.0;
     return best;
 }
 
-void set_best_exact(inout Best best, double t, uint face, uint instance, uint mesh_index, uint slot) {
+void set_best_exact(inout Best best, double t, uint face, uint instance, uint mesh_index) {
     best.t = t;
     best.face = face;
     best.instance = instance;
     best.mesh = mesh_index;
-    best.slot = slot;
     best.resolved = true;
     best.t32 = float(t);
     best.hit_bound = TWO_U * abs(best.t32) + FLOOR;
 }
 
-void set_best_pending(inout Best best, float t32, float bound, uint face, uint instance, uint mesh_index, uint slot) {
+void set_best_pending(inout Best best, float t32, float bound, uint face, uint instance, uint mesh_index) {
     best.face = face;
     best.instance = instance;
     best.mesh = mesh_index;
-    best.slot = slot;
     best.resolved = false;
     best.t32 = t32;
     best.hit_bound = bound;
@@ -339,14 +334,14 @@ void set_best_pending(inout Best best, float t32, float bound, uint face, uint i
 void child_test_exact(bool top, uint c1, uint c2, const Ray ray, double limit, out bool hit1, out bool hit2, out bool swap) {
     double rD0 = safe_reciprocal(ray.D[0]), rD1 = safe_reciprocal(ray.D[1]), rD2 = safe_reciprocal(ray.D[2]);
     precise double ro0 = ray.O[0] * rD0, ro1 = ray.O[1] * rD1, ro2 = ray.O[2] * rD2;
-    uvec4 n1a = top ? top_nodes[c1 * 4u] : nodes[c1 * 4u];
-    uvec4 n1b = top ? top_nodes[c1 * 4u + 1u] : nodes[c1 * 4u + 1u];
-    uvec4 n1c = top ? top_nodes[c1 * 4u + 2u] : nodes[c1 * 4u + 2u];
-    uvec4 n1d = top ? top_nodes[c1 * 4u + 3u] : nodes[c1 * 4u + 3u];
-    uvec4 n2a = top ? top_nodes[c2 * 4u] : nodes[c2 * 4u];
-    uvec4 n2b = top ? top_nodes[c2 * 4u + 1u] : nodes[c2 * 4u + 1u];
-    uvec4 n2c = top ? top_nodes[c2 * 4u + 2u] : nodes[c2 * 4u + 2u];
-    uvec4 n2d = top ? top_nodes[c2 * 4u + 3u] : nodes[c2 * 4u + 3u];
+    uvec4 n1a = node_row(top, c1 * 4u);
+    uvec4 n1b = node_row(top, c1 * 4u + 1u);
+    uvec4 n1c = node_row(top, c1 * 4u + 2u);
+    uvec4 n1d = node_row(top, c1 * 4u + 3u);
+    uvec4 n2a = node_row(top, c2 * 4u);
+    uvec4 n2b = node_row(top, c2 * 4u + 1u);
+    uvec4 n2c = node_row(top, c2 * 4u + 2u);
+    uvec4 n2d = node_row(top, c2 * 4u + 3u);
     double n1min0 = node_word(n1a, 0u), n1min1 = node_word(n1a, 1u), n1min2 = node_word(n1b, 0u);
     double n1max0 = node_word(n1c, 0u), n1max1 = node_word(n1c, 1u), n1max2 = node_word(n1d, 0u);
     double n2min0 = node_word(n2a, 0u), n2min1 = node_word(n2a, 1u), n2min2 = node_word(n2b, 0u);
@@ -578,7 +573,7 @@ void resolve_best(bool top, const Ray world, inout Best best) {
     Ray ray = top ? carried_ray(best.instance, world, best.mesh) : world;
     double t;
     triangle_hit_exact(ray, offsets.z, offsets.w, best.face, BVH_DBL_FAR, t);
-    set_best_exact(best, t, best.face, best.instance, best.mesh, best.slot);
+    set_best_exact(best, t, best.face, best.instance, best.mesh);
 }
 
 // IntersectOctant / IsOccludedOctant over mesh `mesh_index` with `ray` in its frame: the
@@ -606,7 +601,7 @@ bool trace_mesh(uint lane, bool top, uint mesh_index, uint instance, const Ray r
                     if (occlusion) {
                         return true;
                     }
-                    set_best_pending(best, t32, bound, tri.prim, instance, mesh_index, slot);
+                    set_best_pending(best, t32, bound, tri.prim, instance, mesh_index);
                     continue;
                 }
                 // ambiguous: tinybvh's test, against the exact current best
@@ -616,7 +611,7 @@ bool trace_mesh(uint lane, bool top, uint mesh_index, uint instance, const Ray r
                     if (occlusion) {
                         return true;
                     }
-                    set_best_exact(best, t, tri.prim, instance, mesh_index, slot);
+                    set_best_exact(best, t, tri.prim, instance, mesh_index);
                 }
             }
             if (sp == 0u) {
@@ -716,9 +711,9 @@ bool trace_top(uint lane, const Ray ray, bool occlusion, inout Best best) {
 
 // component `c` of ray `r` of an array of rays laid out by `step`: a float32 word widened, or
 // the two words of a float64, low word first
-#define RAY_VALUE(words, step, r, c)                                                                    \
-    ((step) == 3u ? double(uintBitsToFloat(words[(r) * 3u + (c)]))                                      \
-                  : packDouble2x32(uvec2(words[(r) * (step) + 2u * (c)], words[(r) * (step) + 2u * (c) + 1u])))
+#define RAY_VALUE(words, stride, r, c)                                                                    \
+    ((stride) == 3u ? double(uintBitsToFloat(words[(r) * 3u + (c)]))                                      \
+                  : packDouble2x32(uvec2(words[(r) * (stride) + 2u * (c)], words[(r) * (stride) + 2u * (c) + 1u])))
 
 double direction_length(double dx, double dy, double dz) {
     const double x = abs(dx), y = abs(dy), z = abs(dz);
@@ -735,23 +730,19 @@ double direction_length(double dx, double dy, double dz) {
 
 void main() {
     // groups in two dimensions: a device may cap one dimension at 65535
-    const uint r = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP_SIZE) + gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP) + gl_GlobalInvocationID.x;
     const uint lane = gl_LocalInvocationIndex;
     if (r >= ray_count) {
         return;
     }
-    // tracing again: only a ray with more crossings than its room held
-    if (retrace != 0u && counts[r] <= dense) {
-        return;
-    }
-    const bool top = mode != 0u;
+    const bool top = top_level != 0u;
     // the world ray's shadow is bounded by the tree it traverses first: the top level's
     // root, or the one mesh's
     const vec3 B = root_box(top ? top_node32[0] : node32[meshes[mesh].x]);
-    const double ox = RAY_VALUE(origins, origin_step, r, 0u), oy = RAY_VALUE(origins, origin_step, r, 1u);
-    const double oz = RAY_VALUE(origins, origin_step, r, 2u);
-    const double dx = RAY_VALUE(directions, direction_step, r, 0u), dy = RAY_VALUE(directions, direction_step, r, 1u);
-    const double dz = RAY_VALUE(directions, direction_step, r, 2u);
+    const double ox = RAY_VALUE(origins, origin_stride, r, 0u), oy = RAY_VALUE(origins, origin_stride, r, 1u);
+    const double oz = RAY_VALUE(origins, origin_stride, r, 2u);
+    const double dx = RAY_VALUE(directions, direction_stride, r, 0u), dy = RAY_VALUE(directions, direction_stride, r, 1u);
+    const double dz = RAY_VALUE(directions, direction_stride, r, 2u);
     // the direction's length, as src/bvh.cpp's `length` measures it (libstdc++'s
     // hypot written out: the same IEEE operations here and there), which the
     // scene's size and the distances are in
@@ -761,8 +752,6 @@ void main() {
         counts[r] = 0u;
         return;
     }
-    // the scene's size in the direction's units, as the CPU divides it
-    precise double scene = extent / scale;
     if (occlusion != 0u) {
         const Ray ray = make_ray(ox, oy, oz, dx, dy, dz, B);
         Best best = no_hit();
@@ -778,9 +767,10 @@ void main() {
     // the whole scene is nothing left. Each crossing's distance is measured again
     // from the ray's own origin by tinybvh's exact triangle test on the triangle
     // found, unless the traversal started there
+    // the scene's size in the direction's units, as the CPU divides it
+    precise double scene = extent / scale;
     precise double along = 0.0LF, step = 0.0LF, last_t = 0.0LF;
     uint last_instance = MISS, last_face = MISS, emitted = 0u;
-    const uint at = retrace != 0u ? hit_offsets[r] : r * dense;
     while (emitted < most) {
         precise double mx = ox + dx * along, my = oy + dy * along, mz = oz + dz * along;
         const Ray ray = make_ray(mx, my, mz, dx, dy, dz, B);
@@ -793,8 +783,7 @@ void main() {
         if (best.face == MISS) {
             break;
         }
-        // the winner's exact distance from the moved origin, every lane of the warp
-        // that has one doing it together
+        // the winner's exact distance from the moved origin
         resolve_best(top, ray, best);
         const uint instance = top ? best.instance : 0u;
         if (instance == last_instance && best.face == last_face) {
@@ -820,11 +809,13 @@ void main() {
                 t = along + best.t;
             }
         }
-        if (retrace != 0u || emitted < dense) {
-            // the distance in the scene's units: t * scale, as the CPU multiplies
-            hit_words[at + emitted] = uvec2(instance, best.face);
+        // the crossing goes wherever the log has room next, with its ray and its place
+        // along the ray; the distance in the scene's units: t * scale, as the CPU multiplies
+        const uint entry = atomicAdd(header[0], 1u);
+        if (entry < capacity) {
+            log_words[entry] = uvec4(r, emitted, instance, best.face);
             precise double scaled = t * scale;
-            distances[at + emitted] = scaled;
+            log_distances[entry] = scaled;
         }
         emitted++;
         last_instance = instance;

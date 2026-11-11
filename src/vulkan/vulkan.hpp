@@ -6,20 +6,17 @@
 // or failing is a reason string the caller warns with and answers on the CPU.
 // One device per process, opened on first use and kept; the caller serializes
 // its use (a queue is not thread safe).
-// Rays go through in chunks of a quarter million, two in flight: the host
-// fills a chunk's rays into mapped host memory, submits, and fills the next
-// while the device traces this one. Host memory is written only before the
-// submission that reads it: written behind events while a submission ran, a
-// device was measured answering from bytes it had already fetched. The
-// kernel reads the rays where the host put them (as float64 or float32 rows,
-// or one row for every ray), counts each ray's crossings and writes its first DENSE
-// into the ray's own room, and the device scans the counts into offsets:
-// that is a chunk's first submission, and all of an occlusion query. The
-// host reads back one total, makes room for exactly that many crossings, and
-// a second submission writes them as the caller reads them, compacted and in
-// order, into mapped host memory; a chunk with none skips it. Only the rays
-// that crossed more than DENSE times are traced again, there, each writing
-// every crossing at its offset. Python-free: src/bvh.cpp is the only
+// Rays go through in chunks of a quarter million, two in flight, each one
+// submission: the host fills a chunk's rays into mapped host memory, submits,
+// and fills the next while the device traces this one. Host memory is written
+// only before the submission that reads it. The kernel reads the rays where
+// the host put them (as float64 or float32 rows, or one row for every ray),
+// counts each ray's crossings and appends every crossing to the chunk's log
+// on the device; a scan turns the counts into offsets; and two more steps lay
+// the log out in ray order into mapped host columns, sized by the device from
+// its own total. The host reads that total back: when the log was too small
+// for it, nothing was laid out, and the chunk runs again with room. An
+// occlusion query is the kernel alone. Python-free: src/bvh.cpp is the only
 // user. Vulkan 1.0 core, no extensions.
 #pragma once
 
@@ -52,6 +49,8 @@
 #include <vector>
 
 namespace trimkit::vulkan {
+
+// -- the loader ---------------------------------------------------------------
 
 // every entry point used, loaded by name through the loader
 #define TRIMKIT_VULKAN_INSTANCE_FUNCTIONS(X)    \
@@ -90,6 +89,8 @@ namespace trimkit::vulkan {
     X(vkCmdBindDescriptorSets)             \
     X(vkCmdPushConstants)                  \
     X(vkCmdDispatch)                       \
+    X(vkCmdDispatchIndirect)               \
+    X(vkCmdFillBuffer)                     \
     X(vkCreateFence)                       \
     X(vkResetFences)                       \
     X(vkQueueSubmit)                       \
@@ -104,6 +105,8 @@ struct Functions {
 #undef TRIMKIT_VULKAN_MEMBER
 };
 
+// -- what the shaders read ----------------------------------------------------
+
 // src/vulkan/trace.comp's bindings, in its order: a scene's arrays (tinybvh's
 // nodes, the corners, the vertices, each mesh's first node, leaf slot, corner
 // and vertex in those, and the f32 images of the nodes and of the triangle
@@ -114,9 +117,8 @@ constexpr std::uint32_t SCENE_BUFFERS = 6;
 constexpr std::uint32_t TOP_BUFFERS = 5;
 constexpr std::uint32_t CHUNK_BUFFERS = 6;
 constexpr std::uint32_t TRACE_BINDINGS = SCENE_BUFFERS + TOP_BUFFERS + CHUNK_BUFFERS;
-// src/vulkan/layout.comp: counts, offsets, block sums, the kernel's crossings
-// (each ray's room, and those at the offsets: words and distances of each),
-// and the three columns the host reads
+// src/vulkan/layout.comp: counts, offsets, block sums, the header, the log
+// (words and distances), the order, and the three columns the host reads
 constexpr std::uint32_t LAYOUT_BINDINGS = 10;
 constexpr std::uint32_t SETS = 2;  // descriptor sets per chunk in flight: one per shader
 
@@ -132,7 +134,7 @@ struct Node32 {
 };
 constexpr std::uint32_t INTERIOR = 0x80000000U;
 
-// A triangle per primitive slot as the filter reads it (docs/trace.md 4, 5):
+// The triangle in a leaf slot as the filter reads it (docs/trace.md 4, 5):
 // corners in tinybvh's order as f32, the largest coordinate magnitude rounded
 // up, the face, the f64 normal as f32 and a bound on how far that is from
 // the exact normal
@@ -158,10 +160,6 @@ struct Node64 {
     std::uint64_t count;
 };
 static_assert(sizeof(Node64) == 64);
-// the deepest leaf src/vulkan/trace.comp's stacks hold a path to: its
-// STACK_SIZE for a mesh, its TOP_STACK_SIZE for a top level
-constexpr std::uint32_t MESH_DEPTH = 64;
-constexpr std::uint32_t TOP_DEPTH = 32;
 
 // A tree to put on the device: its nodes, the slots its leaves index (which
 // hold faces, or a top level's instances), what every slot a leaf reaches
@@ -175,23 +173,23 @@ struct Tree {
     std::uint32_t depth;
 };
 
-// Walk a tree from its root, as the shader will: each node reached gets its
-// f32 image in `node32` (docs/trace.md 3: the box rounded to nearest, and for
-// an interior node which of its children's coordinates tie exactly, which
-// decides their order), and `leaf(slot, value)` is called for each slot of
-// each leaf. Nothing is followed before it is checked: a child is a node, a
-// leaf's slots are slots, a slot's value is under the limit, no node is
-// reached twice and no leaf is deeper than the shader's stack. So the shader
-// reads only what was written here, and a slot no leaf reaches (a split
-// build leaves stale ones) is never read at all. False with the reason for a
-// tree that fails any of it
-template <typename Leaf>
-bool walk(const Tree& tree, Node32* node32, const Leaf& leaf, std::string* reason) {
+// The f32 images of a tree's nodes (docs/trace.md 3: each box rounded to
+// nearest, and for an interior node which of its children's coordinates tie
+// exactly, which decides their order), written by walking the tree from its
+// root as the shader will. Nothing is followed before it is checked: a child
+// is a node, a leaf's slots are slots, each of those slots holds a value
+// under the limit, no leaf is deeper than the shader's stack, and no more
+// nodes are reached than the tree has, so the walk ends whatever the nodes
+// say. A node the walk doesn't reach keeps a zeroed image, a leaf of no
+// slots: so whoever reads leaf images reads only slots checked here, and a
+// slot no leaf reaches (a split build leaves stale ones) is never read at
+// all. False with the reason for a tree that fails any of it
+inline bool node_images(const Tree& tree, Node32* node32, std::string* reason) {
     struct Pending {
         std::uint32_t node;
         std::uint32_t depth;
     };
-    Pending stack[MESH_DEPTH + 2];
+    Pending stack[TRACE_STACK_SIZE + 2];
     std::size_t pending = 0;
     std::size_t reached = 0;
     bool sound = tree.node_count > 0 && tree.node_count < INTERIOR && tree.slot_count < INTERIOR;
@@ -210,11 +208,9 @@ bool walk(const Tree& tree, Node32* node32, const Leaf& leaf, std::string* reaso
             sound = sound && node.left_first <= tree.slot_count && node.count <= tree.slot_count - node.left_first;
             for (std::uint64_t slot = node.left_first; sound && slot < node.left_first + node.count; slot++) {
                 sound = tree.slots[slot] < tree.limit;
-                if (sound) {
-                    leaf(static_cast<std::size_t>(slot), tree.slots[slot]);
-                }
             }
-            image.count_word = static_cast<std::uint32_t>(node.count);
+            // an unsound leaf stays the leaf of no slots
+            image.count_word = sound ? static_cast<std::uint32_t>(node.count) : 0;
             continue;
         }
         if (at.depth == tree.depth) {
@@ -243,49 +239,47 @@ bool walk(const Tree& tree, Node32* node32, const Leaf& leaf, std::string* reaso
 }
 // the most rays in one chunk: small enough that a million rays are four
 // chunks, so the host's copy of one and reading of another overlap the
-// device's tracing of a third (measured against 2^16 to 2^22)
+// device's tracing (measured against 2^16 to 2^22)
 constexpr std::size_t CHUNK = std::size_t{1} << 18U;
-constexpr std::uint32_t GROUP_SIZE = 64;
-// crossings per ray the kernel keeps from its counting traversal, each ray
-// in its own room: only a ray with more is traced again. Rays through a real
-// assembly cross about nine surfaces when they hit it at all: one in ten of
-// those more than 16 (traced again, that cost half as much as the first
-// traversal), one in a thousand more than 32
-constexpr std::uint32_t DENSE = 32;
-constexpr std::uint32_t LAYOUT_GROUP = 256;
-constexpr std::uint32_t SCAN_BLOCK = 4 * LAYOUT_GROUP;  // counts per scan block: 4 a lane
+// crossings per ray a chunk's log holds when a device opens: a chunk that
+// logs more runs again with a log that holds them, kept from then on
+constexpr std::size_t LOG_PER_RAY = 4;
+// a chunk's header on the device: the crossings logged, then the three group
+// counts of the dispatches that lay them out
+constexpr VkDeviceSize HEADER_BYTES = 4 * sizeof(std::uint32_t);
+// counts per block of the scan, as src/vulkan/layout.comp groups them
+constexpr std::uint32_t SCAN_BLOCK = LAYOUT_PER_LANE * LAYOUT_GROUP;
 // chunks in flight at once: the host fills and reads one while the device
 // traces the other (measured 11 to 23% faster than one, at 16M rays)
-constexpr std::size_t SLOTS = 2;
+constexpr std::size_t IN_FLIGHT = 2;
 constexpr std::uint32_t UNBOUNDED = 0xffffffffU;
 
 // How a chunk holds an array of rays' origins or directions, as the words from
 // one ray's row to the next: one float64 row for every ray, a float32 row
 // each, or a float64 row each. The host's fill decides it per array and per
 // chunk, and src/vulkan/trace.comp reads through it
-constexpr std::uint32_t STEP_ONE = 0;
-constexpr std::uint32_t STEP_NARROW = 3;
-constexpr std::uint32_t STEP_WIDE = 6;
+constexpr std::uint32_t STRIDE_ONE = 0;
+constexpr std::uint32_t STRIDE_NARROW = 3;
+constexpr std::uint32_t STRIDE_WIDE = 6;
 
 struct PushConstants {
     std::uint32_t ray_count;
-    std::uint32_t mode;  // 0: one mesh, 1: the top level
+    std::uint32_t top;  // 1: through the top level, 0: one mesh
     std::uint32_t mesh;
     std::uint32_t occlusion;
-    std::uint32_t most;            // crossings per ray at most
-    std::uint32_t origin_step;     // words between rays' rows: STEP_ONE, STEP_NARROW or STEP_WIDE
-    std::uint32_t direction_step;  // the same, of the directions
-    std::uint32_t dense;           // crossings per ray its room holds
-    std::uint32_t retrace;         // 1: only the rays with more, each writing every crossing at its offset
-    std::uint32_t spare;           // `extent` is aligned to 8 in the shader too
-    double extent;                 // the scene's size
+    std::uint32_t most;              // crossings per ray at most
+    std::uint32_t origin_stride;     // words between rays' rows: STRIDE_ONE, STRIDE_NARROW or STRIDE_WIDE
+    std::uint32_t direction_stride;  // the same, of the directions
+    std::uint32_t capacity;          // crossings the chunk's log holds
+    double extent;                   // the scene's size
 };
 struct LayoutConstants {
     std::uint32_t count;
-    std::uint32_t step;  // 0 to 2 scan the counts into offsets, 3 writes the crossings out
-    std::uint32_t block_count;
-    std::uint32_t dense;  // crossings per ray the kernel wrote dense (a count past it raises the overflow word), or 0
+    std::uint32_t phase;     // 0 to 2 scan the counts into offsets, 3 orders the log, 4 writes the columns
+    std::uint32_t capacity;  // crossings the chunk's log holds
 };
+
+// -- buffers, a chunk's and the device ----------------------------------------
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -303,35 +297,35 @@ struct Pipeline {
 // What one chunk in flight needs, whichever chunk it holds. Mapped host
 // memory the CPU caches for what the host writes or reads: the rays, read by
 // the kernel over the bus as it traces (measured faster than copying them to
-// the device first), the occlusion words, the chunk's total of crossings,
-// and the three columns the layout writes. The device's own memory for what
-// only shaders touch: the counts, their scan, each ray's room of DENSE
-// crossings, and the crossings of the rays that had more, at their offsets.
-// A crossing is two words, its instance and face, and a distance; in the
-// host's columns its ray too. The ray buffers are a chunk's size from the
-// start; the rest grow to the most a chunk of the query needs, and what grew
-// large is let go when the query ends (`release`)
-struct Slot {
+// the device first), the occlusion words, the header as read back, and the
+// three columns the layout writes. The device's own memory for what only
+// shaders touch: the counts, their scan, the header, the log and its order.
+// A crossing in the log is four words (its ray, its place along the ray, its
+// instance and face) and a distance; in the host's columns its ray, its
+// instance and face, and its distance. The ray buffers are a chunk's size;
+// the log, its order and the columns hold `capacity` crossings
+struct Chunk {
     Buffer origins;
     Buffer directions;
     Buffer occlusion;
     Buffer counts;
     Buffer offsets;
     Buffer blocks;
-    Buffer total;
-    Buffer room_words;
-    Buffer room_distances;
-    Buffer more_words;
-    Buffer more_distances;
-    Buffer rays;
-    Buffer words;
-    Buffer distances;
+    Buffer header;
+    Buffer readback;
+    Buffer log_words;
+    Buffer log_distances;
+    Buffer order;
+    Buffer out_rays;
+    Buffer out_words;
+    Buffer out_distances;
+    std::size_t capacity = 0;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkDescriptorSet trace_set = VK_NULL_HANDLE;
     VkDescriptorSet layout_set = VK_NULL_HANDLE;
-    // how the chunk it holds has its origins and directions: STEP_*
-    std::uint32_t steps[2] = {STEP_WIDE, STEP_WIDE};
+    // how the chunk it holds has its origins and directions: STRIDE_*
+    std::uint32_t strides[2] = {STRIDE_WIDE, STRIDE_WIDE};
 };
 
 struct Device {
@@ -350,7 +344,7 @@ struct Device {
     // the commands and fence uploads use, and the chunks in flight
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    Slot slots[SLOTS];
+    Chunk chunks[IN_FLIGHT];
     int pid = 0;
 };
 
@@ -478,7 +472,9 @@ inline bool make_buffer(const Device& device, VkDeviceSize size, VkBufferUsageFl
 
 constexpr VkMemoryPropertyFlags HOST = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 constexpr VkBufferUsageFlags TRANSFER = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-constexpr VkBufferUsageFlags STORAGE = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | TRANSFER;
+// what any buffer a shader touches may also be: copied, filled, and read for a dispatch's size
+constexpr VkBufferUsageFlags STORAGE =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | TRANSFER;
 
 inline bool begin_commands(const Device& device, VkCommandBuffer command, std::string* reason) {
     if (!ok(device.fn.vkResetCommandBuffer(command, 0), "vkResetCommandBuffer", reason)) {
@@ -518,10 +514,12 @@ inline void barrier(const Device& device, VkCommandBuffer command, VkAccessFlags
     device.fn.vkCmdPipelineBarrier(command, from_stage, to_stage, 0, 1, &memory, 0, nullptr, 0, nullptr);
 }
 
-// one shader's writes made visible to the next shader's reads
+// one shader's writes made visible to the next shader's reads, and to the
+// device reading a dispatch's size
 inline void compute_barrier(const Device& device, VkCommandBuffer command) {
     barrier(device, command, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
 // `size` bytes at `data` as a device-local storage buffer, copied through a
@@ -536,19 +534,20 @@ inline bool upload(const Device& device, const void* data, std::size_t size, Buf
         destroy(device, &staging);
         return false;
     }
-    bool ok = true;
+    bool copied = true;
     if (size > 0) {
         std::memcpy(staging.mapped, data, size);
-        ok = begin_commands(device, device.command, reason);
-        if (ok) {
+        copied = begin_commands(device, device.command, reason);
+        if (copied) {
             VkBufferCopy region{};
             region.size = size;
             device.fn.vkCmdCopyBuffer(device.command, staging.buffer, target.buffer, 1, &region);
-            ok = submit_commands(device, device.command, device.fence, reason) && wait(device, device.fence, reason);
+            copied =
+                submit_commands(device, device.command, device.fence, reason) && wait(device, device.fence, reason);
         }
     }
     destroy(device, &staging);
-    if (!ok) {
+    if (!copied) {
         destroy(device, &target);
         return false;
     }
@@ -556,44 +555,42 @@ inline bool upload(const Device& device, const void* data, std::size_t size, Buf
     return true;
 }
 
-// Room in `buffer` for `bytes`, mapped host memory the CPU caches or the
-// device's own: kept if it has it, else replaced by one grown by doubling,
-// whose contents are new
-inline bool hold(const Device& device, Buffer* buffer, VkDeviceSize bytes, bool mapped, std::string* reason) {
-    if (bytes <= buffer->size) {
-        return true;
-    }
-    VkDeviceSize size = std::max<VkDeviceSize>(buffer->size, VkDeviceSize{1} << 16U);
-    while (size < bytes) {
-        size *= 2;
-    }
-    // doubled past what the device binds, what was asked is still tried
-    size = std::max(bytes, std::min(size, device.range));
-    destroy(device, buffer);
-    return make_buffer(device, size, STORAGE, mapped ? HOST : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                       mapped ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0, buffer, reason);
+// a buffer of `bytes`, mapped host memory the CPU caches or the device's own
+inline bool make_sized(const Device& device, VkDeviceSize bytes, bool mapped, Buffer* out, std::string* reason) {
+    return make_buffer(device, bytes, STORAGE, mapped ? HOST : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                       mapped ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0, out, reason);
 }
 
-// A buffer a query grew past `KEEP` bytes, made small again: a device holds
-// between queries a full chunk's rooms (allocating them costs a millisecond
-// each, measured), not the columns and offsets of a chunk that crossed more.
-// Kept as it is if the small one can't be made
-constexpr VkDeviceSize KEEP = VkDeviceSize{64} << 20U;
-inline void release(const Device& device, Buffer* buffer) {
-    if (buffer->size <= KEEP) {
-        return;
+// A chunk's log, its order and the host's columns, all for `capacity`
+// crossings: the new ones made before the old ones go, so a chunk that can't
+// grow keeps what it has
+inline bool size_log(const Device& device, Chunk* chunk, std::size_t capacity, std::string* reason) {
+    const VkDeviceSize word = sizeof(std::uint32_t);
+    Buffer* const held[6] = {&chunk->log_words, &chunk->log_distances, &chunk->order,
+                             &chunk->out_rays,  &chunk->out_words,     &chunk->out_distances};
+    const VkDeviceSize sizes[6] = {4 * word, sizeof(double), word, word, 2 * word, sizeof(double)};
+    Buffer made[6];
+    bool sized = true;
+    for (std::size_t b = 0; b < 6 && sized; b++) {
+        sized = make_sized(device, capacity * sizes[b], b >= 3, &made[b], reason);
     }
-    Buffer small;
-    std::string ignored;
-    if (hold(device, &small, 1, buffer->mapped != nullptr, &ignored)) {
-        destroy(device, buffer);
-        *buffer = small;
+    for (std::size_t b = 0; b < 6; b++) {
+        destroy(device, sized ? held[b] : &made[b]);
+        if (sized) {
+            *held[b] = made[b];
+        }
     }
+    if (sized) {
+        chunk->capacity = capacity;
+    }
+    return sized;
 }
 
 constexpr std::size_t scan_blocks(std::size_t rays) { return (rays + SCAN_BLOCK - 1) / SCAN_BLOCK; }
 // src/vulkan/layout.comp finds a scan block in one dimension of groups, which a device may cap at 65535
-static_assert(scan_blocks(CHUNK) <= 32768);
+static_assert(scan_blocks(CHUNK) <= LAYOUT_WIDEST);
+
+// -- opening the device -------------------------------------------------------
 
 // a shader as a pipeline: `bindings` storage buffers in one set and
 // `push_bytes` of push constants
@@ -756,7 +753,7 @@ inline bool open(Device* device, std::string* reason) {
         }
     }
     if (device->physical == VK_NULL_HANDLE) {
-        *reason = count == 0 ? "no Vulkan device is present" : "no Vulkan device computes in double precision: " + seen;
+        *reason = count == 0 ? "no Vulkan device is present" : "no Vulkan device can run the kernel: " + seen;
         return false;
     }
     fn.vkGetPhysicalDeviceMemoryProperties(device->physical, &device->memory);
@@ -799,26 +796,26 @@ inline bool open(Device* device, std::string* reason) {
     }
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = (TRACE_BINDINGS + LAYOUT_BINDINGS) * SLOTS;
+    pool_size.descriptorCount = (TRACE_BINDINGS + LAYOUT_BINDINGS) * IN_FLIGHT;
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = SETS * SLOTS;
+    pool_info.maxSets = SETS * IN_FLIGHT;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     if (!ok(fn.vkCreateDescriptorPool(device->device, &pool_info, nullptr, &device->descriptor_pool),
             "vkCreateDescriptorPool", reason)) {
         return false;
     }
-    VkDescriptorSetLayout layouts[SETS * SLOTS];
-    for (std::size_t s = 0; s < SLOTS; s++) {
+    VkDescriptorSetLayout layouts[SETS * IN_FLIGHT];
+    for (std::size_t s = 0; s < IN_FLIGHT; s++) {
         layouts[(SETS * s)] = device->trace.set_layout;
         layouts[(SETS * s) + 1] = device->layout.set_layout;
     }
-    VkDescriptorSet sets[SETS * SLOTS]{};
+    VkDescriptorSet sets[SETS * IN_FLIGHT]{};
     VkDescriptorSetAllocateInfo set_info{};
     set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     set_info.descriptorPool = device->descriptor_pool;
-    set_info.descriptorSetCount = SETS * SLOTS;
+    set_info.descriptorSetCount = SETS * IN_FLIGHT;
     set_info.pSetLayouts = layouts;
     if (!ok(fn.vkAllocateDescriptorSets(device->device, &set_info, sets), "vkAllocateDescriptorSets", reason)) {
         return false;
@@ -834,50 +831,42 @@ inline bool open(Device* device, std::string* reason) {
             "vkCreateCommandPool", reason)) {
         return false;
     }
-    VkCommandBuffer commands[SLOTS + 1]{};
+    VkCommandBuffer commands[IN_FLIGHT + 1]{};
     VkCommandBufferAllocateInfo command_info{};
     command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     command_info.commandPool = device->command_pool;
     command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    command_info.commandBufferCount = SLOTS + 1;
+    command_info.commandBufferCount = IN_FLIGHT + 1;
     if (!ok(fn.vkAllocateCommandBuffers(device->device, &command_info, commands), "vkAllocateCommandBuffers", reason)) {
         return false;
     }
     VkFenceCreateInfo fence_info{};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    device->command = commands[SLOTS];
+    device->command = commands[IN_FLIGHT];
     if (!ok(fn.vkCreateFence(device->device, &fence_info, nullptr, &device->fence), "vkCreateFence", reason)) {
         return false;
     }
-    for (std::size_t s = 0; s < SLOTS; s++) {
-        Slot& slot = device->slots[s];
-        slot.command = commands[s];
-        slot.trace_set = sets[SETS * s];
-        slot.layout_set = sets[(SETS * s) + 1];
-        if (!ok(fn.vkCreateFence(device->device, &fence_info, nullptr, &slot.fence), "vkCreateFence", reason)) {
+    for (std::size_t s = 0; s < IN_FLIGHT; s++) {
+        Chunk& chunk = device->chunks[s];
+        chunk.command = commands[s];
+        chunk.trace_set = sets[SETS * s];
+        chunk.layout_set = sets[(SETS * s) + 1];
+        if (!ok(fn.vkCreateFence(device->device, &fence_info, nullptr, &chunk.fence), "vkCreateFence", reason)) {
             return false;
         }
-        // a chunk's rays and counts, and something to bind for the rest
+        // a chunk's rays and counts, and a log for LOG_PER_RAY crossings of each
         const VkDeviceSize word = sizeof(std::uint32_t);
         const VkDeviceSize point = 3 * sizeof(double);
-        if (!hold(*device, &slot.origins, CHUNK * point, true, reason) ||
-            !hold(*device, &slot.directions, CHUNK * point, true, reason) ||
-            !hold(*device, &slot.occlusion, CHUNK * word, true, reason) ||
-            !hold(*device, &slot.counts, CHUNK * word, false, reason) ||
-            !hold(*device, &slot.offsets, CHUNK * word, false, reason) ||
-            !hold(*device, &slot.blocks, (scan_blocks(CHUNK) + 2) * word, false, reason) ||
-            !hold(*device, &slot.total, 2 * word, true, reason)) {
+        if (!make_sized(*device, CHUNK * point, true, &chunk.origins, reason) ||
+            !make_sized(*device, CHUNK * point, true, &chunk.directions, reason) ||
+            !make_sized(*device, CHUNK * word, true, &chunk.occlusion, reason) ||
+            !make_sized(*device, CHUNK * word, false, &chunk.counts, reason) ||
+            !make_sized(*device, CHUNK * word, false, &chunk.offsets, reason) ||
+            !make_sized(*device, scan_blocks(CHUNK) * word, false, &chunk.blocks, reason) ||
+            !make_sized(*device, HEADER_BYTES, false, &chunk.header, reason) ||
+            !make_sized(*device, HEADER_BYTES, true, &chunk.readback, reason) ||
+            !size_log(*device, &chunk, CHUNK * LOG_PER_RAY, reason)) {
             return false;
-        }
-        for (Buffer* buffer : {&slot.room_words, &slot.room_distances, &slot.more_words, &slot.more_distances}) {
-            if (!hold(*device, buffer, 1, false, reason)) {
-                return false;
-            }
-        }
-        for (Buffer* buffer : {&slot.rays, &slot.words, &slot.distances}) {
-            if (!hold(*device, buffer, 1, true, reason)) {
-                return false;
-            }
         }
     }
     device->pid = process_id();
@@ -909,6 +898,8 @@ inline Device* shared_device(std::string* reason) {
     }
     return &opened.device;
 }
+
+// -- a scene on the device, and a query of it ---------------------------------
 
 // one array to put on the device: its bytes
 struct Span {
@@ -951,9 +942,6 @@ struct Query {
     double extent = 0.0;
 };
 
-// crossings per ray a chunk's counting traversal keeps
-inline std::uint32_t room_width(const Query& query) { return std::min(query.most, DENSE); }
-
 // `count` buffers bound to `set`, in binding order
 inline void bind_set(const Device& device, VkDescriptorSet set, const Buffer* const* buffers, std::uint32_t count) {
     VkDescriptorBufferInfo infos[TRACE_BINDINGS]{};
@@ -971,10 +959,9 @@ inline void bind_set(const Device& device, VkDescriptorSet set, const Buffer* co
     device.fn.vkUpdateDescriptorSets(device.device, count, writes, 0, nullptr);
 }
 
-// bind what a query reads and the slot's own buffers (which may have regrown)
-// to the slot's two sets, before each submission is recorded. The kernel
-// writes crossings to each ray's room, or tracing again, to the offsets
-inline void bind(const Device& device, const Slot& slot, const Query& query, bool retrace) {
+// bind what a query reads and the chunk's own buffers to the chunk's two sets:
+// before a chunk is recorded, and again when its log has been resized
+inline void bind(const Device& device, const Chunk& chunk, const Query& query) {
     const Buffer* trace[TRACE_BINDINGS];
     std::uint32_t b = 0;
     for (const Buffer& buffer : query.scene->buffers) {
@@ -984,105 +971,90 @@ inline void bind(const Device& device, const Slot& slot, const Query& query, boo
     for (std::uint32_t i = 0; i < TOP_BUFFERS; i++) {
         trace[b++] = query.top != nullptr ? &query.top->buffers[i] : &query.scene->buffers[0];
     }
-    for (const Buffer* buffer : {&slot.origins, &slot.directions, retrace ? &slot.more_words : &slot.room_words,
-                                 retrace ? &slot.more_distances : &slot.room_distances,
-                                 query.occlusion ? &slot.occlusion : &slot.counts, &slot.offsets}) {
+    for (const Buffer* buffer : {&chunk.origins, &chunk.directions, &chunk.log_words, &chunk.log_distances,
+                                 query.occlusion ? &chunk.occlusion : &chunk.counts, &chunk.header}) {
         trace[b++] = buffer;
     }
-    const Buffer* layout[LAYOUT_BINDINGS] = {
-        &slot.counts,     &slot.offsets,        &slot.blocks, &slot.room_words, &slot.room_distances,
-        &slot.more_words, &slot.more_distances, &slot.rays,   &slot.words,      &slot.distances};
-    bind_set(device, slot.trace_set, trace, TRACE_BINDINGS);
-    bind_set(device, slot.layout_set, layout, LAYOUT_BINDINGS);
+    const Buffer* layout[LAYOUT_BINDINGS] = {&chunk.counts,    &chunk.offsets,       &chunk.blocks, &chunk.header,
+                                             &chunk.log_words, &chunk.log_distances, &chunk.order,  &chunk.out_rays,
+                                             &chunk.out_words, &chunk.out_distances};
+    bind_set(device, chunk.trace_set, trace, TRACE_BINDINGS);
+    bind_set(device, chunk.layout_set, layout, LAYOUT_BINDINGS);
 }
 
-// `groups` groups of a pipeline, in two dimensions: a device may cap one
-// dimension at 65535
-inline void dispatch(const Device& device, VkCommandBuffer command, const Pipeline& pipeline, VkDescriptorSet set,
-                     const void* constants, std::uint32_t constants_size, std::size_t groups) {
+// a pipeline, its set and its constants, for the dispatch that follows
+inline void use(const Device& device, VkCommandBuffer command, const Pipeline& pipeline, VkDescriptorSet set,
+                const void* constants, std::uint32_t constants_size) {
     device.fn.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
     device.fn.vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
     device.fn.vkCmdPushConstants(command, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, constants_size, constants);
-    const std::uint32_t width = static_cast<std::uint32_t>(std::min<std::size_t>(groups, 32768));
+}
+
+// `groups` groups of what `use` chose, in two dimensions: a device may cap
+// one dimension at 65535
+inline void dispatch(const Device& device, VkCommandBuffer command, std::size_t groups) {
+    const std::uint32_t width = static_cast<std::uint32_t>(std::min<std::size_t>(groups, LAYOUT_WIDEST));
     const std::uint32_t height = static_cast<std::uint32_t>((groups + width - 1) / width);
     device.fn.vkCmdDispatch(command, width, height, 1);
 }
 
-// the kernel over the `count` rays of the slot's chunk. Every count here is
-// under 2^32: a chunk has at most CHUNK rays, and its crossings are indexed
-// with 32-bit words on the device (an offset of 4 billion crossings in one
-// chunk would be 80 GB of answers)
-inline void trace_rays(const Device& device, const Slot& slot, const Query& query, std::size_t count, bool retrace) {
-    PushConstants constants{};
-    constants.ray_count = static_cast<std::uint32_t>(count);
-    constants.mode = query.top != nullptr ? 1 : 0;
-    constants.mesh = query.mesh;
-    constants.occlusion = query.occlusion ? 1 : 0;
-    constants.most = query.most;
-    constants.origin_step = slot.steps[0];
-    constants.direction_step = slot.steps[1];
-    constants.dense = room_width(query);
-    constants.retrace = retrace ? 1 : 0;
-    constants.extent = query.extent;
-    dispatch(device, slot.command, device.trace, slot.trace_set, &constants, sizeof(constants),
-             (count + GROUP_SIZE - 1) / GROUP_SIZE);
-}
-
-// A chunk's first submission, the host having filled its `count` rays: the
-// kernel, counting each ray's crossings and writing its first DENSE to its
-// room; for an occlusion query that is all. Then the scan of the counts into
-// offsets, which raises the overflow word when a ray had more, and the
-// chunk's total and that word copied to host memory
-inline bool record_trace(const Device& device, const Slot& slot, const Query& query, std::size_t count,
+// Record and submit a chunk: the host has filled its `count` rays. The
+// header is zeroed; the kernel counts each ray's crossings and logs them; for
+// an occlusion query that is all. Then the scan of the counts into offsets,
+// which also writes into the header how many groups lay the log out (none,
+// when more was logged than the log holds); those two dispatches, sized by
+// the device from the header; and the header copied to host memory
+inline bool record_chunk(const Device& device, const Chunk& chunk, const Query& query, std::size_t count,
                          std::string* reason) {
-    if (!begin_commands(device, slot.command, reason)) {
+    if (!begin_commands(device, chunk.command, reason)) {
         return false;
     }
-    trace_rays(device, slot, query, count, false);
+    const Functions& fn = device.fn;
+    // every count here is under 2^32: a chunk has at most CHUNK rays, and its
+    // crossings are indexed with 32-bit words on the device
+    PushConstants trace{};
+    trace.ray_count = static_cast<std::uint32_t>(count);
+    trace.top = query.top != nullptr ? 1 : 0;
+    trace.mesh = query.mesh;
+    trace.occlusion = query.occlusion ? 1 : 0;
+    trace.most = query.most;
+    trace.origin_stride = chunk.strides[0];
+    trace.direction_stride = chunk.strides[1];
+    trace.capacity = static_cast<std::uint32_t>(chunk.capacity);
+    trace.extent = query.extent;
+    if (!query.occlusion) {
+        fn.vkCmdFillBuffer(chunk.command, chunk.header.buffer, 0, HEADER_BYTES, 0);
+        barrier(device, chunk.command, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+    use(device, chunk.command, device.trace, chunk.trace_set, &trace, sizeof(trace));
+    dispatch(device, chunk.command, (count + TRACE_GROUP - 1) / TRACE_GROUP);
     if (query.occlusion) {
-        return submit_commands(device, slot.command, slot.fence, reason);
+        return submit_commands(device, chunk.command, chunk.fence, reason);
     }
     const std::size_t blocks = scan_blocks(count);
     LayoutConstants layout{};
     layout.count = static_cast<std::uint32_t>(count);
-    layout.block_count = static_cast<std::uint32_t>(blocks);
-    layout.dense = room_width(query);
+    layout.capacity = static_cast<std::uint32_t>(chunk.capacity);
     for (const std::size_t groups : {blocks, std::size_t{1}, blocks}) {
-        compute_barrier(device, slot.command);
-        dispatch(device, slot.command, device.layout, slot.layout_set, &layout, sizeof(layout), groups);
-        layout.step++;
+        compute_barrier(device, chunk.command);
+        use(device, chunk.command, device.layout, chunk.layout_set, &layout, sizeof(layout));
+        dispatch(device, chunk.command, groups);
+        layout.phase++;
     }
-    // the total and the overflow word, after the last block
-    barrier(device, slot.command, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    // ordering the log, then writing the columns: the header's three counts, after its total
+    for (std::uint32_t laid = 0; laid < 2; laid++) {
+        compute_barrier(device, chunk.command);
+        use(device, chunk.command, device.layout, chunk.layout_set, &layout, sizeof(layout));
+        fn.vkCmdDispatchIndirect(chunk.command, chunk.header.buffer, sizeof(std::uint32_t));
+        layout.phase++;
+    }
+    barrier(device, chunk.command, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferCopy region{};
-    region.srcOffset = blocks * sizeof(std::uint32_t);
-    region.size = 2 * sizeof(std::uint32_t);
-    device.fn.vkCmdCopyBuffer(slot.command, slot.blocks.buffer, slot.total.buffer, 1, &region);
-    return submit_commands(device, slot.command, slot.fence, reason);
-}
-
-// A chunk's second submission, for its `total` crossings, the host having
-// made room for them: with `overflow`, the kernel again for the rays that
-// crossed more than their room holds, each writing every crossing at its
-// offset; then a lane per crossing writing it into the host's columns
-inline bool record_layout(const Device& device, const Slot& slot, const Query& query, std::size_t count,
-                          std::size_t total, bool overflow, std::string* reason) {
-    if (!begin_commands(device, slot.command, reason)) {
-        return false;
-    }
-    if (overflow) {
-        trace_rays(device, slot, query, count, true);
-        compute_barrier(device, slot.command);
-    }
-    LayoutConstants layout{};
-    layout.count = static_cast<std::uint32_t>(count);
-    layout.step = 3;
-    layout.block_count = static_cast<std::uint32_t>(scan_blocks(count));
-    layout.dense = room_width(query);
-    dispatch(device, slot.command, device.layout, slot.layout_set, &layout, sizeof(layout),
-             (total + LAYOUT_GROUP - 1) / LAYOUT_GROUP);
-    return submit_commands(device, slot.command, slot.fence, reason);
+    region.size = HEADER_BYTES;
+    fn.vkCmdCopyBuffer(chunk.command, chunk.header.buffer, chunk.readback.buffer, 1, &region);
+    return submit_commands(device, chunk.command, chunk.fence, reason);
 }
 
 // A chunk's answers as the caller reads them
@@ -1096,9 +1068,9 @@ struct Answers {
     const double* distances;         // and the distance in the scene's units
 };
 
-// One query over `count` rays, chunk k in slot k % SLOTS: `fill(origins,
+// One query over `count` rays, chunk k in chunk k % IN_FLIGHT: `fill(origins,
 // directions, begin, n, steps)` writes a chunk's rays before the chunk is
-// submitted, each array as the STEP_* it names in `steps`, or returns false
+// submitted, each array as the STRIDE_* it names in `steps`, or returns false
 // to end the query there (rays it won't hand a device: no reason is given),
 // and `consume(answers)` reads each
 // chunk's answers, in order, while the chunks after it run. False with the
@@ -1106,54 +1078,43 @@ struct Answers {
 template <typename Fill, typename Consume>
 bool run_query(Device& device, const Query& query, std::size_t count, const Fill& fill, const Consume& consume,
                std::string* reason) {
-    const auto rays_of = [&](std::size_t chunk) { return std::min(CHUNK, count - (chunk * CHUNK)); };
-    const VkDeviceSize word = sizeof(std::uint32_t);
-    // chunk `chunk` filled and submitted
-    const auto start = [&](std::size_t chunk) -> bool {
-        Slot& slot = device.slots[chunk % SLOTS];
-        const std::size_t n = rays_of(chunk);
-        // each ray's room, which an occlusion query never writes
-        const VkDeviceSize room = query.occlusion ? 0 : VkDeviceSize{n} * room_width(query);
-        if (!hold(device, &slot.room_words, room * 2 * word, false, reason) ||
-            !hold(device, &slot.room_distances, room * sizeof(double), false, reason)) {
-            return false;
-        }
-        bind(device, slot, query, false);
-        return fill(slot.origins.mapped, slot.directions.mapped, chunk * CHUNK, n, slot.steps) &&
-               record_trace(device, slot, query, n, reason);
+    const auto rays_of = [&](std::size_t number) { return std::min(CHUNK, count - (number * CHUNK)); };
+    // chunk `number` of the query filled and submitted
+    const auto start = [&](std::size_t number) -> bool {
+        Chunk& chunk = device.chunks[number % IN_FLIGHT];
+        const std::size_t n = rays_of(number);
+        bind(device, chunk, query);
+        return fill(chunk.origins.mapped, chunk.directions.mapped, number * CHUNK, n, chunk.strides) &&
+               record_chunk(device, chunk, query, n, reason);
     };
-    // chunk `chunk` waited for, and with `read` its crossings laid out and its answers consumed
-    const auto finish = [&](std::size_t chunk, bool read) -> bool {
-        Slot& slot = device.slots[chunk % SLOTS];
-        if (!wait(device, slot.fence, reason) || !read) {
+    // chunk `number` waited for, and with `read` its answers consumed
+    const auto finish = [&](std::size_t number, bool read) -> bool {
+        Chunk& chunk = device.chunks[number % IN_FLIGHT];
+        if (!wait(device, chunk.fence, reason) || !read) {
             return false;
         }
         Answers answers{};
-        answers.begin = chunk * CHUNK;
-        answers.count = rays_of(chunk);
-        answers.occlusion = static_cast<const std::uint32_t*>(slot.occlusion.mapped);
-        const std::uint32_t* total = static_cast<const std::uint32_t*>(slot.total.mapped);
-        if (!query.occlusion && total[0] != 0) {
-            answers.total = total[0];
-            const bool overflow = total[1] != 0;
-            // room for exactly the crossings counted: the columns, and for a
-            // ray past its own room, every crossing at its offset
-            const VkDeviceSize more = overflow ? answers.total : 0;
-            if (!hold(device, &slot.rays, answers.total * word, true, reason) ||
-                !hold(device, &slot.words, answers.total * 2 * word, true, reason) ||
-                !hold(device, &slot.distances, answers.total * sizeof(double), true, reason) ||
-                !hold(device, &slot.more_words, more * 2 * word, false, reason) ||
-                !hold(device, &slot.more_distances, more * sizeof(double), false, reason)) {
-                return false;
+        answers.begin = number * CHUNK;
+        answers.count = rays_of(number);
+        answers.occlusion = static_cast<const std::uint32_t*>(chunk.occlusion.mapped);
+        if (!query.occlusion) {
+            const std::uint32_t* logged = static_cast<const std::uint32_t*>(chunk.readback.mapped);
+            // more crossings than the log holds were counted, not laid out:
+            // the chunk again, its rays still where they are, with a log that
+            // holds them (at least twice the last, so few chunks do this)
+            while (*logged > chunk.capacity) {
+                if (!size_log(device, &chunk, std::max<std::size_t>(*logged, 2 * chunk.capacity), reason)) {
+                    return false;
+                }
+                bind(device, chunk, query);
+                if (!record_chunk(device, chunk, query, answers.count, reason) || !wait(device, chunk.fence, reason)) {
+                    return false;
+                }
             }
-            bind(device, slot, query, true);
-            if (!record_layout(device, slot, query, answers.count, answers.total, overflow, reason) ||
-                !wait(device, slot.fence, reason)) {
-                return false;
-            }
-            answers.rays = static_cast<const std::uint32_t*>(slot.rays.mapped);
-            answers.words = static_cast<const std::uint32_t*>(slot.words.mapped);
-            answers.distances = static_cast<const double*>(slot.distances.mapped);
+            answers.total = *logged;
+            answers.rays = static_cast<const std::uint32_t*>(chunk.out_rays.mapped);
+            answers.words = static_cast<const std::uint32_t*>(chunk.out_words.mapped);
+            answers.distances = static_cast<const double*>(chunk.out_distances.mapped);
         }
         consume(answers);
         return true;
@@ -1163,8 +1124,8 @@ bool run_query(Device& device, const Query& query, std::size_t count, const Fill
     std::size_t finished = 0;
     bool working = true;
     while (working && started < chunks) {
-        // a slot is free once the chunk SLOTS before this one has finished
-        if (started - finished == SLOTS) {
+        // a chunk is free once the chunk IN_FLIGHT before this one has finished
+        if (started - finished == IN_FLIGHT) {
             working = finish(finished++, true);
         }
         if (working) {
@@ -1175,12 +1136,6 @@ bool run_query(Device& device, const Query& query, std::size_t count, const Fill
     // the chunks still in flight, oldest first: waited for even after a failure
     while (finished < started) {
         working = finish(finished++, working) && working;
-    }
-    for (Slot& slot : device.slots) {
-        for (Buffer* buffer : {&slot.room_words, &slot.room_distances, &slot.more_words, &slot.more_distances,
-                               &slot.rays, &slot.words, &slot.distances}) {
-            release(device, buffer);
-        }
     }
     return working;
 }

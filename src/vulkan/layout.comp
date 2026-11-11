@@ -1,60 +1,58 @@
 // A chunk's crossings laid out for the host, after src/vulkan/trace.comp has
-// counted each ray's and written its first few: four dispatches of this one
-// shader (`step` in the push constants), so nothing per ray visits the host
-// in between.
+// counted each ray's and logged them in whatever order its lanes ran: five
+// dispatches of this one shader (`phase` in the push constants), in the same
+// submission, so nothing per ray visits the host in between.
 //
-// Steps 0 to 2 are an exclusive prefix sum of the counts into each ray's
+// Phases 0 to 2 are an exclusive prefix sum of the counts into each ray's
 // offset:
-//   step 0, one group per block of 1024 counts: the block's sum into `blocks`
-//   step 1, one group: `blocks` scanned in place (exclusive), the chunk's total
-//           of crossings written after the last block and the overflow word
-//           after that cleared
-//   step 2, one group per block: each count's offset, the block's offset plus
-//           the exclusive prefix within the block; a count past `dense`, the
-//           crossings per ray the kernel wrote, raises the overflow word: the
-//           host then traces the chunk again at the offsets
+//   phase 0, one group per block of 1024 counts: the block's sum into `blocks`
+//   phase 1, one group: `blocks` scanned in place (exclusive), and into the
+//           header the groups phases 3 and 4 run with, a lane per crossing
+//           logged: none when more were logged than the log holds
+//   phase 2, one group per block: each count's offset, the block's offset plus
+//           the exclusive prefix within the block
 // Integer adds in a fixed order: the same offsets on every device.
 //
-// Step 3, once the host has read the total and made room, writes the
-// crossings as the host reads them, compacted and in ray order, straight
-// into host memory: one lane per output slot, so consecutive lanes write
-// consecutive addresses (a write over the bus must coalesce: a lane per ray
-// writing its run of crossings measured 50x slower). A slot's ray is found
-// by binary search over the offsets; its crossing is read from where the
-// kernel put it: in the ray's room at `ray * dense + k`, or for a ray that
-// crossed more than its room holds, where the second traversal wrote it, at
-// this same slot.
-// Three columns, 20 bytes a crossing: the ray, counted from the chunk's
-// first, two words (the instance and the face) and the distance. The host
-// widens the words to the caller's int64 (adding the chunk's first ray,
-// mapping the instance through its table) as it copies them into the result,
-// which costs it the same as copying int64 would.
+// Phase 3 gives each log entry its slot in ray order: `order[slot] = entry`
+// for the slot at its ray's offset plus its place along the ray. Each (ray,
+// place) is logged once, so each slot is written once, whatever order the
+// log is in.
 //
-// Vulkan 1.0: shared memory and barriers, one atomic word, no subgroup
-// operations. Compiled by `uv run scripts generate` into
-// src/vulkan/spirv.hpp
+// Phase 4 writes the crossings as the host reads them, straight into host
+// memory: one lane per output slot, so consecutive lanes write consecutive
+// addresses (a write over the bus must coalesce: a lane per ray writing its
+// run of crossings measured 50x slower). Three columns, 20 bytes a crossing:
+// the ray, counted from the chunk's first, two words (the instance and the
+// face) and the distance. The host widens the words to the caller's int64
+// (adding the chunk's first ray, mapping the instance through its table) as
+// it copies them into the result, which costs it the same as copying int64
+// would.
+//
+// Vulkan 1.0: shared memory and barriers, no subgroup operations. Compiled by
+// `uv run scripts generate` into src/vulkan/spirv.hpp
 #version 450
 
 layout(local_size_x = 256) in;
 #define GROUP 256u
 #define PER_LANE 4u
+// the most groups in one dimension of a dispatch: a device may cap one at 65535
+#define WIDEST 32768u
 #define BLOCK (GROUP * PER_LANE)
 
 layout(set = 0, binding = 0, std430) readonly buffer CountBuffer { uint counts[]; };
 layout(set = 0, binding = 1, std430) buffer OffsetBuffer { uint offsets[]; };
-layout(set = 0, binding = 2, std430) buffer BlockBuffer { uint blocks[]; };  // then the total, then the overflow word
-layout(set = 0, binding = 3, std430) readonly buffer RoomWordBuffer { uvec2 room_words[]; };  // instance, face
-layout(set = 0, binding = 4, std430) readonly buffer RoomDistanceBuffer { double room_distances[]; };
-layout(set = 0, binding = 5, std430) readonly buffer MoreWordBuffer { uvec2 more_words[]; };
-layout(set = 0, binding = 6, std430) readonly buffer MoreDistanceBuffer { double more_distances[]; };
+layout(set = 0, binding = 2, std430) buffer BlockBuffer { uint blocks[]; };
+layout(set = 0, binding = 3, std430) buffer HeaderBuffer { uint header[]; };  // the crossings logged, then three group counts
+layout(set = 0, binding = 4, std430) readonly buffer LogWordBuffer { uvec4 log_words[]; };  // ray, place, instance, face
+layout(set = 0, binding = 5, std430) readonly buffer LogDistanceBuffer { double log_distances[]; };
+layout(set = 0, binding = 6, std430) buffer OrderBuffer { uint order[]; };
 layout(set = 0, binding = 7, std430) writeonly buffer OutRayBuffer { uint out_rays[]; };
 layout(set = 0, binding = 8, std430) writeonly buffer OutWordBuffer { uvec2 out_words[]; };
 layout(set = 0, binding = 9, std430) writeonly buffer OutDistanceBuffer { double out_distances[]; };
 layout(push_constant) uniform Constants {
     uint count;        // rays in the chunk
-    uint step;         // 0 to 3 as above
-    uint block_count;  // ceil(count / 1024)
-    uint dense;        // crossings per ray its room holds
+    uint phase;         // 0 to 4 as above
+    uint capacity;     // crossings the log holds
 };
 
 shared uint partial[GROUP];
@@ -72,42 +70,29 @@ uint scan_group(uint lane, uint value) {
     return partial[lane];
 }
 
-void write_crossing() {
-    // groups in two dimensions: a device may cap one dimension at 65535
-    const uint slot = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP) + gl_GlobalInvocationID.x;
-    if (slot >= blocks[block_count]) {
-        return;
-    }
-    // the ray whose run holds the slot: the first r with offsets[r + 1] > slot
-    uint low = 0u, high = count - 1u;
-    while (low < high) {
-        const uint mid = (low + high) / 2u;
-        if (offsets[mid + 1u] > slot) {
-            high = mid;
-        } else {
-            low = mid + 1u;
-        }
-    }
-    const uint r = low;
-    out_rays[slot] = r;
-    if (counts[r] > dense) {
-        out_words[slot] = more_words[slot];
-        out_distances[slot] = more_distances[slot];
-    } else {
-        const uint from = r * dense + (slot - offsets[r]);
-        out_words[slot] = room_words[from];
-        out_distances[slot] = room_distances[from];
-    }
-}
-
 void main() {
-    if (step == 3u) {
-        write_crossing();
+    const uint lane = gl_LocalInvocationID.x;
+    const uint block_count = (count + BLOCK - 1u) / BLOCK;
+    if (phase >= 3u) {
+        // groups in two dimensions: a device may cap one dimension at 65535
+        const uint slot = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * GROUP) + gl_GlobalInvocationID.x;
+        if (slot >= header[0]) {
+            return;
+        }
+        if (phase == 3u) {
+            const uvec4 entry = log_words[slot];
+            order[offsets[entry.x] + entry.y] = slot;
+            return;
+        }
+        const uint from = order[slot];
+        const uvec4 entry = log_words[from];
+        out_rays[slot] = entry.x;
+        out_words[slot] = entry.zw;
+        out_distances[slot] = log_distances[from];
         return;
     }
-    const uint lane = gl_LocalInvocationID.x;
     const uint block = gl_WorkGroupID.x;
-    if (step == 1u) {
+    if (phase == 1u) {
         uint carry = 0u;
         for (uint base = 0u; base < block_count; base += GROUP) {
             const uint i = base + lane;
@@ -120,12 +105,15 @@ void main() {
             barrier();  // every lane has read the total before the next round overwrites it
         }
         if (lane == 0u) {
-            blocks[block_count] = carry;
-            blocks[block_count + 1u] = 0u;
+            const uint groups = header[0] <= capacity ? (header[0] + GROUP - 1u) / GROUP : 0u;
+            const uint width = min(groups, WIDEST);
+            header[1] = width;
+            header[2] = width == 0u ? 0u : (groups + width - 1u) / width;
+            header[3] = 1u;
         }
         return;
     }
-    // steps 0 and 2: this lane's four consecutive counts of the block
+    // phases 0 and 2: this lane's four consecutive counts of the block
     uint value[PER_LANE];
     uint sum = 0u;
     for (uint k = 0u; k < PER_LANE; k++) {
@@ -134,7 +122,7 @@ void main() {
         sum += value[k];
     }
     const uint inclusive = scan_group(lane, sum);
-    if (step == 0u) {
+    if (phase == 0u) {
         if (lane == GROUP - 1u) {
             blocks[block] = inclusive;
         }
@@ -145,9 +133,6 @@ void main() {
         const uint i = block * BLOCK + lane * PER_LANE + k;
         if (i < count) {
             offsets[i] = exclusive;
-        }
-        if (value[k] > dense) {
-            atomicMax(blocks[block_count + 1u], 1u);
         }
         exclusive += value[k];
     }

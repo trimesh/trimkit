@@ -213,21 +213,27 @@ inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_
     }
 }
 
-// `in_parallel` for code already past the GIL (a device driver, between the
-// chunks it hands a device): the same pool, measuring its first items like
-// any query, so a copy the caller finishes in a fraction of a millisecond
-// wakes nobody. No Ctrl-C poll: the chunks are short
+// `body(from, to)` over [0, count) for code already past the GIL (a device
+// driver, between the chunks it hands a device), the cores sharing it a block
+// of items at a time: for a few bytes copied per item, which one at a time is
+// too little for the pool to measure. The same pool, measuring its first
+// blocks like any query, so a copy the caller finishes in a fraction of a
+// millisecond wakes nobody. No Ctrl-C poll: the caller polls between chunks
 template <typename Body>
-void in_parallel_without_gil(std::size_t count, const Body& body) {
+void in_blocks_without_gil(std::size_t count, const Body& body) {
+    constexpr std::size_t BLOCK = 4096;
     if (count == 0) {
         return;
     }
-    parallel::Job job;
-    job.count = count;
-    job.run = [](const void* context, std::size_t begin, std::size_t end) {
-        (*static_cast<const Body*>(context))(begin, end);
+    const auto blocks = [&](std::size_t first, std::size_t last) {
+        body(first * BLOCK, std::min(count, last * BLOCK));
     };
-    job.body = &body;
+    parallel::Job job;
+    job.count = (count + BLOCK - 1) / BLOCK;
+    job.run = [](const void* context, std::size_t begin, std::size_t end) {
+        (*static_cast<const decltype(blocks)*>(context))(begin, end);
+    };
+    job.body = &blocks;
     parallel::run_job(job);
     if (job.error) {
         std::rethrow_exception(job.error);
@@ -235,9 +241,9 @@ void in_parallel_without_gil(std::size_t count, const Body& body) {
 }
 
 // One holder at a time, for what takes exactly one (a device's queue): a
-// waiter sleeps on the scheduler's parking rather than spinning. Held only
-// around one bounded call that takes no other lock, so there is nothing to
-// deadlock on; never nested
+// waiter sleeps on the scheduler's parking rather than spinning. A holder
+// takes no other lock while it holds this, so there is nothing to deadlock
+// on; never nested
 class Exclusive {
 public:
     void acquire() {
