@@ -524,6 +524,17 @@ def check_door() -> None:
     ]
     if found:
         sys.exit("arrays must go through src/numpy.hpp:\n  " + "\n  ".join(found))
+    # Windows: its calls are declared in src/windows.hpp, as windows.h's macros
+    # (FAR, near, min, max) rename whatever of ours they match
+    found = [
+        f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
+        for path in builder.tracked_under(ROOT / "src")
+        if path.suffix in (".cpp", ".hpp")
+        for number, line in enumerate(path.read_text().splitlines(), 1)
+        if re.search(r"#\s*include\s*<windows\.h>", line, re.IGNORECASE)
+    ]
+    if found:
+        sys.exit("Win32 calls must be declared in src/windows.hpp, never windows.h:\n  " + "\n  ".join(found))
     # threads: only common.hpp reaches the pool, through in_parallel and gather_in_parallel
     found = [
         f"{path.relative_to(ROOT)}: {needle}"

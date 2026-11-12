@@ -11,7 +11,7 @@
 // runs here too: every crossing of a ray is tinybvh's nearest hit asked again
 // from just past the one before, exactly as src/bvh.cpp decides it on the
 // CPU. Bindings 4, 5 and 10 are the f32 images of the nodes and triangles
-// that src/vulkan/vulkan.hpp's `walk` and src/bvh.cpp's `triangle32` build. Comments on each
+// that src/vulkan/vulkan.hpp's `node_images` and src/vulkan/scene.hpp's `triangle32` build. Comments on each
 // filtered decision name the docs/trace.md section deriving its bound.
 // Compiled by `uv run scripts generate` into src/vulkan/spirv.hpp;
 // src/vulkan/vulkan.hpp dispatches it.
@@ -761,7 +761,7 @@ void main() {
     }
     // Every crossing of the scene along the ray, nearest first, up to `most`:
     // tinybvh's nearest hit, then its nearest hit again from just past that one,
-    // exactly as RayScene::settle in src/bvh.cpp decides it on the CPU, operation
+    // exactly as RayScene::crossings in src/bvh.cpp decides it on the CPU, operation
     // for operation. The moved origin is rounded, so the triangle just crossed can
     // come back at about zero distance: then the step past it doubles, and past
     // the whole scene is nothing left. Each crossing's distance is measured again

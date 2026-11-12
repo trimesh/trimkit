@@ -4,7 +4,7 @@ Why `src/vulkan/trace.comp` answers byte for byte what tinybvh answers on the CP
 running most of its arithmetic in f32: the model, every filtered decision's bound,
 and what is assumed. The shader's comments name these sections. The f32 data the
 bounds rely on is built on the host: each node's image by `node_images` in
-src/vulkan/vulkan.hpp, each triangle's by `triangle32` in src/bvh.cpp.
+src/vulkan/vulkan.hpp, each triangle's by `triangle32` in src/vulkan/scene.hpp.
 
 Checked, not assumed: tests/test_gpu.py compares the device with the CPU byte for
 byte on random and adversarial rays, with and without instances, and
@@ -372,7 +372,7 @@ n64_x = fl64(fl64(e1_y e2_z) - fl64(e1_z e2_y)):
 |n'_x - n_x| <= that + u |n64_x|
 nu = max_k [4 u64 (|e1_i||e2_j| + |e1_j||e2_i|) + 2 u64 |n64_k| + u |n64_k|] * (1 + 2^-20), rounded up
 ```
-(`triangle32` in src/bvh.cpp; the `(1 + 2^-20)` covers that arithmetic's own rounding.)
+(`triangle32` in src/vulkan/scene.hpp; the `(1 + 2^-20)` covers that arithmetic's own rounding.)
 
 Shadows: `C' = fl(v0' - O')` (`|C'_k - C_k| <= alpha = 2.02uM + 3L`, where here C_k is the exact
 real difference; `|C'_k| <= 1.02M`), `D' = fl32(D)` (`|D'_k - D_k| <= u|D_k|`, no flush in

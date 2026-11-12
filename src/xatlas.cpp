@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
@@ -69,7 +70,11 @@ Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
             pack.maxChartSize = 4096;
             xatlas::Generate(atlas, xatlas::ChartOptions(), pack);
         }
-        if (error == xatlas::AddMeshError::Success && !interrupt.interrupted() && atlas->meshCount == 1) {
+        if (error == xatlas::AddMeshError::Success && !interrupt.interrupted()) {
+            // one mesh went in, so one comes out: anything else is not an answer
+            if (atlas->meshCount != 1) {
+                throw std::runtime_error("xatlas produced no atlas for the mesh");
+            }
             const xatlas::Mesh& out = atlas->meshes[0];
             // xatlas reports texels: normalize into the unit square as float64.
             // Not by sides rounded up to powers of two: xatlas sizes its atlas

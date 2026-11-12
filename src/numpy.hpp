@@ -35,6 +35,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -269,7 +270,41 @@ inline void warn_converted(const std::string& name, const std::string& source, c
     warn(name + ": " + source + " converted to " + dtype + " (a copy); pass a " + dtype + " array to avoid it");
 }
 
-// A numpy array of exactly `dtype` (any dtype for null) that can't be read
+// What numpy reads an object as, without converting or warning: an ndarray
+// itself, a list or any other sequence as `numpy.asarray` makes it, or
+// nothing (a ragged list, a scene, None)
+inline nb::object seen_as_array(nb::handle object) {
+    const nb::module_ numpy = nb::module_::import_("numpy");
+    if (PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1) {
+        return nb::borrow(object);
+    }
+    try {
+        return numpy.attr("asarray")(object);
+    } catch (const nb::python_error&) {
+        return {};
+    }
+}
+
+// whether an array has the shape an In<T, Shape...> takes: its dimensions,
+// and each extent the type fixes
+template <nb::ssize_t... Shape>
+bool shaped(const nb::object& array) {
+    const nb::tuple shape = nb::borrow<nb::tuple>(array.attr("shape"));
+    if (nb::len(shape) != sizeof...(Shape)) {
+        return false;
+    }
+    std::size_t dimension = 0;
+    for (const nb::ssize_t extent : {Shape...}) {
+        if (extent >= 0 && nb::cast<nb::ssize_t>(shape[dimension]) != extent) {
+            return false;
+        }
+        dimension++;
+    }
+    return true;
+}
+
+// An object numpy sees as `array` (`seen_as_array`'s answer for it), of
+// exactly `dtype` (any dtype for null), that can't be read
 // in place, as one fresh C-contiguous copy, aligned as every fresh numpy
 // buffer is (a view at an odd byte offset would make every read of it
 // undefined; a packed structured dtype counts as aligned to numpy there, so
@@ -281,20 +316,11 @@ inline void warn_converted(const std::string& name, const std::string& source, c
 //   other way), or a list or any other sequence `numpy.asarray` reads,
 //   converted with a UserWarning naming the argument
 // Anything else gets nothing: it stays refused
-inline nb::object relaid(nb::handle object, const char* dtype, const std::string& name) {
+inline nb::object relaid(nb::handle object, const nb::object& array, const char* dtype, const std::string& name) {
     const nb::module_ numpy = nb::module_::import_("numpy");
-    const bool is_array = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1;
-    nb::object array = nb::borrow(object);
-    if (!is_array) {
-        if (dtype == nullptr) {
-            return {};
-        }
-        // what numpy makes of it, or nothing: a ragged list, a scene, None
-        try {
-            array = numpy.attr("asarray")(object);
-        } catch (const nb::python_error&) {
-            return {};
-        }
+    const bool is_array = array.is(object);
+    if (!array.is_valid() || (!is_array && dtype == nullptr)) {
+        return {};
     }
     const std::string source = is_array ? text(array.attr("dtype")) : "a " + text(object.type().attr("__name__"));
     if (dtype == nullptr || array.attr("dtype").equal(numpy.attr("dtype")(dtype))) {
@@ -313,14 +339,20 @@ inline nb::object relaid(nb::handle object, const char* dtype, const std::string
 
 // view an object as exactly an In<T, Shape...>, aligned for T: in place, or
 // copied once when its layout is wrong, or converted once (with a warning)
-// when its dtype casts safely. The view holds what it reads
+// when its dtype casts safely. Its shape is checked first, so a wrong one is
+// refused before anything is copied or warned about. The view holds what it
+// reads
 template <typename T, nb::ssize_t... Shape>
 In<T, Shape...> view(nb::handle object, const std::string& name) {
     In<T, Shape...> array;
     bool exact = nb::try_cast(object, array, /*convert=*/false) && aligned(array.data(), alignof(T));
     if (!exact) {
-        const nb::object copy = relaid(object, dtype_name<T>(), name);
-        exact = copy.is_valid() && nb::try_cast(copy, array, /*convert=*/false) && aligned(array.data(), alignof(T));
+        const nb::object seen = seen_as_array(object);
+        if (seen.is_valid() && shaped<Shape...>(seen)) {
+            const nb::object copy = relaid(object, seen, dtype_name<T>(), name);
+            exact =
+                copy.is_valid() && nb::try_cast(copy, array, /*convert=*/false) && aligned(array.data(), alignof(T));
+        }
     }
     if (!exact) {
         type_error(name + " must be " + dtype_name<T>() + " of shape " + shape_text<Shape...>() + ", not " +
@@ -350,9 +382,9 @@ In<T, Shape...> read(const Array<T, Shape...>& argument, const std::string& name
 // A rows argument, its dtype, shape and layout checked as `read` checks
 // either shape: one dimension is one row for every item, anything else must
 // be a row per item. A float32 array is taken as float32, anything else as
-// `read` takes a float64 array. Its values are not checked here: a caller
-// that copies them checks as it copies (`copy_coordinates`), and one that
-// doesn't calls `check_rows`
+// `read` takes a float64 array. Its values are not checked here: a device
+// checks them as it copies them (src/vulkan/scene.hpp), and anything else
+// calls `check_rows`
 template <nb::ssize_t Width>
 Rows<Width> read_rows(const RowsArgument<Width>& argument, const std::string& name) {
     Rows<Width> rows;
@@ -382,37 +414,6 @@ Rows<Width> read_rows(const RowsArgument<Width>& argument, const std::string& na
         rows.count = rows.each.shape(0);
     }
     return rows;
-}
-
-// `count` values copied as float64, a float32 widening to exactly itself,
-// and how many of them `read` would refuse: its check (`detail::refused`) made
-// while the values go by anyway. Python-free
-template <typename T>
-std::size_t copy_coordinates(const T* values, std::size_t count, double* out) {
-    std::size_t bad = 0;
-    for (std::size_t i = 0; i < count; i++) {
-        out[i] = static_cast<double>(values[i]);
-        bad += detail::refused(out[i]) ? 1U : 0U;
-    }
-    return bad;
-}
-
-// `count` values written as float32, and whether every one of them is still
-// itself there: a value `read` takes, exactly a float32, and zero or normal
-// (a device may read a denormal as zero). Python-free
-template <typename T>
-bool narrow_coordinates(const T* values, std::size_t count, float* out) {
-    std::size_t lost = 0;
-    for (std::size_t i = 0; i < count; i++) {
-        const double value = static_cast<double>(values[i]);
-        const float narrowed = static_cast<float>(values[i]);
-        out[i] = narrowed;
-        const double size = std::abs(static_cast<double>(narrowed));
-        const bool same = static_cast<double>(narrowed) == value && !detail::refused(value) &&
-                          (size == 0.0 || size >= static_cast<double>(std::numeric_limits<float>::min()));
-        lost += same ? 0U : 1U;
-    }
-    return lost == 0;
 }
 
 // the values of rows `read_rows` read, refused as `read` refuses them
@@ -455,7 +456,7 @@ inline In<std::uint8_t, -1> read(const Array<bool, -1>& argument, const std::str
     nb::object object = nb::borrow(argument.object);
     const bool is_array = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1;
     if (!is_array) {
-        object = detail::relaid(object, "bool", name);
+        object = detail::relaid(object, detail::seen_as_array(object), "bool", name);
     }
     if (!object.is_valid() || !object.attr("dtype").equal(numpy.attr("dtype")("bool")) ||
         nb::cast<int>(object.attr("ndim")) != 1) {
@@ -484,14 +485,17 @@ std::vector<Index> read_indices(const Array<std::int64_t, -1, 3>& argument, cons
     {
         const nb::gil_scoped_release release;
         for (std::size_t i = 0; i < indices.size(); i++) {
-            violations += static_cast<std::uint64_t>(values[i]) >= vertex_count ? 1U : 0U;
-            indices[i] = static_cast<Index>(values[i]);
+            // read once: what is checked is what is kept
+            const std::int64_t index = values[i];
+            violations += static_cast<std::uint64_t>(index) >= vertex_count ? 1U : 0U;
+            indices[i] = static_cast<Index>(index);
         }
     }
     if (violations != 0) {
-        // the rare refusal pays for finding the row to name
+        // the rare refusal pays for finding the row to name, in the array as
+        // it is now: the last row, if someone has changed it since
         std::size_t bad = 0;
-        while (static_cast<std::uint64_t>(values[bad]) < vertex_count) {
+        while (bad + 1 < indices.size() && static_cast<std::uint64_t>(values[bad]) < vertex_count) {
             bad++;
         }
         value_error(name + " index a vertex out of range at row " + std::to_string(bad / 3));
@@ -550,7 +554,7 @@ inline AnyIn read_any(nb::handle object, const std::string& name) {
     // in place, or its own dtype copied once into a readable layout
     AnyIn array;
     if (!detail::any_readable(object, &array)) {
-        const nb::object copy = detail::relaid(object, nullptr, name);
+        const nb::object copy = detail::relaid(object, detail::seen_as_array(object), nullptr, name);
         if (!copy.is_valid() || !detail::any_readable(copy, &array)) {
             type_error(name + " must be a numeric array, not " + describe(object));
         }
@@ -602,7 +606,8 @@ Records<Record> read_records(nb::handle object, const nb::object& dtype, const c
                           nb::try_cast(object.attr("view")("u1"), bytes, /*convert=*/false) &&
                           detail::aligned(bytes.data(), alignof(Record));
     if (!in_place) {
-        bytes = detail::view<std::uint8_t, -1>(detail::relaid(object, nullptr, name).attr("view")("u1"), name);
+        const nb::object copy = detail::relaid(object, detail::seen_as_array(object), nullptr, name);
+        bytes = detail::view<std::uint8_t, -1>(copy.attr("view")("u1"), name);
     }
     return {bytes};
 }
@@ -638,11 +643,25 @@ T* elements(std::vector<Unset<T>>& values) {
     return reinterpret_cast<T*>(values.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): the same layout
 }
 
+// An output's shape must be exactly what its buffer holds: checked here, once,
+// for every array the package returns, so no binding can hand numpy a shape
+// past its memory
+inline void check_shape(std::initializer_list<std::size_t> shape, std::size_t items) {
+    std::size_t product = 1;
+    for (const std::size_t extent : shape) {
+        product *= extent;
+    }
+    if (product != items) {
+        throw std::logic_error("an output's shape is not its buffer's size");
+    }
+}
+
 // hand a vector to numpy without copying, optionally viewed `As` a type of
 // the same size, e.g. uint64 indices that all fit in int64
 template <typename As = void, typename T, typename R = std::conditional_t<std::is_void_v<As>, T, As>>
 Out<R> to_numpy(std::vector<T>&& values, std::initializer_list<std::size_t> shape) {
     static_assert(sizeof(R) == sizeof(T));
+    check_shape(shape, values.size());
     auto [data, owner] = own(std::move(values));
     return {reinterpret_cast<R*>(data), shape, owner};
 }
@@ -660,6 +679,8 @@ nb::object to_numpy_records(std::vector<Record>&& records, const nb::object& dty
 // the same, for bytes whose dtype is only known at runtime
 inline AnyOut to_numpy(std::vector<std::uint8_t>&& bytes, std::initializer_list<std::size_t> shape,
                        nb::dlpack::dtype dtype) {
+    const std::size_t item_bytes = dtype.bits / 8U;
+    check_shape(shape, item_bytes == 0 ? 0 : bytes.size() / item_bytes);
     auto [data, owner] = own(std::move(bytes));
     return {data, shape, owner, {}, dtype};
 }

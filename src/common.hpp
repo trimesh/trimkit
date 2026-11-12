@@ -55,8 +55,8 @@ struct PointBounds {
 };
 
 inline PointBounds bounds_of(const double* points, std::size_t count) {
-    constexpr double FAR = std::numeric_limits<double>::infinity();
-    PointBounds bounds = {{FAR, FAR, FAR}, {-FAR, -FAR, -FAR}};
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    PointBounds bounds = {{INF, INF, INF}, {-INF, -INF, -INF}};
     for (std::size_t i = 0; i < count; i++) {
         for (std::size_t axis = 0; axis < 3; axis++) {
             bounds.lowest[axis] = std::min(bounds.lowest[axis], points[(3 * i) + axis]);
@@ -213,12 +213,13 @@ inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_
     }
 }
 
-// `body(from, to)` over [0, count) for code already past the GIL (a device
-// driver, between the chunks it hands a device), the cores sharing it a block
-// of items at a time: for a few bytes copied per item, which one at a time is
-// too little for the pool to measure. The same pool, measuring its first
-// blocks like any query, so a copy the caller finishes in a fraction of a
-// millisecond wakes nobody. No Ctrl-C poll: the caller polls between chunks
+// `body(from, to)` over [0, count) for code already past the GIL (a device's
+// answers widened into the caller's columns, between the chunks it reads),
+// the cores sharing it a block of items at a time: for a few bytes copied
+// per item, which one at a time is too little for the pool to measure. The
+// same pool, measuring its first blocks like any query, so a copy the caller
+// finishes in a fraction of a millisecond wakes nobody. No Ctrl-C poll: it
+// never touches Python
 template <typename Body>
 void in_blocks_without_gil(std::size_t count, const Body& body) {
     constexpr std::size_t BLOCK = 4096;
@@ -240,9 +241,10 @@ void in_blocks_without_gil(std::size_t count, const Body& body) {
     }
 }
 
-// One holder at a time, for what takes exactly one (a device's queue): a
-// waiter sleeps on the scheduler's parking rather than spinning. A holder
-// takes no other lock while it holds this, so there is nothing to deadlock
+// One holder at a time, for what takes exactly one (a device's queue,
+// src/vulkan/scene.hpp, which states the rule its users keep): a waiter sleeps
+// on the scheduler's parking rather than spinning. A holder takes no other
+// lock while it holds this, the GIL included, so there is nothing to deadlock
 // on; never nested
 class Exclusive {
 public:
@@ -365,15 +367,18 @@ std::vector<Unset<T>> gathered_rows(const Gathered<T>& gathered) {
 // (`instance_index`, by default each mesh once) and its 4x4 transform
 // (`instance_matrices`, by default the identity), checked for one row per
 // instance, meshes in range and a last row of [0, 0, 0, 1]. Each module then
-// holds the transforms to its own rule: invertible, or rigid.
+// holds the transforms to its own rule: invertible, or rigid. The index is
+// copied and the copy checked, as faces are: whatever becomes an index into
+// our memory is never read from the caller's again.
 struct Instances {
     std::size_t count = 0;
-    In<std::int64_t, -1> index;
+    // a copy: an index is checked once and then trusted, so it must be ours
+    std::vector<std::int64_t> index;
     In<double, -1, 4, 4> matrices;
     bool given_index = false;
     bool given_matrices = false;
 
-    std::size_t mesh(std::size_t i) const { return given_index ? static_cast<std::size_t>(index(i)) : i; }
+    std::size_t mesh(std::size_t i) const { return given_index ? static_cast<std::size_t>(index[i]) : i; }
     const double* matrix(std::size_t i) const {
         static constexpr double IDENTITY[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
         return given_matrices ? matrices.data() + (16 * i) : IDENTITY;
@@ -387,8 +392,9 @@ inline Instances read_instances(const Array<std::int64_t, -1>& index_argument,
     instances.given_matrices = !matrices_argument.is_none();
     instances.count = mesh_count;
     if (instances.given_index) {
-        instances.index = read(index_argument, "instance_index");
-        instances.count = instances.index.shape(0);
+        const In<std::int64_t, -1> given = read(index_argument, "instance_index");
+        instances.index.assign(given.data(), given.data() + given.shape(0));
+        instances.count = instances.index.size();
     }
     if (instances.given_matrices) {
         instances.matrices = read(matrices_argument, "instance_matrices");
@@ -404,7 +410,7 @@ inline Instances read_instances(const Array<std::int64_t, -1>& index_argument,
     }
     for (std::size_t i = 0; i < instances.count; i++) {
         if (instances.given_index &&
-            (instances.index(i) < 0 || static_cast<std::size_t>(instances.index(i)) >= mesh_count)) {
+            (instances.index[i] < 0 || static_cast<std::size_t>(instances.index[i]) >= mesh_count)) {
             value_error("instance_index names a mesh out of range at instance " + std::to_string(i));
         }
         const double* m = instances.matrix(i);

@@ -251,6 +251,9 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
 
     std::unique_ptr<draco::Mesh> mesh;
     draco::Status status;
+    // a face naming a point the mesh doesn't have, or a point naming a value
+    // its attribute doesn't hold: a buffer draco decoded but that isn't a mesh
+    bool malformed = false;
     std::vector<std::int64_t> faces;
     std::vector<std::vector<std::uint8_t>> values(wanted.size());
     std::vector<const draco::PointAttribute*> found(wanted.size(), nullptr);
@@ -263,15 +266,17 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
         status = decoded.status();
         if (status.ok()) {
             mesh = std::move(decoded).value();
+            const std::size_t points = mesh->num_points();
             faces.resize(3 * std::size_t{mesh->num_faces()});
             for (std::uint32_t i = 0; i < mesh->num_faces(); i++) {
                 const auto& face = mesh->face(draco::FaceIndex(i));
                 for (std::size_t j = 0; j < 3; j++) {
                     faces[(3 * std::size_t{i}) + j] = face[j].value();
+                    malformed = malformed || face[j].value() >= points;
                 }
             }
-            // one copy when each point has its own value, else gather
-            const std::size_t points = mesh->num_points();
+            // one copy when each point has its own value, else gather: either
+            // way no value is read that the attribute doesn't hold
             for (std::size_t w = 0; w < wanted.size(); w++) {
                 const draco::PointAttribute* a = mesh->GetAttributeByUniqueId(wanted[w]);
                 found[w] = a;
@@ -279,20 +284,34 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
                     continue;
                 }
                 const auto stride = static_cast<std::size_t>(a->byte_stride());
+                // the values the attribute holds, and no more than its bytes do
+                const auto offset = static_cast<std::size_t>(a->byte_offset());
+                const std::size_t bytes = a->buffer() == nullptr ? 0 : a->buffer()->data_size();
+                const std::size_t held =
+                    stride == 0 || offset > bytes ? 0 : std::min(a->size(), (bytes - offset) / stride);
                 values[w].resize(points * stride);
-                if (a->is_mapping_identity() && a->size() >= points) {
-                    std::copy_n(a->GetAddress(draco::AttributeValueIndex(0)), points * stride, values[w].data());
-                } else {
-                    for (std::uint32_t p = 0; p < points; p++) {
-                        std::copy_n(a->GetAddress(a->mapped_index(draco::PointIndex(p))), stride,
-                                    values[w].data() + (p * stride));
+                if (a->is_mapping_identity()) {
+                    malformed = malformed || held < points;
+                    std::copy_n(a->GetAddress(draco::AttributeValueIndex(0)), std::min(held, points) * stride,
+                                values[w].data());
+                    continue;
+                }
+                for (std::uint32_t p = 0; p < points; p++) {
+                    const draco::AttributeValueIndex at = a->mapped_index(draco::PointIndex(p));
+                    if (at.value() >= held) {
+                        malformed = true;
+                        break;
                     }
+                    std::copy_n(a->GetAddress(at), stride, values[w].data() + (p * stride));
                 }
             }
         }
     }
     if (!status.ok()) {
         trimkit::value_error("draco failed to decode: " + status.error_msg_string());
+    }
+    if (malformed) {
+        trimkit::value_error("draco failed to decode: the buffer's faces or attributes name values it doesn't hold");
     }
 
     const std::size_t face_count = faces.size() / 3;

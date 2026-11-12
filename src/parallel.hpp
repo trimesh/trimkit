@@ -39,16 +39,10 @@
 #include <exception>
 
 #if defined(_WIN32)
+#include "windows.hpp"
+
 #include <process.h>
 #pragma comment(lib, "synchronization")
-// the three calls we make, rather than windows.h, whose macros (FAR, near, far
-// and hundreds more) would reach every source through this header
-extern "C" {
-__declspec(dllimport) int __stdcall WaitOnAddress(volatile void* address, void* expected, std::size_t size,
-                                                  unsigned long timeout_ms);
-__declspec(dllimport) void __stdcall WakeByAddressAll(void* address);
-__declspec(dllimport) int __stdcall CloseHandle(void* handle);
-}
 #else
 #include <pthread.h>
 #include <sched.h>

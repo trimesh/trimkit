@@ -329,13 +329,12 @@ void pair_at(const std::int64_t* rows, const std::vector<std::size_t>& starts, s
 
 // collects every pair of objects whose boxes overlap, as (lower, higher) instance rows
 struct Candidates final : coal::CollisionCallBackBase {
-    std::vector<std::int64_t> pairs;
+    std::vector<std::array<std::int64_t, 2>> pairs;
     bool collide(coal::CollisionObject* a, coal::CollisionObject* b) override {
         // each object's user data is its instance's row, a real int64
         const std::int64_t i = *static_cast<const std::int64_t*>(a->getUserData());
         const std::int64_t j = *static_cast<const std::int64_t*>(b->getUserData());
-        pairs.push_back(std::min(i, j));
-        pairs.push_back(std::max(i, j));
+        pairs.push_back({std::min(i, j), std::max(i, j)});
         return false;  // keep going: every candidate is wanted
     }
 };
@@ -378,21 +377,16 @@ public:
             trimkit::value_error(std::string("margin must be at least 0 and within ") + trimkit::COORDINATE_LIMIT_TEXT);
         }
         const std::vector<Placed> placed = place(matrices_argument, index_argument);
-        // the pairs to test: the given rows, in place, or the boxes' candidates
-        std::vector<std::int64_t> candidates;
-        trimkit::In<std::int64_t, -1, 2> given;
-        const std::int64_t* rows = nullptr;
-        std::size_t pair_count = 0;
+        // the pairs to test: the given rows, or the boxes' candidates
+        std::vector<std::int64_t> pairs;
         if (pairs_argument.is_none()) {
             const nb::gil_scoped_release release;
-            candidates = overlapping(placed, margin);
-            rows = candidates.data();
-            pair_count = candidates.size() / 2;
+            pairs = overlapping(placed, margin);
         } else {
-            given = read_pairs(pairs_argument, placed.size());
-            rows = given.data();
-            pair_count = given.shape(0);
+            pairs = read_pairs(pairs_argument, placed.size());
         }
+        const std::int64_t* rows = pairs.data();
+        const std::size_t pair_count = pairs.size() / 2;
         coal::CollisionRequest request(coal::NO_REQUEST, 1);
         request.security_margin = margin;
         // one pass: each pair culled, then tested, keeping those that touch
@@ -421,13 +415,13 @@ public:
             trimkit::value_error("upper_bound must be positive");
         }
         const std::vector<Placed> placed = place(matrices_argument, index_argument);
-        // every pair is measured, so every pair is named: the given rows, in
-        // place, or each i < j in numpy.triu_indices order, found from where
-        // each row of them starts rather than listed
+        // every pair is measured, so every pair is named: the given rows, or
+        // each i < j in numpy.triu_indices order, found from where each row
+        // of them starts rather than listed
         const std::int64_t* rows = nullptr;
         std::vector<std::size_t> starts(placed.size());
         std::size_t pair_count = 0;
-        trimkit::In<std::int64_t, -1, 2> given;
+        std::vector<std::int64_t> given;
         if (pairs_argument.is_none()) {
             for (std::size_t i = 0; i < placed.size(); i++) {
                 starts[i] = pair_count;
@@ -436,7 +430,7 @@ public:
         } else {
             given = read_pairs(pairs_argument, placed.size());
             rows = given.data();
-            pair_count = given.shape(0);
+            pair_count = given.size() / 2;
         }
         // every row written once, by its pair, so none is filled first
         std::vector<trimkit::Unset<double>> distance(pair_count);
@@ -546,13 +540,14 @@ private:
         return placed;
     }
 
-    // the instance pairs a query names, checked and read in place
-    static trimkit::In<std::int64_t, -1, 2> read_pairs(const PairsArg& pairs_argument, std::size_t count) {
-        const trimkit::In<std::int64_t, -1, 2> pairs = trimkit::read(pairs_argument, "pairs");
-        const std::int64_t* rows = pairs.data();
-        for (std::size_t p = 0; p < pairs.shape(0); p++) {
-            const std::int64_t a = rows[2 * p];
-            const std::int64_t b = rows[(2 * p) + 1];
+    // the instance pairs a query names, copied and the copy checked, as faces
+    // are: what indexes our memory is never read from the caller's again
+    static std::vector<std::int64_t> read_pairs(const PairsArg& pairs_argument, std::size_t count) {
+        const trimkit::In<std::int64_t, -1, 2> given = trimkit::read(pairs_argument, "pairs");
+        std::vector<std::int64_t> pairs(given.data(), given.data() + (2 * given.shape(0)));
+        for (std::size_t p = 0; p < pairs.size() / 2; p++) {
+            const std::int64_t a = pairs[2 * p];
+            const std::int64_t b = pairs[(2 * p) + 1];
             if (a < 0 || b < 0 || static_cast<std::size_t>(a) >= count || static_cast<std::size_t>(b) >= count) {
                 trimkit::value_error("pairs names an instance out of range at row " + std::to_string(p));
             }
@@ -563,7 +558,7 @@ private:
         return pairs;
     }
 
-    // Every pair of instances whose boxes come within `margin`, as ascending
+    // Every pair of instances whose boxes may come within `margin`, as ascending
     // (i < j) rows: coal's dynamic AABB tree, built for this query alone over
     // the placed boxes (each grown by half the margin), so nothing about the
     // scene changes and threads never share it
@@ -597,24 +592,16 @@ private:
             tree.setup();
             tree.collide(&candidates);
         }
-        // in ascending order, so answers never depend on the tree's shape,
-        // and only pairs whose boxes are within the margin, as the explicit
-        // pairs are held to
-        std::vector<std::array<std::int64_t, 2>> rows(candidates.pairs.size() / 2);
-        for (std::size_t p = 0; p < rows.size(); p++) {
-            rows[p] = {candidates.pairs[2 * p], candidates.pairs[(2 * p) + 1]};
+        // in ascending order, so answers never depend on the tree's shape.
+        // Each is a candidate only: `may_touch` holds it to the margin, as it
+        // holds the explicit pairs
+        std::sort(candidates.pairs.begin(), candidates.pairs.end());
+        std::vector<std::int64_t> rows(2 * candidates.pairs.size());
+        for (std::size_t p = 0; p < candidates.pairs.size(); p++) {
+            rows[2 * p] = candidates.pairs[p][0];
+            rows[(2 * p) + 1] = candidates.pairs[p][1];
         }
-        std::sort(rows.begin(), rows.end());
-        std::vector<std::int64_t> kept;
-        kept.reserve(candidates.pairs.size());
-        for (const std::array<std::int64_t, 2>& row : rows) {
-            if (box_gap(placed[static_cast<std::size_t>(row[0])].box, placed[static_cast<std::size_t>(row[1])].box) <=
-                margin) {
-                kept.push_back(row[0]);
-                kept.push_back(row[1]);
-            }
-        }
-        return kept;
+        return rows;
     }
 
     std::vector<std::unique_ptr<CollisionMesh>> meshes_;

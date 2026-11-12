@@ -16,8 +16,8 @@
 // the log out in ray order into mapped host columns, sized by the device from
 // its own total. The host reads that total back: when the log was too small
 // for it, nothing was laid out, and the chunk runs again with room. An
-// occlusion query is the kernel alone. Python-free: src/bvh.cpp is the only
-// user. Vulkan 1.0 core, no extensions.
+// occlusion query is the kernel alone. Python-free: src/vulkan/scene.hpp is
+// the only user, and what src/bvh.cpp calls. Vulkan 1.0 core, no extensions.
 #pragma once
 
 #define VK_NO_PROTOTYPES
@@ -26,16 +26,9 @@
 #include "spirv.hpp"
 
 #if defined(_WIN32)
-// windows.h for the loader's two calls, without its min/max macros and the
-// headers we don't use
-#if !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-#if !defined(WIN32_LEAN_AND_MEAN)
-#define WIN32_LEAN_AND_MEAN
-#endif
+#include "../windows.hpp"
+
 #include <process.h>
-#include <windows.h>
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -294,10 +287,14 @@ struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
-// What one chunk in flight needs, whichever chunk it holds. Mapped host
+// What one chunk in flight needs, whichever chunk it holds. How the rays
+// cross was measured three ways (2026-11-12, RTX 3090, a million rays): the
+// kernel reading host memory as here, 4.4 ms for 24 MB; the submission
+// copying them into device memory first, the same; the host writing straight
+// into device memory it can see, 16 ms. About 0.17 ms a megabyte either of
+// the first two ways, whatever the rays hit, so this is the simplest. Mapped host
 // memory the CPU caches for what the host writes or reads: the rays, read by
-// the kernel over the bus as it traces (measured faster than copying them to
-// the device first), the occlusion words, the header as read back, and the
+// the kernel over the bus as it traces, the occlusion words, the header as read back, and the
 // three columns the layout writes. The device's own memory for what only
 // shaders touch: the counts, their scan, the header, the log and its order.
 // A crossing in the log is four words (its ray, its place along the ray, its
@@ -368,7 +365,7 @@ inline bool ok(VkResult result, const char* what, std::string* reason) {
 // platform gives it, or null
 inline PFN_vkGetInstanceProcAddr open_loader() {
 #if defined(_WIN32)
-    const HMODULE library = LoadLibraryA("vulkan-1.dll");
+    void* const library = LoadLibraryA("vulkan-1.dll");
     if (library == nullptr) {
         return nullptr;
     }
@@ -1123,19 +1120,30 @@ bool run_query(Device& device, const Query& query, std::size_t count, const Fill
     std::size_t started = 0;
     std::size_t finished = 0;
     bool working = true;
-    while (working && started < chunks) {
-        // a chunk is free once the chunk IN_FLIGHT before this one has finished
-        if (started - finished == IN_FLIGHT) {
-            working = finish(finished++, true);
+    try {
+        while (working && started < chunks) {
+            // a chunk is free once the chunk IN_FLIGHT before this one has finished
+            if (started - finished == IN_FLIGHT) {
+                working = finish(finished++, true);
+            }
+            if (working) {
+                working = start(started);
+                started += working ? 1 : 0;
+            }
         }
-        if (working) {
-            working = start(started);
-            started += working ? 1 : 0;
+        // the chunks still in flight, oldest first: waited for even after a failure
+        while (finished < started) {
+            working = finish(finished++, working) && working;
         }
-    }
-    // the chunks still in flight, oldest first: waited for even after a failure
-    while (finished < started) {
-        working = finish(finished++, working) && working;
+    } catch (...) {
+        // `consume` threw (its columns didn't fit in memory): the chunks still
+        // in flight are waited for all the same, so the next query finds the
+        // device idle, and the caller gets its exception
+        std::string unused;
+        while (finished < started) {
+            wait(device, device.chunks[finished++ % IN_FLIGHT].fence, &unused);
+        }
+        throw;
     }
     return working;
 }

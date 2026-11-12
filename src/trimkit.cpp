@@ -21,8 +21,9 @@
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
 #elif defined(_WIN32)
+#include "windows.hpp"
+
 #include <malloc.h>
-extern "C" __declspec(dllimport) int __stdcall GlobalMemoryStatusEx(void* status);
 #endif
 
 // The extension's one door for allocation: every `new` in it, ours and vendored,

@@ -434,6 +434,16 @@ def test_safe_conversions_warn_and_match(name):
                     assert same, (argument, how)
 
 
+def test_a_wrong_shape_is_refused_before_anything_converts():
+    # the shape is checked first: no conversion warning (which this suite
+    # raises) for an array that is refused anyway, whatever its dtype
+    for wrong in (np.zeros((4, 3), dtype=np.float32), np.zeros((4, 3)), [[0, 0, 0], [1, 0, 0]], [0.0, 1.0]):
+        with pytest.raises(TypeError, match="exterior"):
+            trimkit.triangulate(wrong)
+    with pytest.raises(TypeError, match="instance_index"):
+        trimkit.RayScene([box()]).intersect_any(np.zeros(3), np.ones(3), None, [[0]])
+
+
 def test_a_mesh_is_any_pair():
     # a mesh is any sequence of two: a list is as good as a tuple, a triple isn't
     vertices, faces = box()

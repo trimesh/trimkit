@@ -97,7 +97,8 @@ Another dtype numpy casts safely (float32, int32), or a list, is converted to th
 dtype once with a `UserWarning` naming the argument: the copy is what you would have
 written, and the warning says so. A dtype that would lose values, or anything that
 isn't array-like, is a `TypeError`, and a bad value a `ValueError`, saying what was
-expected. Faces are always copied once, into each library's index type, and scene
+expected. Whatever indexes memory is always copied once and the copy checked: faces,
+into each library's index type, and a query's `instance_index` and `pairs`. Scene
 constructors keep their own copy of their meshes.
 Everything returned is freshly allocated, and the GIL is released while computing.
 Answers are dense when you name the rows (`intersect_any`'s rays, `distances`'
@@ -119,8 +120,8 @@ the same trees and runs a compute shader that makes every decision tinybvh's
 traversal makes, most of them in float32 behind a proven error bound and the
 rest with tinybvh's own float64 operations (`docs/trace.md`), so it answers the
 same bytes the CPU does. Rays go as given: a `(3,)` origin or direction is one
-row for every ray, float32 arrays go as float32, and float64 arrays whose
-values are exactly float32 go at half size. When no such device can be used,
+row for every ray, and an array goes as its dtype: float32 at half the bytes
+of float64, widened on the device. When no such device can be used,
 at construction or later, the scene warns once (a `UserWarning` naming why)
 and the
 CPU answers. `tests/golden.json` holds the hashed answers of an exact corpus
@@ -153,8 +154,10 @@ threads), which slows the CPU's column far more than the device's: on a quieter
 run the million-ray rows of the assembly as loaded were about 12 ms against 6
 for the nearest hit and 7 against 5 for any hit. Three things hold either way.
 A camera's float64 directions are 24 MB a million rays, and moving them to the
-device takes about as long as the CPU takes to find that most of them miss, so
-a sparse scene gains least; float32 directions go at half that. Every crossing
+device (about 0.17 ms a megabyte here, by any route measured, and nearly all
+of a query's time: tracing is a few percent of it) takes about as long as the
+CPU takes to find that most of them miss, so a sparse scene gains least;
+float32 directions go at half that. Every crossing
 runs each ray's crossings one after another on its own lane, so a small batch
 with long rays is slower on the device than on the CPU, and a large one much
 faster. And the device's answers are the CPU's, which the bench checks before

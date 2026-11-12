@@ -428,10 +428,10 @@ def test_device_agrees_on_axis_aligned_rays_through_instances(device_required):
 
 
 def test_rays_are_float64_or_float32(device_required):
-    # a float32 array is taken as it is and a float64 one goes to the device
-    # as float32 while every value is exactly one: either way the answers are
-    # those of the same values as float64, on the CPU and the device, for a
-    # row per ray and for one row for every ray
+    # an array goes to the device as its dtype, float32 or float64, whatever
+    # its values: either way the answers are those of the same values as
+    # float64, on the CPU and the device, for a row per ray and for one row
+    # for every ray
     mesh = sphere(30, 60)
     cpu = trimkit.RayScene([mesh])
     gpu = device_scene([mesh], device_required)
@@ -457,9 +457,9 @@ def test_rays_are_float64_or_float32(device_required):
 
 
 def test_device_widens_what_float32_cannot_hold(device_required):
-    # values that are exactly float32 until one, late, is not; float32
-    # denormals, which a device may read as zero; and both zeros: each array
-    # goes as float64 from the chunk that needs it, and the answers stay
+    # float64 values that are exactly float32 until one, late, is not;
+    # float32 denormals, which a device may read as zero, so a chunk holding
+    # one goes widened; and both zeros: the answers stay
     mesh = box((-1, -1, -1), (1, 1, 1))
     cpu = trimkit.RayScene([mesh])
     gpu = device_scene([mesh], device_required)
@@ -519,6 +519,60 @@ def test_threads_share_a_device_scene(device_required):
     assert not errors
     for result in results:
         same(expected, result)
+
+
+def test_threads_never_deadlock_on_the_device(device_required):
+    # One thread runs long queries of one scene while another moves its own
+    # scene's instances every query, which frees the top level it replaces
+    # with the GIL held. Freeing once waited for the device while the query
+    # holding the device waited for the GIL to look for Ctrl-C: both threads
+    # stopped for good. A subprocess, so that is a timeout here, not a hang
+    device_scene([box()], device_required)
+    script = textwrap.dedent(
+        """
+        import sys, threading, time, warnings
+        sys.path.insert(0, sys.argv[1])
+        import numpy as np
+        import trimkit
+        from helpers import sphere
+        warnings.simplefilter("error")
+        mesh = sphere(60, 120)
+        long_scene = trimkit.RayScene([mesh], use_gpu=True)
+        moving_scene = trimkit.RayScene([mesh], use_gpu=True)
+        rng = np.random.default_rng(0)
+        origins = rng.normal(size=(400_000, 3)) * 3.0
+        directions = -origins
+        places = np.tile(np.eye(4), (2, 2, 1, 1))
+        places[1, :, :3, 3] = 0.5
+        index = np.zeros(2, dtype=np.int64)
+        stop = time.monotonic() + 3.0
+        done = {"long": 0, "moving": 0}
+        def long_queries():
+            while time.monotonic() < stop:
+                long_scene.intersect(origins, directions)
+                done["long"] += 1
+        def moving_queries():
+            while time.monotonic() < stop:
+                moving_scene.intersect_any(origins[:64], directions[:64], places[done["moving"] % 2], index)
+                done["moving"] += 1
+        threads = [threading.Thread(target=long_queries), threading.Thread(target=moving_queries)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert done["long"] > 0 and done["moving"] > 0, done
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, os.path.dirname(__file__)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 def test_use_gpu_is_keyword_only():
