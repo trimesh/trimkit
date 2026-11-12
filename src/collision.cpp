@@ -50,8 +50,6 @@
 
 namespace {
 
-using MatricesArg = trimkit::Array<double, -1, 4, 4>;
-using IndexArg = trimkit::Array<std::int64_t, -1>;
 // every mesh convex or none, or a mask of which
 using ConvexArg = std::variant<trimkit::Flag, trimkit::Array<bool, -1>>;
 using PairsArg = trimkit::Array<std::int64_t, -1, 2>;
@@ -362,8 +360,9 @@ public:
 
     std::size_t size() const { return meshes_.size(); }
 
-    trimkit::Out<std::int64_t> collides(const MatricesArg& matrices_argument, const IndexArg& index_argument,
-                                        const PairsArg& pairs_argument, trimkit::Number<double> margin_argument) const {
+    trimkit::Out<std::int64_t> collides(const trimkit::InstanceMatrices& matrices_argument,
+                                        const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
+                                        trimkit::Number<double> margin_argument) const {
         const double margin = margin_argument;
         // NaN fails both comparisons, so it is refused too
         if (margin < 0.0 || margin > trimkit::COORDINATE_LIMIT || std::isnan(margin)) {
@@ -397,12 +396,12 @@ public:
                     }
                 }
             });
-        const std::size_t touching_count = touching.size() / 2;
-        return trimkit::to_numpy<std::int64_t>(trimkit::gathered_rows(touching), {touching_count, 2});
+        return trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(touching), {2});
     }
 
-    Distances distances(const MatricesArg& matrices_argument, const IndexArg& index_argument,
-                        const PairsArg& pairs_argument, trimkit::Number<double> upper_bound_argument) const {
+    Distances distances(const trimkit::InstanceMatrices& matrices_argument,
+                        const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
+                        trimkit::Number<double> upper_bound_argument) const {
         const double upper_bound = upper_bound_argument;
         if (!(upper_bound > 0.0)) {
             trimkit::value_error("upper_bound must be positive");
@@ -452,12 +451,13 @@ public:
             }
         });
         return {trimkit::to_numpy<double>(std::move(distance), {pair_count}),
-                trimkit::to_numpy<double>(std::move(points), {pair_count, 2, 3}),
-                trimkit::to_numpy<double>(std::move(normals), {pair_count, 3})};
+                trimkit::to_numpy_rows<double>(std::move(points), {2, 3}),
+                trimkit::to_numpy_rows<double>(std::move(normals), {3})};
     }
 
     // the box each instance is culled by, as these instances place it
-    trimkit::BoxesObject boxes(const MatricesArg& matrices_argument, const IndexArg& index_argument) const {
+    trimkit::BoxesObject boxes(const trimkit::InstanceMatrices& matrices_argument,
+                               const trimkit::InstanceIndex& index_argument) const {
         const std::vector<Placed> placed = place(matrices_argument, index_argument);
         std::vector<double> boxes(6 * placed.size());
         for (std::size_t i = 0; i < placed.size(); i++) {
@@ -478,7 +478,8 @@ private:
     // hierarchy's root oriented box. Either bounds it, so their overlap does:
     // the oriented box is far tighter for a mesh lying diagonally in its own
     // frame, and looser for a cube, whose principal axes are arbitrary
-    std::vector<Placed> place(const MatricesArg& matrices_argument, const IndexArg& index_argument) const {
+    std::vector<Placed> place(const trimkit::InstanceMatrices& matrices_argument,
+                              const trimkit::InstanceIndex& index_argument) const {
         // read and checked, rigid transforms only: the rest only places, and touches no Python
         const trimkit::Instances instances = trimkit::read_instances(
             trimkit::view_instances(index_argument, matrices_argument), meshes_.size(), /*rigid=*/true);

@@ -129,10 +129,8 @@ trimkit::MeshOuts decompose(const trimkit::Array<double, -1, 3>& vertices_argume
     }
     nb::list meshes;
     for (Hull& hull : hulls) {
-        const std::size_t vertex_rows = hull.vertices.size() / 3;
-        const std::size_t face_rows = hull.faces.size() / 3;
-        meshes.append(nb::make_tuple(trimkit::to_numpy(std::move(hull.vertices), {vertex_rows, 3}),
-                                     trimkit::to_numpy(std::move(hull.faces), {face_rows, 3})));
+        meshes.append(nb::make_tuple(trimkit::to_numpy_rows(std::move(hull.vertices), {3}),
+                                     trimkit::to_numpy_rows(std::move(hull.faces), {3})));
     }
     return meshes;
 }

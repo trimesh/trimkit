@@ -55,8 +55,6 @@
 namespace {
 
 using Vec = tinybvh::bvhdbl3;
-using Transforms = trimkit::Array<double, -1, 4, 4>;
-using Numbers = trimkit::Array<std::int64_t, -1>;
 using Points = trimkit::In<double, -1, 3>;
 // rays' origins or directions: one each, or one for every ray
 using RaysArg = trimkit::RaysArgument;
@@ -282,14 +280,16 @@ public:
             }
         }
         // the default instances, each mesh once where it is, built now
-        last_ = build(read_instances(Transforms{nb::none()}, Numbers{nb::none()}));
+        last_ = build(trimkit::read_instances(trimkit::InstanceViews{}, meshes_.size(), /*rigid=*/false));
     }
 
     // the boxes a query with these instances culls rays by, without building
     // a top level: the same placement a query makes
-    trimkit::BoxesObject boxes(const Transforms& matrices_argument, const Numbers& index_argument) const {
+    trimkit::BoxesObject boxes(const trimkit::InstanceMatrices& matrices_argument,
+                               const trimkit::InstanceIndex& index_argument) const {
         TopLevel placed;
-        placed.given = read_instances(matrices_argument, index_argument);
+        placed.given = trimkit::read_instances(trimkit::view_instances(index_argument, matrices_argument),
+                                               meshes_.size(), /*rigid=*/false);
         place(&placed);
         return trimkit::scene_boxes(placed.boxes);
     }
@@ -297,7 +297,8 @@ public:
     std::size_t size() const { return meshes_.size(); }
 
     trimkit::Out<bool> intersect_any(const RaysArg& origins_argument, const RaysArg& directions_argument,
-                                     const Transforms& matrices_argument, const Numbers& index_argument) const {
+                                     const trimkit::InstanceMatrices& matrices_argument,
+                                     const trimkit::InstanceIndex& index_argument) const {
         const Rays origins = trimkit::read_rays(origins_argument, "origins");
         const Rays directions = trimkit::read_rays(directions_argument, "directions");
         const std::size_t n = count_rays(origins, directions);
@@ -326,7 +327,7 @@ public:
     }
 
     Hits intersect(const RaysArg& origins_argument, const RaysArg& directions_argument,
-                   const Transforms& matrices_argument, const Numbers& index_argument,
+                   const trimkit::InstanceMatrices& matrices_argument, const trimkit::InstanceIndex& index_argument,
                    const MaximumHits& maximum_hits) const {
         if (maximum_hits && *maximum_hits < 1) {
             trimkit::value_error("maximum_hits must be at least 1");
@@ -394,17 +395,11 @@ public:
     }
 
 private:
-    // a query's instances, read and checked: any invertible transform
-    trimkit::Instances read_instances(const Transforms& matrices_argument, const Numbers& index_argument) const {
-        return trimkit::read_instances(trimkit::view_instances(index_argument, matrices_argument), meshes_.size(),
-                                       /*rigid=*/false);
-    }
-
     // The top level for these instances: the remembered one if they are
     // exactly the arrays it was built from, else a new one, remembered. The
     // arrays are viewed once, for the comparison and for the read after it
-    std::shared_ptr<const TopLevel> top_level(const Transforms& matrices_argument,
-                                              const Numbers& index_argument) const {
+    std::shared_ptr<const TopLevel> top_level(const trimkit::InstanceMatrices& matrices_argument,
+                                              const trimkit::InstanceIndex& index_argument) const {
         const trimkit::InstanceViews views = trimkit::view_instances(index_argument, matrices_argument);
         std::shared_ptr<const TopLevel> last = remembered();
         if (trimkit::same_instances(views, last->given)) {
@@ -798,7 +793,7 @@ public:
                 }
             }
         }
-        return trimkit::to_numpy(std::move(boxes), {n, 2, dimension_});
+        return trimkit::to_numpy_rows(std::move(boxes), {2, dimension_});
     }
 
     trimkit::Out<std::int64_t> intersect(const BoundsArg& queries_argument) const {
@@ -826,8 +821,7 @@ public:
                     }
                 }
             });
-        const std::size_t count = pairs.size() / 2;
-        return trimkit::to_numpy<std::int64_t>(trimkit::gathered_rows(pairs), {count, 2});
+        return trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(pairs), {2});
     }
 
 private:

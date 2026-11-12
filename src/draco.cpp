@@ -313,7 +313,6 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
         trimkit::value_error("draco failed to decode: the buffer's faces or attributes name values it doesn't hold");
     }
 
-    const std::size_t face_count = faces.size() / 3;
     const std::size_t points = mesh->num_points();
     nb::list arrays;
     for (std::size_t w = 0; w < wanted.size(); w++) {
@@ -334,7 +333,7 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
         arrays.append(c == 1 ? trimkit::to_numpy(std::move(values[w]), {points}, type->numpy)
                              : trimkit::to_numpy(std::move(values[w]), {points, c}, type->numpy));
     }
-    return {trimkit::to_numpy(std::move(faces), {face_count, 3}), nb::borrow<trimkit::AnyOuts>(nb::tuple(arrays))};
+    return {trimkit::to_numpy_rows(std::move(faces), {3}), nb::borrow<trimkit::AnyOuts>(nb::tuple(arrays))};
 }
 
 }  // namespace

@@ -509,6 +509,15 @@ Mesh<Index> read_mesh(nb::handle object, const std::string& name) {
     return mesh;
 }
 
+// a mesh given as two arguments, `vertices` and `faces`, read the same way
+template <typename Index>
+Mesh<Index> read_mesh(const Array<double, -1, 3>& vertices, const Array<std::int64_t, -1, 3>& faces) {
+    Mesh<Index> mesh;
+    mesh.vertices = read(vertices, "vertices");
+    mesh.faces = read_indices<Index>(faces, "faces", mesh.vertices.shape(0));
+    return mesh;
+}
+
 // every mesh of a sequence, read as `read_mesh` reads each, before anything
 // is built from any of them
 template <typename Index>
@@ -635,6 +644,23 @@ Out<R> to_numpy(std::vector<T>&& values, std::initializer_list<std::size_t> shap
     check_shape(shape, values.size());
     auto [data, owner] = own(std::move(values));
     return {reinterpret_cast<R*>(data), shape, owner};
+}
+
+// A vector as rows, however many it holds: `row` is one row's shape ({3} for
+// faces, {2, 3} for pairs of points), and the leading extent is the vector's
+// size over a row's, which `to_numpy` checks divides it
+template <typename As = void, typename T, typename R = std::conditional_t<std::is_void_v<As>, T, As>>
+Out<R> to_numpy_rows(std::vector<T>&& values, std::initializer_list<std::size_t> row) {
+    std::size_t width = 1;
+    for (const std::size_t extent : row) {
+        width *= extent;
+    }
+    const std::size_t rows = width == 0 ? 0 : values.size() / width;
+    const std::size_t* inner = row.begin();
+    if (row.size() == 1) {
+        return to_numpy<As>(std::move(values), {rows, inner[0]});
+    }
+    return to_numpy<As>(std::move(values), {rows, inner[0], inner[1]});
 }
 
 // records handed to numpy without copying, as a 1D array of the structured

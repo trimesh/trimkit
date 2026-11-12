@@ -46,10 +46,10 @@ static Simplified simplify(const trimkit::Array<double, -1, 3>& vertices_argumen
                            const trimkit::Array<std::int64_t, -1, 3>& faces_argument,
                            trimkit::Number<std::int64_t> face_count, trimkit::Number<double> maximum_error,
                            trimkit::Flag lock_border) {
-    const trimkit::In<double, -1, 3> vertices = trimkit::read(vertices_argument, "vertices");
+    const trimkit::Mesh<std::uint32_t> mesh = trimkit::read_mesh<std::uint32_t>(vertices_argument, faces_argument);
+    const trimkit::In<double, -1, 3>& vertices = mesh.vertices;
+    const std::vector<std::uint32_t>& indices = mesh.faces;
     const std::size_t vertex_count = vertices.shape(0);
-    const std::vector<std::uint32_t> indices =
-        trimkit::read_indices<std::uint32_t>(faces_argument, "faces", vertex_count);
     if (face_count < 0) {
         trimkit::value_error("face_count must be at least 0");
     }
@@ -93,9 +93,8 @@ static Simplified simplify(const trimkit::Array<double, -1, 3>& vertices_argumen
         }
     }
     const std::size_t source_count = vertex_sources.size();
-    const std::size_t triangle_count = output_faces.size() / 3;
-    return {trimkit::to_numpy(std::move(output_vertices), {source_count, 3}),
-            trimkit::to_numpy(std::move(output_faces), {triangle_count, 3}),
+    return {trimkit::to_numpy_rows(std::move(output_vertices), {3}),
+            trimkit::to_numpy_rows(std::move(output_faces), {3}),
             trimkit::to_numpy(std::move(vertex_sources), {source_count})};
 }
 

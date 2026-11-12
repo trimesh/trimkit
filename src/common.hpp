@@ -370,6 +370,10 @@ inline bool is_rigid(const double* m) {
     return rigid && determinant_of(m) > 0.0;
 }
 
+// the two arguments every scene query names its instances by
+using InstanceMatrices = Array<double, -1, 4, 4>;
+using InstanceIndex = Array<std::int64_t, -1>;
+
 // The arrays a query names its instances by, viewed once: their dtype, shape
 // and layout as `read` checks them, their values not yet looked at. An array
 // not given is None
@@ -380,8 +384,7 @@ struct InstanceViews {
     bool given_matrices = false;
 };
 
-inline InstanceViews view_instances(const Array<std::int64_t, -1>& index_argument,
-                                    const Array<double, -1, 4, 4>& matrices_argument) {
+inline InstanceViews view_instances(const InstanceIndex& index_argument, const InstanceMatrices& matrices_argument) {
     InstanceViews views;
     views.given_index = !index_argument.is_none();
     views.given_matrices = !matrices_argument.is_none();

@@ -61,8 +61,7 @@ static nb::tuple svg_parse(std::string_view path, const nb::object& segment_dtyp
         // error rather than failing the whole path, so how far it got is unused
         static_cast<void>(svgpath::parse(path.data(), path.size(), &parsed));
     }
-    const std::size_t vertex_count = parsed.vertices.size() / 2;
-    const trimkit::Out<double> vertices = trimkit::to_numpy(std::move(parsed.vertices), {vertex_count, 2});
+    const trimkit::Out<double> vertices = trimkit::to_numpy_rows(std::move(parsed.vertices), {2});
     return nb::make_tuple(vertices, trimkit::to_numpy_records(std::move(parsed.segments), segment_dtype));
 }
 

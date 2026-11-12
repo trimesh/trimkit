@@ -94,10 +94,8 @@ std::tuple<trimkit::Out<double>, trimkit::Out<std::int64_t>> triangulate(const R
         earcut(polygon);
         faces = std::move(earcut.indices);
     }
-    const std::size_t vertex_count = vertices.size() / 2;
-    const std::size_t face_count = faces.size() / 3;
-    return {trimkit::to_numpy(std::move(vertices), {vertex_count, 2}),
-            trimkit::to_numpy<std::int64_t>(std::move(faces), {face_count, 3})};
+    return {trimkit::to_numpy_rows(std::move(vertices), {2}),
+            trimkit::to_numpy_rows<std::int64_t>(std::move(faces), {3})};
 }
 
 }  // namespace

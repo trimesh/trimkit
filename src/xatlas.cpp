@@ -29,10 +29,10 @@ using Result = std::tuple<trimkit::Out<std::int64_t>, trimkit::Out<std::int64_t>
 
 Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
                    const trimkit::Array<std::int64_t, -1, 3>& faces_argument) {
-    const trimkit::In<double, -1, 3> vertices = trimkit::read(vertices_argument, "vertices");
+    const trimkit::Mesh<std::uint32_t> given = trimkit::read_mesh<std::uint32_t>(vertices_argument, faces_argument);
+    const trimkit::In<double, -1, 3>& vertices = given.vertices;
+    const std::vector<std::uint32_t>& indices = given.faces;
     const std::size_t n_vertices = vertices.shape(0);
-    const std::vector<std::uint32_t> indices =
-        trimkit::read_indices<std::uint32_t>(faces_argument, "faces", n_vertices);
 
     std::vector<std::int64_t> vertex_sources;
     std::vector<std::int64_t> out_faces;
@@ -100,10 +100,8 @@ Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
     }
 
     const std::size_t vertex_count = vertex_sources.size();
-    const std::size_t face_count = out_faces.size() / 3;
     return {trimkit::to_numpy(std::move(vertex_sources), {vertex_count}),
-            trimkit::to_numpy(std::move(out_faces), {face_count, 3}),
-            trimkit::to_numpy(std::move(uv), {vertex_count, 2})};
+            trimkit::to_numpy_rows(std::move(out_faces), {3}), trimkit::to_numpy_rows(std::move(uv), {2})};
 }
 
 }  // namespace
