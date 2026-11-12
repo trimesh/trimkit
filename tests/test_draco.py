@@ -64,6 +64,26 @@ def test_round_trip():
             assert np.array_equal(out, value)
 
 
+# 290 bytes the fuzzer found (fuzz/draco.cpp): draco decodes them to a mesh whose
+# attribute 0 names values it doesn't hold, which read past its buffer
+MALFORMED = bytes.fromhex(
+    "445241434f02020101000000180c020b0000035f4b1fe80101445241434f0202010000000c01000110bc084341524f7e"
+    "ff445241434f0102000200012c0000104e21212121445241434f02020101000000080c024b03000b0000080c024b0300"
+    "0b5f05000000010015011021210044d2414321210107dc084341524f7eff3f0100010302020101000000080c020b0005"
+    "000000000000ffffffffffffff324103ff0001002c00018d000100090300000001000b01010300010209030000000030"
+    "00000000ffff4f3000064d0800fcff000000000000000000000000000000000000000001ffffffffffffffffffff25ff"
+    "fffffffffffffffffffffffffff8ffffffffffffffffff000000000080cfff91bebebebebe4141414141414141419741"
+    "4141"
+)
+
+
+def test_decode_refuses_an_attribute_that_names_values_it_does_not_hold():
+    # once a segfault: every value read is now checked against what is held
+    buffer = np.frombuffer(MALFORMED, dtype=np.uint8)
+    with pytest.raises(ValueError, match="name values it doesn't hold"):
+        trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
+
+
 def test_decode_subset_in_any_order_and_views():
     faces, attributes, kinds, _ = primitive(100)
     buffer = trimkit.exchange.draco_encode(faces, attributes, kinds)

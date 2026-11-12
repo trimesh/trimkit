@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import textwrap
+import warnings
 from fractions import Fraction
 from pathlib import Path
 
@@ -273,6 +274,24 @@ def test_defaults_and_fast_path():
     )
     # and every way of spelling the same instances places them the same
     assert np.array_equal(scene.boxes().boxes(), scene.boxes(one, np.array([0], dtype=np.int64)).boxes())
+
+
+def test_instances_convert_once():
+    # a query's instances are viewed once: what converts (a list, float32
+    # matrices) warns once per argument, though the scene first compares them
+    # with the instances it remembers and then builds from them
+    scene = trimkit.RayScene([box()])
+    origins, directions = np.array([[0.5, 0.5, 5.0]]), np.array([[0.0, 0.0, -1.0]])
+    matrices = np.tile(np.eye(4), (2, 1, 1))
+    matrices[1, 0, 3] = 3.0
+    scene.intersect_any(origins, directions, matrices, np.zeros(2, dtype=np.int64))
+    moved = matrices.copy()
+    moved[1, 0, 3] = 4.0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hits = scene.intersect_any(origins, directions, moved.astype(np.float32), [0, 0])
+    assert hits.tolist() == [True]
+    assert sorted(str(w.message).split(":")[0] for w in caught) == ["instance_index", "instance_matrices"]
 
 
 def test_remembered_instances_answer_the_same():

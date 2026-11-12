@@ -59,8 +59,8 @@ using Transforms = trimkit::Array<double, -1, 4, 4>;
 using Numbers = trimkit::Array<std::int64_t, -1>;
 using Points = trimkit::In<double, -1, 3>;
 // rays' origins or directions: one each, or one for every ray
-using RaysArg = trimkit::RowsArgument<3>;
-using Rays = trimkit::Rows<3>;
+using RaysArg = trimkit::RaysArgument;
+using Rays = trimkit::Rays;
 using FacesArg = trimkit::Array<std::int64_t, -1, 3>;
 using BoundsArg = trimkit::Array<double, -1, 2, -1>;
 using Bounds = trimkit::In<double, -1, 2, -1>;
@@ -232,32 +232,21 @@ using Hits = std::tuple<trimkit::Out<std::int64_t>, trimkit::Out<std::int64_t>, 
                         trimkit::Out<double>>;
 using MaximumHits = std::optional<trimkit::Number<std::int64_t>>;
 
-// Instances as a scene places them: each checked transform with its
-// inverse, kept only for meshes with faces (`which` holds each kept one's
-// row), and every row's world box: its mesh's root box carried by the
-// transform, as tinybvh's top level bounds it (the root as tinybvh keeps it,
-// unpadded, as `pad` widens only the nodes; the top level's own padding
-// covers the rounding), or for a mesh without faces, a point at its
-// translation, as 6 values, minimum then maximum
-struct Placement {
+// A query's instances built into a top level, never changed once built: the
+// instances as they were read, which a later query's arrays are compared
+// with; each kept instance (a mesh with faces) with its checked transform,
+// its inverse and its caller's row in `which`; every row's world box, 6
+// values, minimum then maximum (its mesh's root box carried by the transform,
+// as tinybvh's top level bounds it: the root as tinybvh keeps it, unpadded,
+// as `pad` widens only the nodes and the top level's own padding covers the
+// rounding; or for a mesh without faces, a point at its translation); and
+// the BVH over the kept instances, or the one identity instance's mesh,
+// traced directly
+struct TopLevel {
+    trimkit::Instances given;
     std::vector<tinybvh::BLASInstanceEx> instances;
     std::vector<std::int64_t> which;
     std::vector<double> boxes;
-    double extent = 0.0;
-    bool all_identity = true;
-};
-
-// A placement built into a top level: the instance arrays it was built from,
-// byte for byte (each None or not), each kept instance (a mesh with faces)
-// with its caller's row, and the BVH over them, or the one identity
-// instance's mesh, traced directly. Never changed once built
-struct TopLevel {
-    bool given_index = false;
-    bool given_matrices = false;
-    std::vector<std::int64_t> index;
-    std::vector<double> matrices;
-    std::vector<tinybvh::BLASInstanceEx> instances;
-    std::vector<std::int64_t> which;
     // the largest coordinate magnitude any placed box reaches: the scene's size
     double extent = 0.0;
     const RayMesh* direct = nullptr;
@@ -271,16 +260,6 @@ struct TopLevel {
     const tinybvh::BVH_Double* bvh() const { return direct != nullptr ? direct->bvh() : tlas.get(); }
 };
 
-// Whether a query names exactly the instance arrays `top` was built from:
-// both None, or the same bytes, compared without rechecking their values
-bool names(const TopLevel& top, const Transforms& matrices_argument, const Numbers& index_argument) {
-    if (top.given_index == index_argument.is_none() || top.given_matrices == matrices_argument.is_none()) {
-        return false;
-    }
-    return (!top.given_index || trimkit::same_bytes(index_argument, top.index, "instance_index")) &&
-           (!top.given_matrices || trimkit::same_bytes(matrices_argument, top.matrices, "instance_matrices"));
-}
-
 class RayScene {
 public:
     // it owns its meshes (std::vector of std::unique_ptr claims to be
@@ -289,12 +268,11 @@ public:
     RayScene& operator=(const RayScene&) = delete;
 
     RayScene(const trimkit::Meshes& meshes, trimkit::Flag use_gpu) {
-        for (const nb::handle item : meshes) {
-            const std::string name = "meshes[" + std::to_string(meshes_.size()) + "]";
-            meshes_.push_back(std::make_unique<RayMesh>(trimkit::read_mesh<std::uint64_t>(item, name)));
-        }
-        blas_.resize(meshes_.size());
-        for (std::size_t m = 0; m < meshes_.size(); m++) {
+        std::vector<trimkit::Mesh<std::uint64_t>> read = trimkit::read_meshes<std::uint64_t>(meshes);
+        meshes_.resize(read.size());
+        blas_.resize(read.size());
+        for (std::size_t m = 0; m < read.size(); m++) {
+            meshes_[m] = std::make_unique<RayMesh>(std::move(read[m]));
             blas_[m] = meshes_[m]->bvh();
         }
         if (use_gpu.value) {
@@ -304,22 +282,24 @@ public:
             }
         }
         // the default instances, each mesh once where it is, built now
-        last_ = build(Transforms{nb::none()}, Numbers{nb::none()});
+        last_ = build(read_instances(Transforms{nb::none()}, Numbers{nb::none()}));
     }
 
     // the boxes a query with these instances culls rays by, without building
     // a top level: the same placement a query makes
     trimkit::BoxesObject boxes(const Transforms& matrices_argument, const Numbers& index_argument) const {
-        const trimkit::Instances instances = trimkit::read_instances(index_argument, matrices_argument, meshes_.size());
-        return trimkit::scene_boxes(place(instances).boxes);
+        TopLevel placed;
+        placed.given = read_instances(matrices_argument, index_argument);
+        place(&placed);
+        return trimkit::scene_boxes(placed.boxes);
     }
 
     std::size_t size() const { return meshes_.size(); }
 
     trimkit::Out<bool> intersect_any(const RaysArg& origins_argument, const RaysArg& directions_argument,
                                      const Transforms& matrices_argument, const Numbers& index_argument) const {
-        const Rays origins = trimkit::read_rows(origins_argument, "origins");
-        const Rays directions = trimkit::read_rows(directions_argument, "directions");
+        const Rays origins = trimkit::read_rays(origins_argument, "origins");
+        const Rays directions = trimkit::read_rays(directions_argument, "directions");
         const std::size_t n = count_rays(origins, directions);
         const std::shared_ptr<const TopLevel> top = top_level(matrices_argument, index_argument);
         std::vector<std::uint8_t> hits(n, 0);
@@ -327,14 +307,14 @@ public:
         std::string fallback;
         if (bvh == nullptr || !device_occlusion(*top, origins, directions, n, &hits, &fallback)) {
             // the device checks each ray's values as it copies them: here, now
-            trimkit::check_rows(origins, "origins");
-            trimkit::check_rows(directions, "directions");
+            trimkit::check_rays(origins, "origins");
+            trimkit::check_rays(directions, "directions");
             trimkit::in_parallel(bvh != nullptr ? n : 0, [&](std::size_t begin, std::size_t end) {
                 for (std::size_t i = begin; i < end; i++) {
                     double o[3];
                     double d[3];
-                    origins.read(i, o);
-                    directions.read(i, d);
+                    trimkit::ray_row(origins, i, o);
+                    trimkit::ray_row(directions, i, d);
                     // every ray written, whatever a device left there
                     const tinybvh::RayEx ray = make_tinybvh_ray(o, d);
                     hits[i] = !still(d) && bvh->IsOccluded(ray) ? 1 : 0;
@@ -353,8 +333,8 @@ public:
         }
         const std::size_t most = maximum_hits ? static_cast<std::size_t>(std::int64_t{*maximum_hits})
                                               : std::numeric_limits<std::size_t>::max();
-        const Rays origins = trimkit::read_rows(origins_argument, "origins");
-        const Rays directions = trimkit::read_rows(directions_argument, "directions");
+        const Rays origins = trimkit::read_rays(origins_argument, "origins");
+        const Rays directions = trimkit::read_rays(directions_argument, "directions");
         const std::size_t n = count_rays(origins, directions);
         const std::shared_ptr<const TopLevel> top = top_level(matrices_argument, index_argument);
         const TopLevel& level = *top;
@@ -364,8 +344,8 @@ public:
         std::string fallback;
         if (level.bvh() == nullptr || !device_crossings(level, origins, directions, n, most, &columns, &fallback)) {
             // the device checks each ray's values as it copies them: here, now
-            trimkit::check_rows(origins, "origins");
-            trimkit::check_rows(directions, "directions");
+            trimkit::check_rays(origins, "origins");
+            trimkit::check_rays(directions, "directions");
             trimkit::Gathered<Hit> found;
             if (level.bvh() != nullptr) {
                 trimkit::gather_in_parallel<Hit>(
@@ -376,8 +356,8 @@ public:
                         for (std::size_t i = begin; i < end; i++) {
                             double o[3];
                             double d[3];
-                            origins.read(i, o);
-                            directions.read(i, d);
+                            trimkit::ray_row(origins, i, o);
+                            trimkit::ray_row(directions, i, d);
                             if (still(d)) {
                                 continue;
                             }
@@ -414,15 +394,23 @@ public:
     }
 
 private:
+    // a query's instances, read and checked: any invertible transform
+    trimkit::Instances read_instances(const Transforms& matrices_argument, const Numbers& index_argument) const {
+        return trimkit::read_instances(trimkit::view_instances(index_argument, matrices_argument), meshes_.size(),
+                                       /*rigid=*/false);
+    }
+
     // The top level for these instances: the remembered one if they are
-    // exactly the arrays it was built from, else a new one, remembered
+    // exactly the arrays it was built from, else a new one, remembered. The
+    // arrays are viewed once, for the comparison and for the read after it
     std::shared_ptr<const TopLevel> top_level(const Transforms& matrices_argument,
                                               const Numbers& index_argument) const {
+        const trimkit::InstanceViews views = trimkit::view_instances(index_argument, matrices_argument);
         std::shared_ptr<const TopLevel> last = remembered();
-        if (names(*last, matrices_argument, index_argument)) {
+        if (trimkit::same_instances(views, last->given)) {
             return last;
         }
-        std::shared_ptr<const TopLevel> built = build(matrices_argument, index_argument);
+        std::shared_ptr<const TopLevel> built = build(trimkit::read_instances(views, meshes_.size(), /*rigid=*/false));
         {
             const nb::ft_lock_guard guard(last_lock_);
             last_ = built;
@@ -435,25 +423,14 @@ private:
         return last_;
     }
 
-    // A top level for these instances, checked, from a copy of their arrays
-    std::shared_ptr<const TopLevel> build(const Transforms& matrices_argument, const Numbers& index_argument) const {
-        const trimkit::Instances instances = trimkit::read_instances(index_argument, matrices_argument, meshes_.size());
-        Placement placement = place(instances);
+    // a top level for instances already read
+    std::shared_ptr<const TopLevel> build(trimkit::Instances instances) const {
         std::shared_ptr<TopLevel> top = std::make_shared<TopLevel>();
-        top->given_index = instances.given_index;
-        top->given_matrices = instances.given_matrices;
-        if (instances.given_index) {
-            top->index.assign(instances.index.data(), instances.index.data() + instances.count);
-        }
-        if (instances.given_matrices) {
-            top->matrices.assign(instances.matrices.data(), instances.matrices.data() + (16 * instances.count));
-        }
-        top->instances = std::move(placement.instances);
-        top->which = std::move(placement.which);
-        top->extent = placement.extent;
+        top->given = std::move(instances);
+        const bool all_identity = place(top.get());
         // one identity instance traces its mesh directly: the same answers as
         // through a top level, without the extra level per ray (19% of a query)
-        if (top->instances.size() == 1 && placement.all_identity) {
+        if (top->instances.size() == 1 && all_identity) {
             top->direct = meshes_[static_cast<std::size_t>(top->instances[0].blasIdx)].get();
         } else if (!top->instances.empty()) {
             const nb::gil_scoped_release release;
@@ -462,7 +439,7 @@ private:
             tinybvh::BVH_Double** meshes =
                 const_cast<tinybvh::BVH_Double**>(blas_.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
             top->tlas->Build(top->instances.data(), top->instances.size(), meshes, blas_.size());
-            pad(*top->tlas, placement.extent);
+            pad(*top->tlas, top->extent);
         }
         if (device_meshes_ && top->tlas) {
             const nb::gil_scoped_release release;
@@ -471,25 +448,33 @@ private:
         return top;
     }
 
-    Placement place(const trimkit::Instances& instances) const {
+    // Place `top->given`: each instance of a mesh with faces kept, in its
+    // order, with its world box; whether every kept transform is the identity
+    bool place(TopLevel* top) const {
         constexpr std::array<double, 16> IDENTITY{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        Placement placement;
-        placement.boxes.resize(6 * instances.count);
+        const trimkit::Instances& instances = top->given;
+        bool all_identity = true;
+        // as many as there could be, written by index, then cut to those kept
+        std::size_t kept = 0;
+        top->instances.resize(instances.count, tinybvh::BLASInstanceEx(0));
+        top->which.resize(instances.count);
+        top->boxes.resize(6 * instances.count);
         // read and checked: the rest touches no Python
         const nb::gil_scoped_release release;
         for (std::size_t i = 0; i < instances.count; i++) {
-            double* box = &placement.boxes[6 * i];
+            double* box = &top->boxes[6 * i];
             const std::size_t mesh_index = instances.mesh(i);
             const double* transform = instances.matrix(i);
             tinybvh::BLASInstanceEx instance(static_cast<std::uint64_t>(mesh_index));
             for (std::int32_t entry = 0; entry < 16; entry++) {
                 instance.transform[entry] = transform[entry];
             }
-            // every instance's transform is checked, its mesh empty or not.
-            // tinybvh leaves a singular transform's adjugate as its inverse, so
-            // check the determinant here. The inverse carries rays into the
-            // mesh's frame, so it is held to the same bound as every input: a
-            // nearly singular transform's huge inverse would overflow there
+            // The one check made here, as only here is the inverse: tinybvh
+            // leaves a singular transform's adjugate as its inverse, so the
+            // determinant is checked, and the inverse carries rays into the
+            // mesh's frame, so it is held to the same bound as every input (a
+            // nearly singular transform's huge inverse would overflow there).
+            // Every instance's, its mesh empty or not
             instance.InvertTransform();
             bool invertible = trimkit::determinant_of(transform) != 0.0;
             for (std::int32_t entry = 0; entry < 16; entry++) {
@@ -509,19 +494,20 @@ private:
                 continue;
             }
             instance.Update(blas);
-            placement.all_identity = placement.all_identity && std::equal(transform, transform + 16, IDENTITY.begin());
+            all_identity = all_identity && std::equal(transform, transform + 16, IDENTITY.begin());
             for (std::int32_t axis = 0; axis < 3; axis++) {
-                placement.extent =
-                    std::max({placement.extent, std::abs(instance.aabbMin[axis]), std::abs(instance.aabbMax[axis])});
-            }
-            for (std::int32_t axis = 0; axis < 3; axis++) {
+                top->extent =
+                    std::max({top->extent, std::abs(instance.aabbMin[axis]), std::abs(instance.aabbMax[axis])});
                 box[axis] = instance.aabbMin[axis];
                 box[3 + axis] = instance.aabbMax[axis];
             }
-            placement.instances.push_back(instance);
-            placement.which.push_back(static_cast<std::int64_t>(i));
+            top->instances[kept] = instance;
+            top->which[kept] = static_cast<std::int64_t>(i);
+            kept++;
         }
-        return placement;
+        top->instances.resize(kept, tinybvh::BLASInstanceEx(0));
+        top->which.resize(kept);
+        return all_identity;
     }
 
     // The crossings of the scene's surface along a ray, nearest first, up to
@@ -608,7 +594,7 @@ private:
     // reason: that is no fallback to warn about), when there are no rays,
     // when this top level isn't on it or the device failed (then with the
     // reason), or when a ray's value is one `read` refuses (no reason: the
-    // caller's `check_rows` raises it), and the CPU answers. No Ctrl-C is
+    // caller's `check_rays` raises it), and the CPU answers. No Ctrl-C is
     // looked for: that would take the GIL while holding the device, and a
     // device query is over in milliseconds
     template <typename Consume>

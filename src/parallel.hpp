@@ -189,6 +189,21 @@ inline void unpark(std::atomic<std::uint32_t>& word) {
 #endif
 }
 
+#if defined(__linux__)
+// the CPUs one cgroup's quota allows, from its `cpu.max`: "max 100000" for no
+// quota, or "<quota> <period>" in microseconds
+inline std::uint64_t cpu_quota(const char* directory) {
+    char path[cgroup::PATH_CAPACITY];
+    char text[64];
+    cgroup::join(path, sizeof(path), directory, "cpu.max");
+    cgroup::read_text(path, text, sizeof(text));
+    char* end = nullptr;
+    const unsigned long long quota = std::strtoull(text, &end, 10);
+    const unsigned long long period = end == text ? 0 : std::strtoull(end, nullptr, 10);
+    return period > 0 ? std::max<unsigned long long>(1, (quota + period - 1) / period) : cgroup::NO_LIMIT;
+}
+#endif
+
 // the CPUs this process may run on: its affinity, where there is one, and no
 // more than a cgroup's CPU quota allows (`cpu.max` at its cgroup and each one
 // above), which affinity doesn't see: a container limited to 2 CPUs on a
@@ -201,23 +216,7 @@ inline std::uint32_t cpu_count() {
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
         count = static_cast<std::uint32_t>(std::max(1, CPU_COUNT(&set)));
     }
-    char directory[cgroup::DIRECTORY_CAPACITY];
-    cgroup::own_directory(directory, sizeof(directory));
-    // this process's cgroup and each one above it
-    for (bool more = true; more; more = cgroup::ascend(directory)) {
-        // "max 100000" for no quota, or "<quota> <period>" in microseconds
-        char path[cgroup::PATH_CAPACITY];
-        char text[64];
-        cgroup::join(path, sizeof(path), directory, "cpu.max");
-        cgroup::read_text(path, text, sizeof(text));
-        char* end = nullptr;
-        const unsigned long long quota = std::strtoull(text, &end, 10);
-        const unsigned long long period = end == text ? 0 : std::strtoull(end, nullptr, 10);
-        if (period > 0) {
-            const unsigned long long cpus = std::max<unsigned long long>(1, (quota + period - 1) / period);
-            count = static_cast<std::uint32_t>(std::min<unsigned long long>(count, cpus));
-        }
-    }
+    count = static_cast<std::uint32_t>(std::min<std::uint64_t>(count, cgroup::least_over_chain(cpu_quota)));
 #endif
     return count;
 }

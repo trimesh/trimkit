@@ -143,11 +143,11 @@ nb::bytes draco_encode(const trimkit::Array<std::int64_t, -1, 3>& faces_argument
     }
     const trimkit::In<std::int64_t, -1> kind_numbers = trimkit::read(kinds_argument, "kinds");
     // validate every attribute while we hold the GIL
-    std::vector<Attribute> inputs;
-    for (const nb::handle value : attributes) {
-        const std::string name = "attributes[" + std::to_string(inputs.size()) + "]";
-        Attribute a;
-        a.array = trimkit::read_any(value, name);
+    std::vector<Attribute> inputs(nb::len(attributes));
+    for (std::size_t i = 0; i < inputs.size(); i++) {
+        const std::string name = "attributes[" + std::to_string(i) + "]";
+        Attribute& a = inputs[i];
+        a.array = trimkit::read_any(attributes[i], name);
         if (const auto* c = component([&](const ComponentType& t) { return t.numpy == a.array.dtype(); })) {
             a.type = c->draco;
         } else {
@@ -157,10 +157,9 @@ nb::bytes draco_encode(const trimkit::Array<std::int64_t, -1, 3>& faces_argument
             a.components = a.array.shape(1);
         }
         if (a.array.ndim() < 1 || a.array.ndim() > 2 || a.components < 1 || a.components > 16 ||
-            a.array.shape(0) != (inputs.empty() ? a.array.shape(0) : inputs[0].array.shape(0))) {
+            a.array.shape(0) != inputs[0].array.shape(0)) {
             trimkit::value_error(name + " must be (n,) or (n, c<=16) like the rest");
         }
-        inputs.push_back(std::move(a));
     }
     if (kind_numbers.shape(0) != inputs.size()) {
         trimkit::value_error("kinds must have one entry per attribute");
@@ -240,13 +239,13 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
     // bytes and memoryviews are uint8 buffers already, viewed without a copy
     const trimkit::In<std::uint8_t, -1> buffer = trimkit::read(buffer_argument, "buffer");
     const trimkit::In<std::int64_t, -1> draco_attributes = trimkit::read(attributes_argument, "draco_attributes");
-    std::vector<std::uint32_t> wanted;
-    for (std::size_t i = 0; i < draco_attributes.shape(0); i++) {
+    std::vector<std::uint32_t> wanted(draco_attributes.shape(0));
+    for (std::size_t i = 0; i < wanted.size(); i++) {
         const std::int64_t id = draco_attributes(i);
         if (id < 0 || id > std::numeric_limits<std::uint32_t>::max()) {
             trimkit::value_error("draco_attributes[" + std::to_string(i) + "] is not a draco attribute id");
         }
-        wanted.push_back(static_cast<std::uint32_t>(id));
+        wanted[i] = static_cast<std::uint32_t>(id);
     }
 
     std::unique_ptr<draco::Mesh> mesh;

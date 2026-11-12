@@ -100,4 +100,16 @@ static inline bool ascend(char* directory) {
     return true;
 }
 
+// The least `value(directory)` over this process's cgroup directory and each
+// one above it: a limit set anywhere up the chain holds for everything below
+static inline std::uint64_t least_over_chain(std::uint64_t (*value)(const char* directory)) {
+    char directory[DIRECTORY_CAPACITY];
+    own_directory(directory, sizeof(directory));
+    std::uint64_t least = NO_LIMIT;
+    for (bool more = true; more; more = ascend(directory)) {
+        least = std::min(least, value(directory));
+    }
+    return least;
+}
+
 }  // namespace trimkit::cgroup

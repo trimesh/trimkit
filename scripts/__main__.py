@@ -504,9 +504,7 @@ THREADING = (
 # the vendored libraries with thread pools of their own, and the define that compiles each out
 POOLS_COMPILED_OUT = {"vhacd": "VHACD_DISABLE_THREADING", "tinybvh": "NO_THREADED_BUILDS"}
 
-DOOR_ONLY = re.compile(
-    r"nb::ndarray|try_cast|check_bounded|check_coordinates|trimkit::detail::|\b(malloc|calloc|realloc)\("
-)
+DOOR_ONLY = re.compile(r"nb::ndarray|try_cast|check_values|trimkit::detail::|\b(malloc|calloc|realloc)\(")
 
 
 def check_door() -> None:

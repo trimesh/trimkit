@@ -68,12 +68,6 @@ static_assert(coal::MeshCollisionTraversalNodeOBBRSS::RTIsIdentity == 0, "collis
 static_assert(coal::MeshDistanceTraversalNodeOBBRSS::RTIsIdentity == 0, "distance must not move the model");
 static_assert(MeshConvexCollision::RTIsIdentity == 0, "collision must not move the model");
 
-// How far a rigid transform's rotation may be from orthonormal: matrices
-// assembled in double precision are within ~1e-15, and float32 ones ~1e-7
-constexpr double ORTHONORMAL_TOLERANCE = 1e-6;
-
-double dot(const double* a, const double* b) { return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]); }
-
 // One mesh of a CollisionScene, built once however often its queries place it
 class CollisionMesh {
 public:
@@ -119,11 +113,7 @@ private:
             triangles[f] = coal::Triangle32(faces[3 * f], faces[(3 * f) + 1], faces[(3 * f) + 2]);
         }
         const trimkit::PointBounds bounds = trimkit::bounds_of(points, vertex_count);
-        for (std::size_t axis = 0; axis < 3; axis++) {
-            // halved before subtracting, so no extent overflows
-            box_[axis] = (bounds.lowest[axis] / 2.0) + (bounds.highest[axis] / 2.0);
-            box_[3 + axis] = (bounds.highest[axis] / 2.0) - (bounds.lowest[axis] / 2.0);
-        }
+        trimkit::center_half(bounds.lowest, bounds.highest, box_.data());
         model_ = std::make_shared<Model>();
         model_->beginModel(static_cast<unsigned int>(face_count_), static_cast<unsigned int>(vertex_count));
         model_->addSubModel(vertices, triangles);
@@ -167,7 +157,11 @@ void relative(const Placed& a, const Placed& b, coal::Matrix3s& rotation, coal::
 
 // Whether two placed meshes may touch or come within `request`'s margin:
 // their world boxes, then their hierarchies' roots as coal's collision
-// traversal prunes, by oriented boxes. False only when they can't
+// traversal prunes, by oriented boxes. False only when they can't. The root
+// test is not coal's work done twice for convex solids, which have no
+// hierarchy between the boxes and GJK: without it, three robots' named pairs
+// took 6 to 11, 146 to 218 and 117 to 200 microseconds a configuration
+// (2026-11-12, answers identical); between meshes it changes nothing
 bool may_touch(const Placed& a, const Placed& b, const coal::CollisionRequest& request) {
     if (a.mesh->empty() || b.mesh->empty() || box_gap(a.box, b.box) > request.security_margin) {
         return false;
@@ -186,7 +180,9 @@ bool may_touch(const Placed& a, const Placed& b, const coal::CollisionRequest& r
 
 // Whether two placed meshes may be at most `bound` apart: their world
 // boxes, then their roots' rectangle swept spheres, a lower bound on their
-// distance, as coal's distance traversal prunes. False only when they can't
+// distance, as coal's distance traversal prunes. False only when they can't.
+// Worth up to 7% of a bounded query between convex solids, and nothing
+// between meshes (2026-11-12, the same three robots, answers identical)
 bool may_be_within(const Placed& a, const Placed& b, double bound) {
     if (a.mesh->empty() || b.mesh->empty() || box_gap(a.box, b.box) > bound) {
         return false;
@@ -347,23 +343,20 @@ public:
     CollisionScene& operator=(const CollisionScene&) = delete;
 
     CollisionScene(const trimkit::Meshes& meshes, const ConvexArg& convex_argument) {
-        std::vector<trimkit::Mesh<std::uint32_t>> read;
-        for (const nb::handle item : meshes) {
-            read.push_back(trimkit::read_mesh<std::uint32_t>(item, "meshes[" + std::to_string(read.size()) + "]"));
-        }
+        const std::vector<trimkit::Mesh<std::uint32_t>> read = trimkit::read_meshes<std::uint32_t>(meshes);
         std::vector<std::uint8_t> solid(read.size(), 0);
         if (const trimkit::Flag* every = std::get_if<trimkit::Flag>(&convex_argument)) {
             std::fill(solid.begin(), solid.end(), every->value ? 1 : 0);
         } else {
-            const trimkit::In<std::uint8_t, -1> convex = trimkit::read(std::get<1>(convex_argument), "convex");
+            const trimkit::In<bool, -1> convex = trimkit::read(std::get<1>(convex_argument), "convex");
             if (convex.shape(0) != read.size()) {
                 trimkit::value_error("convex must have one row per mesh");
             }
-            std::copy(convex.data(), convex.data() + read.size(), solid.begin());
+            std::copy_n(trimkit::mask_bytes(convex), read.size(), solid.begin());
         }
+        meshes_.resize(read.size());
         for (std::size_t i = 0; i < read.size(); i++) {
-            meshes_.push_back(
-                std::make_unique<CollisionMesh>(read[i], solid[i] != 0, "meshes[" + std::to_string(i) + "]"));
+            meshes_[i] = std::make_unique<CollisionMesh>(read[i], solid[i] != 0, "meshes[" + std::to_string(i) + "]");
         }
     }
 
@@ -486,25 +479,13 @@ private:
     // the oriented box is far tighter for a mesh lying diagonally in its own
     // frame, and looser for a cube, whose principal axes are arbitrary
     std::vector<Placed> place(const MatricesArg& matrices_argument, const IndexArg& index_argument) const {
-        const trimkit::Instances instances = trimkit::read_instances(index_argument, matrices_argument, meshes_.size());
+        // read and checked, rigid transforms only: the rest only places, and touches no Python
+        const trimkit::Instances instances = trimkit::read_instances(
+            trimkit::view_instances(index_argument, matrices_argument), meshes_.size(), /*rigid=*/true);
         std::vector<Placed> placed(instances.count);
-        // read and checked: the rest touches no Python
         const nb::gil_scoped_release release;
         for (std::size_t i = 0; i < instances.count; i++) {
             const double* m = instances.matrix(i);
-            // a rotation: orthonormal rows, and no reflection
-            bool rigid = true;
-            for (std::size_t r = 0; r < 3; r++) {
-                for (std::size_t c = 0; c < 3; c++) {
-                    const double product = dot(m + (4 * r), m + (4 * c));
-                    const double expected = r == c ? 1.0 : 0.0;
-                    rigid = rigid && std::abs(product - expected) <= ORTHONORMAL_TOLERANCE;
-                }
-            }
-            if (!rigid || trimkit::determinant_of(m) <= 0.0) {
-                trimkit::value_error("instance_matrices must be rigid: instance " + std::to_string(i) +
-                                     " rotates by a matrix that isn't a rotation");
-            }
             const CollisionMesh* mesh = meshes_[instances.mesh(i)].get();
             coal::Matrix3s rotation;
             coal::Vec3s translation;
@@ -524,16 +505,15 @@ private:
                 const coal::Vec3s vertex_center =
                     (rotation * coal::Vec3s(vertex_box[0], vertex_box[1], vertex_box[2])) + translation;
                 const coal::Vec3s vertex_half(vertex_box[3], vertex_box[4], vertex_box[5]);
+                double lowest[3];
+                double highest[3];
                 for (Eigen::Index r = 0; r < 3; r++) {
                     const double oriented_half = oriented_axes.row(r).cwiseAbs().dot(oriented.extent);
                     const double vertex_extent = rotation.row(r).cwiseAbs().dot(vertex_half);
-                    const double lowest =
-                        std::max(oriented_center[r] - oriented_half, vertex_center[r] - vertex_extent);
-                    const double highest =
-                        std::min(oriented_center[r] + oriented_half, vertex_center[r] + vertex_extent);
-                    box[static_cast<std::size_t>(r)] = (lowest / 2.0) + (highest / 2.0);
-                    box[3 + static_cast<std::size_t>(r)] = std::max(0.0, (highest / 2.0) - (lowest / 2.0));
+                    lowest[r] = std::max(oriented_center[r] - oriented_half, vertex_center[r] - vertex_extent);
+                    highest[r] = std::min(oriented_center[r] + oriented_half, vertex_center[r] + vertex_extent);
                 }
+                trimkit::center_half(lowest, highest, box.data());
             }
             placed[i] = {mesh, coal::Transform3s(rotation, translation), box};
         }
@@ -565,8 +545,9 @@ private:
     static std::vector<std::int64_t> overlapping(const std::vector<Placed>& placed, double margin) {
         std::vector<coal::CollisionObject> objects;
         objects.reserve(placed.size());
-        std::vector<coal::CollisionObject*> registered;
-        registered.reserve(placed.size());
+        // as many as there could be, written by index, then cut to those kept
+        std::vector<coal::CollisionObject*> registered(placed.size());
+        std::size_t kept = 0;
         std::vector<std::int64_t> rows_of(placed.size());
         std::iota(rows_of.begin(), rows_of.end(), std::int64_t{0});
         for (std::size_t i = 0; i < placed.size(); i++) {
@@ -583,8 +564,9 @@ private:
                 object.getAABB().min_[axis] = box[static_cast<std::size_t>(axis)] - half;
                 object.getAABB().max_[axis] = box[static_cast<std::size_t>(axis)] + half;
             }
-            registered.push_back(&object);
+            registered[kept++] = &object;
         }
+        registered.resize(kept);
         Candidates candidates;
         if (registered.size() > 1) {
             coal::DynamicAABBTreeArrayCollisionManager tree;

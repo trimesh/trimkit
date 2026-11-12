@@ -27,9 +27,9 @@
 namespace trimkit::vulkan {
 
 // a device takes one submitter at a time
-inline Exclusive& device_lock() {
-    static Exclusive lock;
-    return lock;
+inline std::atomic<std::uint32_t>& device_lock() {
+    static std::atomic<std::uint32_t> held{0};
+    return held;
 }
 
 // A scene's meshes, or one top level, on the device: uploaded once from the
@@ -209,31 +209,15 @@ inline std::unique_ptr<DeviceArrays> put_top(Device* device, const void* tree_no
     return arrays;
 }
 
-// `count` values copied as they are, and whether every one is a value a ray
-// may hold: finite and within the bound every float64 input is held to
-inline bool copy_checked(const double* values, std::size_t count, double* out) {
-    std::size_t refused = 0;
-    for (std::size_t i = 0; i < count; i++) {
-        out[i] = values[i];
-        refused += !(std::abs(values[i]) <= COORDINATE_LIMIT) ? 1U : 0U;
-    }
-    return refused == 0;
-}
-
-// `count` float32 values copied as they are: whether every one may be held,
-// and in `*plain` whether every one is zero or normal (a device may read a
-// float32 denormal as zero, so a chunk holding one goes widened instead)
-inline bool copy_checked(const float* values, std::size_t count, float* out, bool* plain) {
-    std::size_t refused = 0;
+// whether any of `count` float32 values is a denormal, which a device may
+// read as zero
+inline bool has_denormal(const float* values, std::size_t count) {
     std::size_t denormal = 0;
     for (std::size_t i = 0; i < count; i++) {
         const float size = std::abs(values[i]);
-        out[i] = values[i];
-        refused += !(static_cast<double>(size) <= COORDINATE_LIMIT) ? 1U : 0U;
         denormal += size != 0.0F && size < std::numeric_limits<float>::min() ? 1U : 0U;
     }
-    *plain = denormal == 0;
-    return refused == 0;
+    return denormal != 0;
 }
 
 // `count` of a query's origins or directions from row `begin`, written into
@@ -241,49 +225,44 @@ inline bool copy_checked(const float* values, std::size_t count, float* out, boo
 // float32, which the device widens; a float64 array as float64. The array's
 // dtype decides, and nothing about one chunk decides another's. False for a
 // value no ray may hold: the one look these values get on their way to a
-// device. One pass on the calling thread: the device, not this copy, is what
-// a query waits for
-inline bool fill_rows(const Rows<3>& rays, void* chunk, std::size_t begin, std::size_t count, std::uint32_t* stride) {
+// device (`count_beyond`, the scan every input gets, made as they are copied)
+inline bool fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::size_t count, std::uint32_t* stride) {
     double* wide = static_cast<double*>(chunk);
     if (rays.one) {
         double row[3];
-        rays.read(0, row);
+        ray_row(rays, 0, row);
         *stride = STRIDE_ONE;
-        return copy_checked(row, 3, wide);
+        return count_beyond(row, 3, COORDINATE_LIMIT, wide) == 0;
     }
-    std::atomic<bool> taken{true};
-    if (rays.wide != nullptr) {
+    std::atomic<std::size_t> beyond{0};
+    if (!rays.is_float32) {
         *stride = STRIDE_WIDE;
-        const double* given = rays.wide + (3 * begin);
+        const double* given = static_cast<const double*>(rays.data) + (3 * begin);
         in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
-            if (!copy_checked(given + (3 * from), 3 * (to - from), wide + (3 * from))) {
-                taken.store(false, std::memory_order_relaxed);
-            }
+            beyond.fetch_add(count_beyond(given + (3 * from), 3 * (to - from), COORDINATE_LIMIT, wide + (3 * from)),
+                             std::memory_order_relaxed);
         });
-        return taken.load();
+        return beyond.load() == 0;
     }
-    const float* narrow = rays.narrow + (3 * begin);
-    std::atomic<bool> every_plain{true};
+    const float* given = static_cast<const float*>(rays.data) + (3 * begin);
+    float* narrow = static_cast<float*>(chunk);
+    std::atomic<bool> denormal{false};
     *stride = STRIDE_NARROW;
     in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
-        bool block_plain = true;
-        if (!copy_checked(narrow + (3 * from), 3 * (to - from), static_cast<float*>(chunk) + (3 * from),
-                          &block_plain)) {
-            taken.store(false, std::memory_order_relaxed);
-        }
-        if (!block_plain) {
-            every_plain.store(false, std::memory_order_relaxed);
+        beyond.fetch_add(count_beyond(given + (3 * from), 3 * (to - from), COORDINATE_LIMIT, narrow + (3 * from)),
+                         std::memory_order_relaxed);
+        if (has_denormal(given + (3 * from), 3 * (to - from))) {
+            denormal.store(true, std::memory_order_relaxed);
         }
     });
-    if (!taken.load()) {
+    if (beyond.load() != 0) {
         return false;
     }
-    const bool plain = every_plain.load();
-    if (!plain) {
-        // a float32 widens to exactly itself, and was just checked
+    if (denormal.load()) {
+        // this chunk goes widened on the host: a float32 widens to exactly itself
         *stride = STRIDE_WIDE;
         for (std::size_t i = 0; i < 3 * count; i++) {
-            wide[i] = static_cast<double>(narrow[i]);
+            wide[i] = static_cast<double>(given[i]);
         }
     }
     return true;
@@ -298,8 +277,8 @@ inline bool fill_rows(const Rows<3>& rays, void* chunk, std::size_t begin, std::
 // running on the device either way. Called with the GIL released
 template <typename Consume>
 bool trace(const DeviceArrays& scene, const DeviceArrays* top, std::uint32_t mesh, double extent, bool occlusion,
-           std::size_t most, const Rows<3>& origins, const Rows<3>& directions, std::size_t count,
-           const Consume& consume, std::string* reason) {
+           std::size_t most, const Rays& origins, const Rays& directions, std::size_t count, const Consume& consume,
+           std::string* reason) {
     Query query;
     query.scene = &scene.arrays;
     query.top = top != nullptr ? &top->arrays : nullptr;

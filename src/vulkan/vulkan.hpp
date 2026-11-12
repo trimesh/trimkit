@@ -426,11 +426,6 @@ inline void destroy(const Device& device, Buffer* buffer) {
 inline bool make_buffer(const Device& device, VkDeviceSize size, VkBufferUsageFlags usage,
                         VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred, Buffer* out,
                         std::string* reason) {
-    // past the device's range a bound buffer is undefined, not an error
-    if (size > device.range) {
-        *reason = "a buffer of " + std::to_string(size) + " bytes exceeds the device's storage buffer range";
-        return false;
-    }
     const Functions& fn = device.fn;
     Buffer buffer;
     buffer.size = std::max<VkDeviceSize>(size, 16);
@@ -519,41 +514,13 @@ inline void compute_barrier(const Device& device, VkCommandBuffer command) {
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
-// `size` bytes at `data` as a device-local storage buffer, copied through a
-// staging buffer; an empty array becomes a small buffer the shader never reads
-inline bool upload(const Device& device, const void* data, std::size_t size, Buffer* out, std::string* reason) {
-    Buffer staging;
-    if (!make_buffer(device, size, TRANSFER, HOST, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &staging, reason)) {
-        return false;
-    }
-    Buffer target;
-    if (!make_buffer(device, size, STORAGE, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &target, reason)) {
-        destroy(device, &staging);
-        return false;
-    }
-    bool copied = true;
-    if (size > 0) {
-        std::memcpy(staging.mapped, data, size);
-        copied = begin_commands(device, device.command, reason);
-        if (copied) {
-            VkBufferCopy region{};
-            region.size = size;
-            device.fn.vkCmdCopyBuffer(device.command, staging.buffer, target.buffer, 1, &region);
-            copied =
-                submit_commands(device, device.command, device.fence, reason) && wait(device, device.fence, reason);
-        }
-    }
-    destroy(device, &staging);
-    if (!copied) {
-        destroy(device, &target);
-        return false;
-    }
-    *out = target;
-    return true;
-}
-
 // a buffer of `bytes`, mapped host memory the CPU caches or the device's own
 inline bool make_sized(const Device& device, VkDeviceSize bytes, bool mapped, Buffer* out, std::string* reason) {
+    // past the device's range a bound buffer is undefined, not an error
+    if (bytes > device.range) {
+        *reason = "a buffer of " + std::to_string(bytes) + " bytes exceeds the device's storage buffer range";
+        return false;
+    }
     return make_buffer(device, bytes, STORAGE, mapped ? HOST : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                        mapped ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0, out, reason);
 }
@@ -910,15 +877,34 @@ struct Arrays {
     Buffer buffers[SCENE_BUFFERS];
 };
 
-// `count` arrays uploaded as the first buffers of `out`: false with the
-// reason, what was made left for `destroy`
+// `count` arrays as the first buffers of `out`, each a storage buffer in the
+// device's own memory, all of them through one staging buffer in one
+// submission; an empty array becomes a small buffer the shader never reads.
+// False with the reason, what was made left for `destroy`
 inline bool upload(const Device& device, const Span* spans, std::uint32_t count, Arrays* out, std::string* reason) {
+    VkDeviceSize total = 0;
     for (std::uint32_t b = 0; b < count; b++) {
-        if (!upload(device, spans[b].data, spans[b].size, &out->buffers[b], reason)) {
-            return false;
-        }
+        total += spans[b].size;
     }
-    return true;
+    Buffer staging;
+    if (!make_buffer(device, total, TRANSFER, HOST, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &staging, reason)) {
+        return false;
+    }
+    bool copied = begin_commands(device, device.command, reason);
+    VkBufferCopy region{};
+    for (std::uint32_t b = 0; b < count && copied; b++) {
+        copied = make_sized(device, spans[b].size, false, &out->buffers[b], reason);
+        region.size = spans[b].size;
+        if (copied && region.size > 0) {
+            std::memcpy(static_cast<char*>(staging.mapped) + region.srcOffset, spans[b].data, spans[b].size);
+            device.fn.vkCmdCopyBuffer(device.command, staging.buffer, out->buffers[b].buffer, 1, &region);
+        }
+        region.srcOffset += region.size;
+    }
+    copied =
+        copied && submit_commands(device, device.command, device.fence, reason) && wait(device, device.fence, reason);
+    destroy(device, &staging);
+    return copied;
 }
 
 inline void destroy(const Device& device, Arrays* arrays) {

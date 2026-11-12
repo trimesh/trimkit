@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -66,6 +67,16 @@ inline PointBounds bounds_of(const double* points, std::size_t count) {
     return bounds;
 }
 
+// The center and half extent of the box from `lowest` to `highest`, as six
+// values: halved before subtracting, so extents up to DBL_MAX don't overflow,
+// and never negative
+inline void center_half(const double* lowest, const double* highest, double* box) {
+    for (std::size_t axis = 0; axis < 3; axis++) {
+        box[axis] = (lowest[axis] / 2.0) + (highest[axis] / 2.0);
+        box[3 + axis] = std::max(0.0, (highest[axis] / 2.0) - (lowest[axis] / 2.0));
+    }
+}
+
 // The determinant of a row-major 4x4 transform's 3x3 linear part
 inline double determinant_of(const double* m) {
     return (m[0] * ((m[5] * m[10]) - (m[6] * m[9]))) - (m[1] * ((m[4] * m[10]) - (m[6] * m[8]))) +
@@ -104,13 +115,10 @@ inline std::vector<float> float32_positions(const double* values, std::size_t co
         return positions;
     }
     const PointBounds bounds = bounds_of(values, count);
-    double center[3] = {0.0, 0.0, 0.0};
-    double half_extent = 0.0;
-    for (std::size_t axis = 0; axis < 3; axis++) {
-        // halved before subtracting, so extents up to DBL_MAX don't overflow
-        center[axis] = (bounds.lowest[axis] / 2.0) + (bounds.highest[axis] / 2.0);
-        half_extent = std::max(half_extent, (bounds.highest[axis] / 2.0) - (bounds.lowest[axis] / 2.0));
-    }
+    double box[6];
+    center_half(bounds.lowest, bounds.highest, box);
+    const double* center = box;
+    const double half_extent = std::max({box[3], box[4], box[5]});
     int exponent = 0;
     std::frexp(half_extent, &exponent);
     *scale = half_extent > 0.0 ? std::ldexp(1.0, -exponent) : 1.0;
@@ -149,128 +157,108 @@ private:
     std::atomic<bool> interrupted_{false};
 };
 
-// The shape of every batch query: `body(begin, end)` over [0, count) in
-// ranges, on this thread and the pool's workers (parallel.hpp), with the GIL
-// released; then, with it held again, a Ctrl-C raised as KeyboardInterrupt
-// or the first exception a range threw, rethrown. Each item writes its own
-// output, so the result doesn't depend on how the ranges fell.
+// The one way onto the pool (parallel.hpp): `body(begin, end)` over
+// [0, count) in ranges, on this thread and the pool's workers, from a thread
+// that holds no GIL. `eager` wakes every worker before the first item, for a
+// fan-out that is coarse by construction; `interrupt`, when there is one,
+// is polled by this thread between its ranges and stops the job. The first
+// exception a range threw comes back, for the caller to rethrow where it may
 template <typename Body>
-void in_parallel(std::size_t count, const Body& body) {
+std::exception_ptr on_pool(std::size_t count, const Body& body, bool eager, Interrupt* interrupt) {
     if (count == 0) {
-        return;
+        return nullptr;
     }
-    Interrupt interrupt;
     parallel::Job job;
     job.count = count;
+    job.eager = eager;
     job.run = [](const void* context, std::size_t begin, std::size_t end) {
         (*static_cast<const Body*>(context))(begin, end);
     };
     job.body = &body;
-    job.poll = [](void* context) { return static_cast<Interrupt*>(context)->poll(); };
-    job.poll_context = &interrupt;
+    if (interrupt != nullptr) {
+        job.poll = [](void* context) { return static_cast<Interrupt*>(context)->poll(); };
+        job.poll_context = interrupt;
+    }
+    parallel::run_job(job);
+    return job.error;
+}
+
+// The shape of every batch query: `body(begin, end)` over [0, count) with the
+// GIL released; then, with it held again, a Ctrl-C raised as
+// KeyboardInterrupt or the first exception a range threw, rethrown. Each item
+// writes its own output, so the result doesn't depend on how the ranges fell
+template <typename Body>
+void in_parallel(std::size_t count, const Body& body) {
+    Interrupt interrupt;
+    std::exception_ptr error;
     {
         const nb::gil_scoped_release release;
-        parallel::run_job(job);
+        error = on_pool(count, body, /*eager=*/false, &interrupt);
     }
     if (interrupt.interrupted()) {
         throw nb::python_error();
     }
-    if (job.error) {
-        std::rethrow_exception(job.error);
+    if (error) {
+        std::rethrow_exception(error);
     }
 }
 
 // The pool's fork handler, installed once by the module's init
 inline void install_fork_handler() { parallel::install_fork_handler(); }
 
-// A vendored library's own fan-out, on the same pool and Python-free:
-// `body(context, begin, end)` over [0, count) on this thread and the workers,
-// called by the library while the binding already holds the GIL released,
-// with no Ctrl-C poll (the library's progress callback polls), and the first
-// exception a range threw rethrown here, on the library's thread, for it to
-// unwind through
+// A vendored library's own fan-out, Python-free: `body(context, begin, end)`
+// over [0, count), called by the library while the binding already holds the
+// GIL released, with no Ctrl-C poll (the library's progress callback polls),
+// and the first exception a range threw rethrown here, on the library's
+// thread, for it to unwind through
 inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_t begin, std::size_t end),
                        void* context) {
-    if (count == 0) {
-        return;
-    }
-    struct Call {
-        void (*body)(void* context, std::size_t begin, std::size_t end);
-        void* context;
-    };
-    const Call call{body, context};
-    parallel::Job job;
-    job.count = count;
-    job.eager = true;
-    job.run = [](const void* called, std::size_t begin, std::size_t end) {
-        const Call* c = static_cast<const Call*>(called);
-        c->body(c->context, begin, end);
-    };
-    job.body = &call;
-    parallel::run_job(job);
-    if (job.error) {
-        std::rethrow_exception(job.error);
+    const std::exception_ptr error =
+        on_pool(count, [&](std::size_t begin, std::size_t end) { body(context, begin, end); }, /*eager=*/true, nullptr);
+    if (error) {
+        std::rethrow_exception(error);
     }
 }
 
 // `body(from, to)` over [0, count) for code already past the GIL (a device's
-// answers widened into the caller's columns, between the chunks it reads),
-// the cores sharing it a block of items at a time: for a few bytes copied
-// per item, which one at a time is too little for the pool to measure. The
-// same pool, measuring its first blocks like any query, so a copy the caller
-// finishes in a fraction of a millisecond wakes nobody. No Ctrl-C poll: it
-// never touches Python
+// rays copied into a chunk, its answers widened into the caller's columns),
+// the cores sharing it a block of items at a time: for a few bytes copied per
+// item, which one at a time is too little for the pool to measure. A copy the
+// caller finishes in a fraction of a millisecond wakes nobody. No Ctrl-C
+// poll: it never touches Python
 template <typename Body>
 void in_blocks_without_gil(std::size_t count, const Body& body) {
     constexpr std::size_t BLOCK = 4096;
-    if (count == 0) {
-        return;
-    }
-    const auto blocks = [&](std::size_t first, std::size_t last) {
-        body(first * BLOCK, std::min(count, last * BLOCK));
-    };
-    parallel::Job job;
-    job.count = (count + BLOCK - 1) / BLOCK;
-    job.run = [](const void* context, std::size_t begin, std::size_t end) {
-        (*static_cast<const decltype(blocks)*>(context))(begin, end);
-    };
-    job.body = &blocks;
-    parallel::run_job(job);
-    if (job.error) {
-        std::rethrow_exception(job.error);
+    const std::exception_ptr error =
+        on_pool((count + BLOCK - 1) / BLOCK,
+                [&](std::size_t first, std::size_t last) { body(first * BLOCK, std::min(count, last * BLOCK)); },
+                /*eager=*/false, nullptr);
+    if (error) {
+        std::rethrow_exception(error);
     }
 }
 
-// One holder at a time, for what takes exactly one (a device's queue,
-// src/vulkan/scene.hpp, which states the rule its users keep): a waiter sleeps
-// on the scheduler's parking rather than spinning. A holder takes no other
-// lock while it holds this, the GIL included, so there is nothing to deadlock
-// on; never nested
-class Exclusive {
-public:
-    void acquire() {
-        while (taken_.exchange(1, std::memory_order_acquire) != 0) {
-            parallel::park(taken_, 1, 1000);
-        }
-    }
-    void release() {
-        taken_.store(0, std::memory_order_release);
-        parallel::unpark(taken_);
-    }
-
-private:
-    std::atomic<std::uint32_t> taken_{0};
-};
-
+// One holder at a time of `word`, for what takes exactly one (a device's
+// queue, src/vulkan/scene.hpp, which states the rule its users keep): a
+// waiter sleeps on the scheduler's parking rather than spinning. A holder
+// takes no other lock while it holds this, the GIL included, so there is
+// nothing to deadlock on; never nested
 class Exclusively {
 public:
-    explicit Exclusively(Exclusive& lock) : lock_(lock) { lock_.acquire(); }
-    ~Exclusively() { lock_.release(); }
+    explicit Exclusively(std::atomic<std::uint32_t>& word) : word_(word) {
+        while (word_.exchange(1, std::memory_order_acquire) != 0) {
+            parallel::park(word_, 1, 1000);
+        }
+    }
+    ~Exclusively() {
+        word_.store(0, std::memory_order_release);
+        parallel::unpark(word_);
+    }
     Exclusively(const Exclusively&) = delete;
     Exclusively& operator=(const Exclusively&) = delete;
 
 private:
-    Exclusive& lock_;
+    std::atomic<std::uint32_t>& word_;
 };
 
 // For a query that finds its rows: `body(begin, end, out)` appends the rows
@@ -363,20 +351,59 @@ std::vector<Unset<T>> gathered_rows(const Gathered<T>& gathered) {
     return rows;
 }
 
-// Instances, as a scene or a query names them: which mesh each one places
-// (`instance_index`, by default each mesh once) and its 4x4 transform
-// (`instance_matrices`, by default the identity), checked for one row per
-// instance, meshes in range and a last row of [0, 0, 0, 1]. Each module then
-// holds the transforms to its own rule: invertible, or rigid. The index is
-// copied and the copy checked, as faces are: whatever becomes an index into
-// our memory is never read from the caller's again.
-struct Instances {
-    std::size_t count = 0;
-    // a copy: an index is checked once and then trusted, so it must be ours
-    std::vector<std::int64_t> index;
+// How far a rigid transform's rotation may be from orthonormal: matrices
+// assembled in double precision are within ~1e-15, and float32 ones ~1e-7
+constexpr double ORTHONORMAL_TOLERANCE = 1e-6;
+
+// whether a row-major 4x4 transform's linear part is a rotation: orthonormal
+// rows, and no reflection
+inline bool is_rigid(const double* m) {
+    bool rigid = true;
+    for (std::size_t r = 0; r < 3; r++) {
+        for (std::size_t c = 0; c < 3; c++) {
+            const double* a = m + (4 * r);
+            const double* b = m + (4 * c);
+            const double product = (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]);
+            rigid = rigid && std::abs(product - (r == c ? 1.0 : 0.0)) <= ORTHONORMAL_TOLERANCE;
+        }
+    }
+    return rigid && determinant_of(m) > 0.0;
+}
+
+// The arrays a query names its instances by, viewed once: their dtype, shape
+// and layout as `read` checks them, their values not yet looked at. An array
+// not given is None
+struct InstanceViews {
+    In<std::int64_t, -1> index;
     In<double, -1, 4, 4> matrices;
     bool given_index = false;
     bool given_matrices = false;
+};
+
+inline InstanceViews view_instances(const Array<std::int64_t, -1>& index_argument,
+                                    const Array<double, -1, 4, 4>& matrices_argument) {
+    InstanceViews views;
+    views.given_index = !index_argument.is_none();
+    views.given_matrices = !matrices_argument.is_none();
+    if (views.given_index) {
+        views.index = view(index_argument, "instance_index");
+    }
+    if (views.given_matrices) {
+        views.matrices = view(matrices_argument, "instance_matrices");
+    }
+    return views;
+}
+
+// Instances, as a scene or a query names them: which mesh each one places
+// (`instance_index`, by default each mesh once) and its 4x4 transform
+// (`instance_matrices`, by default the identity). Copies, checked: nothing of
+// the caller's is read again once this is made
+struct Instances {
+    std::size_t count = 0;
+    bool given_index = false;
+    bool given_matrices = false;
+    std::vector<std::int64_t> index;  // empty unless given
+    std::vector<double> matrices;     // 16 a row, empty unless given
 
     std::size_t mesh(std::size_t i) const { return given_index ? static_cast<std::size_t>(index[i]) : i; }
     const double* matrix(std::size_t i) const {
@@ -385,31 +412,50 @@ struct Instances {
     }
 };
 
-inline Instances read_instances(const Array<std::int64_t, -1>& index_argument,
-                                const Array<double, -1, 4, 4>& matrices_argument, std::size_t mesh_count) {
+// whether a query's arrays are exactly the ones `instances` was read from:
+// each None or not, and the same bytes, which were checked when it was read
+inline bool same_instances(const InstanceViews& views, const Instances& instances) {
+    if (views.given_index != instances.given_index || views.given_matrices != instances.given_matrices) {
+        return false;
+    }
+    const bool same_index = !views.given_index || (views.index.size() == instances.index.size() &&
+                                                   std::memcmp(views.index.data(), instances.index.data(),
+                                                               instances.index.size() * sizeof(std::int64_t)) == 0);
+    return same_index && (!views.given_matrices || (views.matrices.size() == instances.matrices.size() &&
+                                                    std::memcmp(views.matrices.data(), instances.matrices.data(),
+                                                                instances.matrices.size() * sizeof(double)) == 0));
+}
+
+// A query's instances read: each array copied once and the copy checked, the
+// one place any of this is checked. Values finite and bounded, one row per
+// instance, meshes in range, a last row of [0, 0, 0, 1], and for a scene
+// that takes only rigid transforms (`rigid`), a rotation. A scene whose
+// transforms need only be invertible checks that where it inverts them
+inline Instances read_instances(const InstanceViews& views, std::size_t mesh_count, bool rigid) {
     Instances instances;
-    instances.given_index = !index_argument.is_none();
-    instances.given_matrices = !matrices_argument.is_none();
+    instances.given_index = views.given_index;
+    instances.given_matrices = views.given_matrices;
     instances.count = mesh_count;
-    if (instances.given_index) {
-        const In<std::int64_t, -1> given = read(index_argument, "instance_index");
-        instances.index.assign(given.data(), given.data() + given.shape(0));
+    if (views.given_index) {
+        instances.index.assign(views.index.data(), views.index.data() + views.index.shape(0));
         instances.count = instances.index.size();
     }
-    if (instances.given_matrices) {
-        instances.matrices = read(matrices_argument, "instance_matrices");
-        if (!instances.given_index) {
-            instances.count = instances.matrices.shape(0);
+    if (views.given_matrices) {
+        const std::size_t rows = views.matrices.shape(0);
+        instances.matrices.resize(16 * rows);
+        if (count_beyond(views.matrices.data(), 16 * rows, COORDINATE_LIMIT, instances.matrices.data()) != 0) {
+            value_error(std::string("instance_matrices must be finite and within ") + COORDINATE_LIMIT_TEXT);
         }
+        if (views.given_index && rows != instances.count) {
+            value_error("instance_index and instance_matrices must have one row per instance");
+        }
+        instances.count = rows;
     }
-    if (instances.given_matrices && instances.matrices.shape(0) != instances.count) {
-        value_error("instance_index and instance_matrices must have one row per instance");
-    }
-    if (!instances.given_index && instances.count != mesh_count) {
+    if (!views.given_index && instances.count != mesh_count) {
         value_error("without instance_index there is one instance per mesh");
     }
     for (std::size_t i = 0; i < instances.count; i++) {
-        if (instances.given_index &&
+        if (views.given_index &&
             (instances.index[i] < 0 || static_cast<std::size_t>(instances.index[i]) >= mesh_count)) {
             value_error("instance_index names a mesh out of range at instance " + std::to_string(i));
         }
@@ -417,6 +463,10 @@ inline Instances read_instances(const Array<std::int64_t, -1>& index_argument,
         if (m[12] != 0.0 || m[13] != 0.0 || m[14] != 0.0 || m[15] != 1.0) {
             value_error("instance_matrices must be affine: the last row of instance " + std::to_string(i) +
                         " is not [0, 0, 0, 1]");
+        }
+        if (rigid && !is_rigid(m)) {
+            value_error("instance_matrices must be rigid: instance " + std::to_string(i) +
+                        " rotates by a matrix that isn't a rotation");
         }
     }
     return instances;
@@ -426,14 +476,10 @@ inline Instances read_instances(const Array<std::int64_t, -1>& index_argument,
 
 // `BoxesObject` returns its object, shown as `Boxes`
 namespace nanobind::detail {
-template <>
-struct type_caster<trimkit::BoxesObject> {
-    // cppcheck-suppress unknownMacro ; nanobind's, and cppcheck doesn't read nanobind's headers
-    NB_TYPE_CASTER(trimkit::BoxesObject, const_name("Boxes"))
-    static bool from_python(handle /*source*/, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept { return false; }
-    static handle from_cpp(const trimkit::BoxesObject& boxes, rv_policy /*policy*/,
-                           cleanup_list* /*cleanup*/) noexcept {
-        return boxes.object.inc_ref();
-    }
+struct boxes_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = const_name("Boxes");
 };
+template <>
+struct type_caster<trimkit::BoxesObject> : passed_through<trimkit::BoxesObject, boxes_shown> {};
 }  // namespace nanobind::detail

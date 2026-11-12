@@ -9,7 +9,7 @@ src/vulkan/vulkan.hpp, each triangle's by `triangle32` in src/vulkan/scene.hpp.
 Checked, not assumed: tests/test_gpu.py compares the device with the CPU byte for
 byte on random and adversarial rays, with and without instances, and
 tests/test_golden.py holds both to one corpus of hashed answers. What it costs
-against the CPU is `bench/rays.py`; the README has its table.
+against the CPU is `bench/scene.py`; the README has its table.
 
 How the kernel is driven (src/vulkan/vulkan.hpp): rays go to the device in chunks of
 a quarter million, two in flight, each chunk one submission. The host writes a

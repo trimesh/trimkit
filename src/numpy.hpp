@@ -81,36 +81,32 @@ struct Array {
     bool is_none() const { return object.is_none(); }
 };
 
-// An argument that is a row of float64 or float32 per item, (n, Width), or
-// one row for every item, (Width,): `read_rows` reads it, and the signature
-// shows them all
-template <nb::ssize_t Width>
-struct RowsArgument {
+// Rays' origins or directions as an argument: a row of float64 or float32 per
+// ray, (n, 3), or one row for every ray, (3,). `read_rays` reads it, and the
+// signature shows them all
+struct RaysArgument {
     nb::handle object;
 };
 
-// What `read_rows` read: `count` rows, or one row that is every item's
-// (`one`, with a count of 1), as float64 in
-// `wide` or, for a float32 array taken as it is, in `narrow` (the other is
-// null). Valid while it and the argument are
-template <nb::ssize_t Width>
-struct Rows {
-    In<double, -1, Width> each;
-    In<double, Width> single;
-    In<float, -1, Width> each_narrow;
-    In<float, Width> single_narrow;
-    const double* wide = nullptr;
-    const float* narrow = nullptr;
+// What `read_rays` read: `count` rows of three, or one row that is every
+// ray's (`one`, with a count of 1), float64 or, for a float32 array taken as
+// it is, float32. Valid while it is: it holds the argument, or its one copy
+struct Rays {
+    AnyIn held;
+    const void* data = nullptr;
     std::size_t count = 0;
+    bool is_float32 = false;
     bool one = false;
-    // row `i` as float64: a float32 widens to exactly itself
-    void read(std::size_t i, double* row) const {
-        const std::size_t first = one ? 0 : static_cast<std::size_t>(Width) * i;
-        for (std::size_t w = 0; w < static_cast<std::size_t>(Width); w++) {
-            row[w] = wide != nullptr ? wide[first + w] : static_cast<double>(narrow[first + w]);
-        }
-    }
 };
+
+// row `i` of rays as float64: a float32 widens to exactly itself
+inline void ray_row(const Rays& rays, std::size_t i, double* row) {
+    const std::size_t first = rays.one ? 0 : 3 * i;
+    for (std::size_t k = 0; k < 3; k++) {
+        row[k] = rays.is_float32 ? static_cast<double>(static_cast<const float*>(rays.data)[first + k])
+                                 : static_cast<const double*>(rays.data)[first + k];
+    }
+}
 
 // A bool argument: Python's, or numpy's scalar, which is what `array.all()` and
 // every other numpy test returns. Nothing else counts as one: not 0, 1 or None
@@ -135,6 +131,9 @@ using Out = nb::ndarray<nb::numpy, T>;
 using AnyOut = nb::ndarray<nb::numpy>;
 using AnyOuts = nb::typed<nb::tuple, AnyOut, nb::ellipsis>;
 
+// numpy's objects kept for every call after: called once, by NB_MODULE
+inline void init_numpy();
+
 // raise a Python exception from a built-up message
 [[noreturn]] inline void value_error(const std::string& message) { throw nb::value_error(message.c_str()); }
 [[noreturn]] inline void type_error(const std::string& message) { throw nb::type_error(message.c_str()); }
@@ -146,6 +145,19 @@ using AnyOuts = nb::typed<nb::tuple, AnyOut, nb::ellipsis>;
 }
 
 namespace detail {
+
+// numpy's own objects, looked up once as the module is made (`init_numpy`,
+// the first thing NB_MODULE does) and kept for good: never released, so
+// nothing of ours runs when the interpreter ends, and only read afterwards
+struct Numpy {
+    nb::handle ndarray;
+    nb::handle bool_;
+    nb::handle asarray;
+    nb::handle array;
+    nb::handle dtype;
+    nb::handle can_cast;
+};
+inline Numpy numpy;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // "(*, 3)" for shape<-1, 3>, the way the stubs write it
 template <nb::ssize_t... Shape>
@@ -161,19 +173,7 @@ std::string shape_text() {
 }
 
 // Python's str() of any object, for messages
-inline std::string text(nb::handle object) {
-    const nb::object converted = nb::steal(PyObject_Str(object.ptr()));
-    if (!converted.is_valid()) {
-        PyErr_Clear();
-        return "?";
-    }
-    const char* utf8 = PyUnicode_AsUTF8AndSize(converted.ptr(), nullptr);  // stable ABI since 3.10
-    if (utf8 == nullptr) {
-        PyErr_Clear();
-        return "?";
-    }
-    return utf8;
-}
+inline std::string text(nb::handle object) { return nb::str(object).c_str(); }
 
 // a short dtype name for messages: "float64", "int64", ...
 template <typename T>
@@ -197,47 +197,38 @@ inline bool aligned(const void* data, std::size_t alignment) {
     return reinterpret_cast<std::uintptr_t>(data) % alignment == 0;
 }
 
-// Whether a coordinate is one no array may hold: beyond the limit, an
-// infinity or not a number. One comparison, false for all three. Python-free
-inline bool refused(double value) { return !(std::abs(value) <= COORDINATE_LIMIT); }
-
-// Refuse any value whose magnitude isn't at most `limit`: one comparison,
-// false for NaN and infinity too, counted without branching so the scan
-// vectorizes, and run without the GIL.
-template <typename T>
-void check_bounded(const T* values, std::size_t count, T limit, const std::string& name, const char* bound) {
-    std::size_t violations = 0;
-    {
-        const nb::gil_scoped_release release;
-        for (std::size_t i = 0; i < count; i++) {
-            violations += !(std::abs(values[i]) <= limit) ? 1U : 0U;
-        }
-    }
-    if (violations != 0) {
-        value_error(name + " must be finite" + bound);
-    }
-}
-
-// what a refused coordinate raises, naming its argument
-[[noreturn]] inline void refuse_coordinates(const std::string& name) {
-    value_error(name + " must be finite and within " + COORDINATE_LIMIT_TEXT);
-}
-
-// float64 values, refused unless within COORDINATE_LIMIT
-inline void check_coordinates(const double* values, std::size_t count, const std::string& name) {
-    std::size_t bad = 0;
-    {
-        const nb::gil_scoped_release release;
-        for (std::size_t i = 0; i < count; i++) {
-            bad += refused(values[i]) ? 1U : 0U;
-        }
-    }
-    if (bad != 0) {
-        refuse_coordinates(name);
-    }
-}
-
 }  // namespace detail
+
+// The one scan of values there is. How many of `count` values are not within
+// `limit`: beyond it, an infinity or not a number, one comparison that is
+// false for all three, counted without branching so it vectorizes. Each value
+// is written to `copy` as it is read, when there is one. Python-free
+template <typename T>
+std::size_t count_beyond(const T* values, std::size_t count, double limit, T* copy) {
+    std::size_t beyond = 0;
+    for (std::size_t i = 0; i < count; i++) {
+        const T value = values[i];
+        if (copy != nullptr) {
+            copy[i] = value;
+        }
+        beyond += !(static_cast<double>(std::abs(value)) <= limit) ? 1U : 0U;
+    }
+    return beyond;
+}
+
+// refuse values not within `limit`, scanned without the GIL, naming the argument
+template <typename T>
+void check_values(const T* values, std::size_t count, double limit, const std::string& name) {
+    std::size_t beyond = 0;
+    {
+        const nb::gil_scoped_release release;
+        beyond = count_beyond<T>(values, count, limit, nullptr);
+    }
+    if (beyond != 0) {
+        value_error(name + " must be finite" +
+                    (limit == COORDINATE_LIMIT ? std::string(" and within ") + COORDINATE_LIMIT_TEXT : std::string()));
+    }
+}
 
 // what an object that isn't the expected array actually is, for messages
 inline std::string describe(nb::handle object) {
@@ -274,12 +265,11 @@ inline void warn_converted(const std::string& name, const std::string& source, c
 // itself, a list or any other sequence as `numpy.asarray` makes it, or
 // nothing (a ragged list, a scene, None)
 inline nb::object seen_as_array(nb::handle object) {
-    const nb::module_ numpy = nb::module_::import_("numpy");
-    if (PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1) {
+    if (PyObject_IsInstance(object.ptr(), numpy.ndarray.ptr()) == 1) {
         return nb::borrow(object);
     }
     try {
-        return numpy.attr("asarray")(object);
+        return numpy.asarray(object);
     } catch (const nb::python_error&) {
         return {};
     }
@@ -317,24 +307,23 @@ bool shaped(const nb::object& array) {
 //   converted with a UserWarning naming the argument
 // Anything else gets nothing: it stays refused
 inline nb::object relaid(nb::handle object, const nb::object& array, const char* dtype, const std::string& name) {
-    const nb::module_ numpy = nb::module_::import_("numpy");
     const bool is_array = array.is(object);
     if (!array.is_valid() || (!is_array && dtype == nullptr)) {
         return {};
     }
     const std::string source = is_array ? text(array.attr("dtype")) : "a " + text(object.type().attr("__name__"));
-    if (dtype == nullptr || array.attr("dtype").equal(numpy.attr("dtype")(dtype))) {
+    if (dtype == nullptr || array.attr("dtype").equal(numpy.dtype(dtype))) {
         if (!is_array) {
             warn_converted(name, source, dtype);
         }
-        return numpy.attr("array")(array, nb::arg("copy") = true, nb::arg("order") = "C");
+        return numpy.array(array, nb::arg("copy") = true, nb::arg("order") = "C");
     }
-    const nb::object wanted = numpy.attr("dtype")(dtype);
-    if (!nb::cast<bool>(numpy.attr("can_cast")(array.attr("dtype"), wanted, "safe"))) {
+    const nb::object wanted = numpy.dtype(dtype);
+    if (!nb::cast<bool>(numpy.can_cast(array.attr("dtype"), wanted, "safe"))) {
         return {};
     }
     warn_converted(name, source, dtype);
-    return numpy.attr("array")(array, nb::arg("dtype") = wanted, nb::arg("copy") = true, nb::arg("order") = "C");
+    return numpy.array(array, nb::arg("dtype") = wanted, nb::arg("copy") = true, nb::arg("order") = "C");
 }
 
 // view an object as exactly an In<T, Shape...>, aligned for T: in place, or
@@ -369,7 +358,7 @@ template <typename T, nb::ssize_t... Shape>
 In<T, Shape...> read(nb::handle object, const std::string& name) {
     In<T, Shape...> array = detail::view<T, Shape...>(object, name);
     if constexpr (std::is_same_v<T, double>) {
-        detail::check_coordinates(array.data(), array.size(), name);
+        check_values(array.data(), array.size(), COORDINATE_LIMIT, name);
     }
     return array;
 }
@@ -379,90 +368,75 @@ In<T, Shape...> read(const Array<T, Shape...>& argument, const std::string& name
     return read<T, Shape...>(argument.object, name);
 }
 
-// A rows argument, its dtype, shape and layout checked as `read` checks
-// either shape: one dimension is one row for every item, anything else must
-// be a row per item. A float32 array is taken as float32, anything else as
-// `read` takes a float64 array. Its values are not checked here: a device
-// checks them as it copies them (src/vulkan/scene.hpp), and anything else
-// calls `check_rows`
-template <nb::ssize_t Width>
-Rows<Width> read_rows(const RowsArgument<Width>& argument, const std::string& name) {
-    Rows<Width> rows;
-    try {
-        // numpy's own count, so a list reads as the array it converts to
-        rows.one = nb::cast<int>(nb::module_::import_("numpy").attr("ndim")(argument.object)) == 1;
-    } catch (const nb::python_error&) {
-        // not an array at all: `read` says so, naming the argument
-        rows.one = false;
+namespace detail {
+
+// whether `candidate` is an array of any dtype readable in place, viewed into `array`
+inline bool any_readable(nb::handle candidate, AnyIn* array) {
+    if (!nb::try_cast(candidate, *array, /*convert=*/false)) {
+        return false;
     }
-    const bool narrow =
-        nb::hasattr(argument.object, "dtype") && detail::text(argument.object.attr("dtype")) == "float32";
-    rows.count = 1;
-    if (rows.one && narrow) {
-        rows.single_narrow = detail::view<float, Width>(argument.object, name);
-        rows.narrow = rows.single_narrow.data();
-    } else if (rows.one) {
-        rows.single = detail::view<double, Width>(argument.object, name);
-        rows.wide = rows.single.data();
-    } else if (narrow) {
-        rows.each_narrow = detail::view<float, -1, Width>(argument.object, name);
-        rows.narrow = rows.each_narrow.data();
-        rows.count = rows.each_narrow.shape(0);
-    } else {
-        rows.each = detail::view<double, -1, Width>(argument.object, name);
-        rows.wide = rows.each.data();
-        rows.count = rows.each.shape(0);
-    }
-    return rows;
+    const std::size_t item_size = (array->dtype().bits + 7U) / 8U;
+    return item_size == 0 || aligned(array->data(), item_size);
 }
 
-// the values of rows `read_rows` read, refused as `read` refuses them
-template <nb::ssize_t Width>
-void check_rows(const Rows<Width>& rows, const std::string& name) {
-    const std::size_t count = rows.count * static_cast<std::size_t>(Width);
-    if (rows.wide != nullptr) {
-        detail::check_coordinates(rows.wide, count, name);
-        return;
-    }
-    // float32 values are held to the same bound as float64 ones
-    std::size_t bad = 0;
-    {
-        const nb::gil_scoped_release release;
-        for (std::size_t i = 0; i < count; i++) {
-            bad += detail::refused(static_cast<double>(rows.narrow[i])) ? 1U : 0U;
+// whether an array is float64 or float32 rays: (n, 3), or (3,) for one row
+inline bool holds_rays(const AnyIn& array) {
+    const bool floats = array.dtype() == nb::dtype<double>() || array.dtype() == nb::dtype<float>();
+    return floats && ((array.ndim() == 1 && array.shape(0) == 3) || (array.ndim() == 2 && array.shape(1) == 3));
+}
+
+}  // namespace detail
+
+// A rays argument: float64 or float32, a row per ray or one row for every
+// ray, read in place when it is already that (no Python is called at all)
+// and otherwise as `read` takes any array: its shape checked first, then one
+// copy, converted with the warning when its dtype isn't one of the two. Its
+// values are not checked here: a device checks them as it copies them
+// (src/vulkan/scene.hpp), and anything else calls `check_rays`
+inline Rays read_rays(const RaysArgument& argument, const std::string& name) {
+    Rays rays;
+    bool taken = detail::any_readable(argument.object, &rays.held) && detail::holds_rays(rays.held);
+    if (!taken) {
+        const nb::object seen = detail::seen_as_array(argument.object);
+        if (seen.is_valid() && (detail::shaped<-1, 3>(seen) || detail::shaped<3>(seen))) {
+            const bool narrow = seen.attr("dtype").equal(detail::numpy.dtype("float32"));
+            const nb::object copy = detail::relaid(argument.object, seen, narrow ? "float32" : "float64", name);
+            taken = copy.is_valid() && detail::any_readable(copy, &rays.held) && detail::holds_rays(rays.held);
         }
     }
-    if (bad != 0) {
-        detail::refuse_coordinates(name);
+    if (!taken) {
+        type_error(name + " must be float64 or float32 of shape (*, 3) or (3,), not " + describe(argument.object));
+    }
+    rays.data = rays.held.data();
+    rays.is_float32 = rays.held.dtype() == nb::dtype<float>();
+    rays.one = rays.held.ndim() == 1;
+    rays.count = rays.one ? 1 : rays.held.shape(0);
+    return rays;
+}
+
+// the values of rays `read_rays` read, refused as `read` refuses them:
+// float32 ones are held to the same bound as float64 ones
+inline void check_rays(const Rays& rays, const std::string& name) {
+    if (rays.is_float32) {
+        check_values(static_cast<const float*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
+    } else {
+        check_values(static_cast<const double*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
     }
 }
 
-// Whether an array argument holds exactly `stored`, byte for byte, checked
-// for dtype, shape and layout as `read` checks it but not for its values:
-// `stored` came from `read`, so equal bytes are valid ones. For comparing
-// with what was read before (a scene's remembered instances), not computing
+// An array argument viewed: its dtype, shape and layout as `read` checks
+// them, its values not looked at. For what copies the values and checks the
+// copy (a query's instances)
 template <typename T, nb::ssize_t... Shape>
-bool same_bytes(const Array<T, Shape...>& argument, const std::vector<T>& stored, const std::string& name) {
-    const In<T, Shape...> array = detail::view<T, Shape...>(argument.object, name);
-    return array.size() == stored.size() && std::memcmp(array.data(), stored.data(), stored.size() * sizeof(T)) == 0;
+In<T, Shape...> view(const Array<T, Shape...>& argument, const std::string& name) {
+    return detail::view<T, Shape...>(argument.object, name);
 }
 
-// A bool array argument, as its bytes: a byte other than 0 or 1 in a numpy
-// bool array (a uint8 array viewed as bool can hold one) is undefined as a
-// C++ bool, so its values are read as uint8 and tested `!= 0`. A list of
-// bools converts (with the warning); no other dtype casts safely to bool
-inline In<std::uint8_t, -1> read(const Array<bool, -1>& argument, const std::string& name) {
-    const nb::module_ numpy = nb::module_::import_("numpy");
-    nb::object object = nb::borrow(argument.object);
-    const bool is_array = PyObject_IsInstance(object.ptr(), numpy.attr("ndarray").ptr()) == 1;
-    if (!is_array) {
-        object = detail::relaid(object, detail::seen_as_array(object), "bool", name);
-    }
-    if (!object.is_valid() || !object.attr("dtype").equal(numpy.attr("dtype")("bool")) ||
-        nb::cast<int>(object.attr("ndim")) != 1) {
-        type_error(name + " must be a bool array of shape (*,), not " + describe(argument.object));
-    }
-    return detail::view<std::uint8_t, -1>(object.attr("view")("u1"), name);
+// A bool array's values as bytes: a byte other than 0 or 1 in a numpy bool
+// array (a uint8 array viewed as bool can hold one) is undefined as a C++
+// bool, so they are read as uint8 and tested `!= 0`, never as bool
+inline const std::uint8_t* mask_bytes(const In<bool, -1>& mask) {
+    return reinterpret_cast<const std::uint8_t*>(mask.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
 }
 
 // (m, 3) int64 faces as the index type a vendored library uses, every index
@@ -535,21 +509,19 @@ Mesh<Index> read_mesh(nb::handle object, const std::string& name) {
     return mesh;
 }
 
-// An array of any numeric dtype, for inputs whose dtype is chosen at runtime:
-// C-contiguous, aligned for its own item size, and finite if floating.
-namespace detail {
-
-// whether `candidate` is an array of any dtype readable in place, viewed into `array`
-inline bool any_readable(nb::handle candidate, AnyIn* array) {
-    if (!nb::try_cast(candidate, *array, /*convert=*/false)) {
-        return false;
+// every mesh of a sequence, read as `read_mesh` reads each, before anything
+// is built from any of them
+template <typename Index>
+std::vector<Mesh<Index>> read_meshes(const Meshes& meshes) {
+    std::vector<Mesh<Index>> read(nb::len(meshes));
+    for (std::size_t m = 0; m < read.size(); m++) {
+        read[m] = read_mesh<Index>(meshes[m], "meshes[" + std::to_string(m) + "]");
     }
-    const std::size_t item_size = (array->dtype().bits + 7U) / 8U;
-    return item_size == 0 || aligned(array->data(), item_size);
+    return read;
 }
 
-}  // namespace detail
-
+// An array of any numeric dtype, for inputs whose dtype is chosen at runtime:
+// C-contiguous, aligned for its own item size, and finite if floating.
 inline AnyIn read_any(nb::handle object, const std::string& name) {
     // in place, or its own dtype copied once into a readable layout
     AnyIn array;
@@ -570,10 +542,10 @@ inline AnyIn read_any(nb::handle object, const std::string& name) {
     }
     // float32 can't exceed its own range, so finite is its whole rule
     if (dtype == nb::dtype<float>()) {
-        detail::check_bounded(static_cast<const float*>(array.data()), array.size(), std::numeric_limits<float>::max(),
-                              name, "");
+        check_values(static_cast<const float*>(array.data()), array.size(),
+                     static_cast<double>(std::numeric_limits<float>::max()), name);
     } else if (dtype == nb::dtype<double>()) {
-        detail::check_coordinates(static_cast<const double*>(array.data()), array.size(), name);
+        check_values(static_cast<const double*>(array.data()), array.size(), COORDINATE_LIMIT, name);
     }
     return array;
 }
@@ -593,10 +565,9 @@ template <typename Record>
 Records<Record> read_records(nb::handle object, const nb::object& dtype, const char* dtype_name,
                              const std::string& name) {
     // the dtype's own size is the record's, so rows can't be misread
-    const bool exact = PyObject_IsInstance(object.ptr(), nb::module_::import_("numpy").attr("ndarray").ptr()) == 1 &&
-                       object.attr("dtype").equal(dtype) &&
-                       nb::cast<std::size_t>(dtype.attr("itemsize")) == sizeof(Record) &&
-                       nb::cast<int>(object.attr("ndim")) == 1;
+    const bool exact =
+        PyObject_IsInstance(object.ptr(), detail::numpy.ndarray.ptr()) == 1 && object.attr("dtype").equal(dtype) &&
+        nb::cast<std::size_t>(dtype.attr("itemsize")) == sizeof(Record) && nb::cast<int>(object.attr("ndim")) == 1;
     if (!exact) {
         type_error(name + " must be a 1D array of dtype " + dtype_name + ", not " + describe(object));
     }
@@ -689,40 +660,46 @@ inline AnyOut to_numpy(std::vector<std::uint8_t>&& bytes, std::initializer_list<
 
 // `Array<T, Shape...>` takes any object and shows up as In<T, Shape...>
 namespace nanobind::detail {
-template <typename T, nb::ssize_t... Shape>
-struct type_caster<trimkit::Array<T, Shape...>> {
-    using Argument = trimkit::Array<T, Shape...>;
-    using Shown = make_caster<trimkit::In<T, Shape...>>;
+
+// An argument nanobind hands over untouched, for the door to read itself:
+// `Argument` holds whatever object was passed, and shows in signatures and
+// stubs under `Shown::Name`
+template <typename Argument, typename Shown>
+struct passed_through {
     // cppcheck-suppress unknownMacro ; nanobind's, and cppcheck doesn't read nanobind's headers
     NB_TYPE_CASTER(Argument, Shown::Name)
     bool from_python(handle source, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept {
         value.object = source;
         return true;
     }
-    static handle from_cpp(const Argument& array, rv_policy /*policy*/, cleanup_list* /*cleanup*/) noexcept {
-        return array.object.inc_ref();
+    static handle from_cpp(const Argument& argument, rv_policy /*policy*/, cleanup_list* /*cleanup*/) noexcept {
+        return handle(argument.object).inc_ref();
     }
 };
 
-// `RowsArgument<Width>` takes any object and shows up as each array it reads
-template <nb::ssize_t Width>
-struct type_caster<trimkit::RowsArgument<Width>> {
-    using Argument = trimkit::RowsArgument<Width>;
-    using Each = make_caster<trimkit::In<double, -1, Width>>;
-    using One = make_caster<trimkit::In<double, Width>>;
-    using EachNarrow = make_caster<trimkit::In<float, -1, Width>>;
-    using OneNarrow = make_caster<trimkit::In<float, Width>>;
-    // cppcheck-suppress unknownMacro ; nanobind's, and cppcheck doesn't read nanobind's headers
-    NB_TYPE_CASTER(Argument, Each::Name + const_name(" | ") + One::Name + const_name(" | ") + EachNarrow::Name +
-                                 const_name(" | ") + OneNarrow::Name)
-    bool from_python(handle source, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept {
-        value.object = source;
-        return true;
-    }
-    static handle from_cpp(const Argument& rows, rv_policy /*policy*/, cleanup_list* /*cleanup*/) noexcept {
-        return rows.object.inc_ref();
-    }
+// `Array<T, Shape...>` shows up as In<T, Shape...>
+template <typename T, nb::ssize_t... Shape>
+struct type_caster<trimkit::Array<T, Shape...>>
+    : passed_through<trimkit::Array<T, Shape...>, make_caster<trimkit::In<T, Shape...>>> {};
+
+// `RaysArgument` shows up as each array it reads
+struct rays_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = make_caster<trimkit::In<double, -1, 3>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<double, 3>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<float, -1, 3>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<float, 3>>::Name;
 };
+template <>
+struct type_caster<trimkit::RaysArgument> : passed_through<trimkit::RaysArgument, rays_shown> {};
+
+// `MeshArgument` shows up as the `Mesh` alias
+struct mesh_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = const_name("Mesh");
+};
+template <>
+struct type_caster<trimkit::MeshArgument> : passed_through<trimkit::MeshArgument, mesh_shown> {};
 
 template <typename T>
 struct type_caster<trimkit::Number<T>> {
@@ -750,15 +727,12 @@ struct type_caster<trimkit::Flag> {
     NB_TYPE_CASTER(trimkit::Flag, const_name("bool | numpy.bool_"))
     bool from_python(handle source, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept {
         PyObject* object = source.ptr();
-        if (object == Py_True || object == Py_False) {
-            value.value = object == Py_True;
-            return true;
+        const bool plain = object == Py_True || object == Py_False;
+        if (!plain && PyObject_IsInstance(object, trimkit::detail::numpy.bool_.ptr()) != 1) {
+            PyErr_Clear();
+            return false;
         }
-        PyObject* numpy = PyImport_ImportModule("numpy");
-        PyObject* scalar = numpy != nullptr ? PyObject_GetAttrString(numpy, "bool_") : nullptr;
-        const int truth = scalar != nullptr && PyObject_IsInstance(object, scalar) == 1 ? PyObject_IsTrue(object) : -1;
-        Py_XDECREF(scalar);
-        Py_XDECREF(numpy);
+        const int truth = PyObject_IsTrue(object);
         PyErr_Clear();
         value.value = truth == 1;
         return truth >= 0;
@@ -767,19 +741,15 @@ struct type_caster<trimkit::Flag> {
         return handle(flag.value ? Py_True : Py_False).inc_ref();
     }
 };
-
-// `MeshArgument` takes any object and shows up as the `Mesh` alias
-template <>
-struct type_caster<trimkit::MeshArgument> {
-    // cppcheck-suppress unknownMacro ; nanobind's, and cppcheck doesn't read nanobind's headers
-    NB_TYPE_CASTER(trimkit::MeshArgument, const_name("Mesh"))
-    bool from_python(handle source, uint8_t /*flags*/, cleanup_list* /*cleanup*/) noexcept {
-        value.object = source;
-        return true;
-    }
-    static handle from_cpp(const trimkit::MeshArgument& mesh, rv_policy /*policy*/,
-                           cleanup_list* /*cleanup*/) noexcept {
-        return mesh.object.inc_ref();
-    }
-};
 }  // namespace nanobind::detail
+
+// numpy's objects, kept: a new reference to each, never given back
+inline void trimkit::init_numpy() {
+    const nb::module_ module = nb::module_::import_("numpy");
+    detail::numpy.ndarray = nb::object(module.attr("ndarray")).release();
+    detail::numpy.bool_ = nb::object(module.attr("bool_")).release();
+    detail::numpy.asarray = nb::object(module.attr("asarray")).release();
+    detail::numpy.array = nb::object(module.attr("array")).release();
+    detail::numpy.dtype = nb::object(module.attr("dtype")).release();
+    detail::numpy.can_cast = nb::object(module.attr("can_cast")).release();
+}

@@ -65,9 +65,9 @@ std::tuple<trimkit::Out<double>, trimkit::Out<std::int64_t>> triangulate(const R
                                                                          const Interiors& interiors) {
     const Ring2 exterior = trimkit::read(exterior_argument, "exterior");
     // every interior viewed in place, held so the views below stay valid
-    std::vector<Ring2> holes;
-    for (const nb::handle item : interiors) {
-        holes.push_back(trimkit::read<double, -1, 2>(item, "interiors[" + std::to_string(holes.size()) + "]"));
+    std::vector<Ring2> holes(nb::len(interiors));
+    for (std::size_t h = 0; h < holes.size(); h++) {
+        holes[h] = trimkit::read<double, -1, 2>(interiors[h], "interiors[" + std::to_string(h) + "]");
     }
     std::vector<double> vertices;
     std::vector<std::uint64_t> faces;
@@ -75,11 +75,12 @@ std::tuple<trimkit::Out<double>, trimkit::Out<std::int64_t>> triangulate(const R
         const nb::gil_scoped_release release;
         // the first ring is the shell and the rest are holes, indexed as stacked
         Polygon polygon;
-        polygon.rings.push_back({exterior.data(), exterior.shape(0)});
+        polygon.rings.resize(1 + holes.size());
+        polygon.rings[0] = {exterior.data(), exterior.shape(0)};
         std::size_t count = exterior.shape(0);
-        for (const Ring2& hole : holes) {
-            polygon.rings.push_back({hole.data(), hole.shape(0)});
-            count += hole.shape(0);
+        for (std::size_t h = 0; h < holes.size(); h++) {
+            polygon.rings[1 + h] = {holes[h].data(), holes[h].shape(0)};
+            count += holes[h].shape(0);
         }
         vertices.reserve(2 * count);
         for (const Ring& ring : polygon.rings) {

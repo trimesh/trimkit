@@ -182,7 +182,9 @@ def sheets(spans):
     """
     corners = ((0, -9), (1, -9), (1, 9), (0, 9))
     vertices = np.array([[span[c], y, k + 1.0] for k, span in enumerate(spans) for c, y in corners])
-    faces = np.array([[0, 1, 2], [0, 2, 3]]) + 4 * np.arange(len(spans))[:, None, None]
+    # int64 by name: numpy's default integer is int32 on 32-bit Windows
+    first = 4 * np.arange(len(spans), dtype=np.int64)[:, None, None]
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64) + first
     return vertices, faces.reshape(-1, 3)
 
 

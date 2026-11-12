@@ -65,16 +65,16 @@ static std::uint64_t cgroup_room(const char* directory, const char* limit_file, 
     return limit - std::min(limit, held);
 }
 
-// this process's cgroup and each one above it, whichever leaves least
+static std::uint64_t cgroup2_room(const char* directory) {
+    return cgroup_room(directory, "memory.max", "memory.current", "inactive_file ");
+}
+
+// the version 1 memory cgroup, and this process's version 2 cgroup and each
+// one above it: whichever leaves least
 static std::uint64_t cgroups_room() {
-    std::uint64_t room =
+    const std::uint64_t room =
         cgroup_room("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file ");
-    char directory[trimkit::cgroup::DIRECTORY_CAPACITY];
-    trimkit::cgroup::own_directory(directory, sizeof(directory));
-    for (bool more = true; more; more = trimkit::cgroup::ascend(directory)) {
-        room = std::min(room, cgroup_room(directory, "memory.max", "memory.current", "inactive_file "));
-    }
-    return room;
+    return std::min(room, trimkit::cgroup::least_over_chain(cgroup2_room));
 }
 #endif
 
@@ -93,18 +93,11 @@ static std::uint64_t available() {
         bytes = total;
     }
 #elif defined(_WIN32)
-    // MEMORYSTATUSEX: what can still be committed, within the address space
-    struct {
-        std::uint32_t length;
-        std::uint32_t load;
-        std::uint64_t total_physical, available_physical;
-        std::uint64_t total_commit, available_commit;
-        std::uint64_t total_virtual, available_virtual;
-        std::uint64_t available_extended;
-    } status = {};
+    // what can still be committed, within the address space
+    TrimkitWin32MemoryStatus status = {};
     status.length = sizeof(status);
     if (GlobalMemoryStatusEx(&status) != 0) {
-        bytes = std::min(status.available_commit, status.available_virtual);
+        bytes = std::min<std::uint64_t>(status.available_commit, status.available_virtual);
     }
 #endif
     return std::min<std::uint64_t>(bytes, std::numeric_limits<std::size_t>::max());
@@ -204,6 +197,7 @@ void operator delete[](void* block, std::size_t /*unused*/, std::align_val_t /*u
 // NOLINTEND(misc-new-delete-overloads, cppcoreguidelines-no-malloc, cppcoreguidelines-owning-memory)
 
 NB_MODULE(trimkit, m) {  // NOLINT(performance-unnecessary-value-param): the macro passes it by value
+    trimkit::init_numpy();
     trimkit::install_fork_handler();
     // the last paragraph names what this build compiled in, each upstream's
     // repository and commit, or `(system)` for a distribution's copy
