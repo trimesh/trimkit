@@ -85,6 +85,16 @@ class RayScene:
 
     def __init__(self, meshes: Sequence[Mesh], *, use_gpu: bool | numpy.bool_ = False) -> None: ...
 
+    def __reduce__(self) -> tuple:
+        """
+        Pickle as its constructor's arguments, by name: anything built from them is built again on load.
+
+        Returns
+        -------
+        reduced : tuple
+          Its constructor with those arguments bound, as pickle and copy call it.
+        """
+
     def __len__(self) -> int:
         """
         How many meshes the scene was built from.
@@ -228,6 +238,16 @@ class Boxes:
     """
 
     def __init__(self, boxes: Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)]) -> None: ...
+
+    def __reduce__(self) -> tuple:
+        """
+        Pickle as its constructor's arguments, by name: anything built from them is built again on load.
+
+        Returns
+        -------
+        reduced : tuple
+          Its constructor with those arguments bound, as pickle and copy call it.
+        """
 
     def __len__(self) -> int:
         """
@@ -501,6 +521,16 @@ class CollisionScene:
     """
 
     def __init__(self, meshes: Sequence[Mesh], convex: bool | numpy.bool_ | Annotated[NDArray[numpy.bool_], dict(shape=(None,), order='C', device='cpu', writable=False)] = False) -> None: ...
+
+    def __reduce__(self) -> tuple:
+        """
+        Pickle as its constructor's arguments, by name: anything built from them is built again on load.
+
+        Returns
+        -------
+        reduced : tuple
+          Its constructor with those arguments bound, as pickle and copy call it.
+        """
 
     def __len__(self) -> int:
         """

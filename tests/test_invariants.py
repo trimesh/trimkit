@@ -8,10 +8,12 @@ API, and the GIL is released while computing.
 """
 
 import _thread
+import copy
 import functools
 import importlib.metadata
 import os
 import pathlib
+import pickle
 import select
 import signal
 import subprocess
@@ -180,6 +182,81 @@ def test_tables_cover_the_api():
     # else: a new one can't go untested, and a renamed one can't linger
     for table in (small_calls(), _SLOW_CALLS, empty_calls(), _array_arguments()):
         assert sorted(table) == API
+
+
+def pickled_objects() -> dict:
+    """
+    Constructor calls of every class the package binds, a full and an empty
+    one each, by class name: keyword arguments in the canonical form a pickle
+    gives them back in, and a query a pickled copy must answer exactly.
+    """
+    vertices, faces = sphere(16, 32)
+    # a mesh without faces keeps vertices that no model holds
+    loose = (np.ones((4, 3)), np.zeros((0, 3), dtype=np.int64))
+    rays = np.random.default_rng(0).normal(size=(2, 200, 3))
+    corners = np.random.default_rng(1).uniform(-1, 1, (300, 3))
+    boxes = np.stack([corners, corners + 0.2], axis=1)
+    meshes = [(vertices, faces), (vertices + 0.5, faces), loose]
+    return {
+        "Boxes": (
+            [
+                {"boxes": boxes},
+                {"boxes": np.ascontiguousarray(boxes[:, :, :2])},
+                {"boxes": np.zeros((0, 2, 3))},
+            ],
+            lambda tree: tree.intersection(np.zeros((1, 2, tree.bounds.shape[1]))),
+        ),
+        "RayScene": (
+            [
+                {"meshes": meshes, "use_gpu": False},
+                {"meshes": [], "use_gpu": False},
+                {"meshes": [], "use_gpu": True},
+            ],
+            lambda scene: scene.intersect(*rays),
+        ),
+        "CollisionScene": (
+            [
+                {"meshes": meshes, "convex": np.array([True, False, False])},
+                {"meshes": [], "convex": np.zeros(0, dtype=bool)},
+            ],
+            lambda scene: scene.distances(),
+        ),
+    }
+
+
+def test_every_class_pickles():
+    # every class the package binds pickles as exactly the keyword arguments
+    # it was built with, only arrays and Python values, never a tree: a load
+    # or a deep copy answers bit for bit what the original does
+    classes = sorted(name for name in API if "." not in name and isinstance(getattr(trimkit, name), type))
+    objects = pickled_objects()
+    assert sorted(objects) == classes
+    with warnings.catch_warnings():
+        # a scene asked for a device answers on the CPU without one, saying so
+        warnings.simplefilter("ignore", UserWarning)
+        for name, (calls, query) in objects.items():
+            for keywords in calls:
+                instance = getattr(trimkit, name)(**keywords)
+                constructor, positional = instance.__reduce__()
+                assert constructor.func is type(instance) and constructor.args == () and positional == ()
+                assert sorted(constructor.keywords) == sorted(keywords)
+                for key, given in keywords.items():
+                    reduced = constructor.keywords[key]
+                    if isinstance(given, bool):
+                        assert reduced is given
+                        continue
+                    for argument, truth in zip(leaves(reduced), leaves(given), strict=True):
+                        assert isinstance(argument, np.ndarray) and argument.dtype == truth.dtype
+                        assert argument.shape == truth.shape and argument.tobytes() == truth.tobytes()
+                data = pickle.dumps(instance)
+                # a pickle this test just made, so trusted
+                for loaded in (pickle.loads(data), copy.deepcopy(instance)):  # noqa: S301
+                    assert type(loaded) is type(instance)
+                    assert pickle.dumps(loaded) == data
+                    # bit for bit, the NaNs a pair with a faceless mesh answers too
+                    for answer, truth in zip(leaves(query(loaded)), leaves(query(instance)), strict=True):
+                        assert answer.dtype == truth.dtype and answer.shape == truth.shape
+                        assert answer.tobytes() == truth.tobytes()
 
 
 @pytest.mark.parametrize("name", API)

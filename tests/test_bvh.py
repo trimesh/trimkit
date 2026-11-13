@@ -579,28 +579,28 @@ def test_boxes_match_brute_force(d):
     assert 0 < len(np.unique(pairs[:, 0])) < len(queries)
 
 
-@pytest.mark.parametrize("d", [2, 3])
-def test_boxes_every_query_form(d):
+def test_boxes_every_query_form():
     # one query flat or as corners answers its boxes, many either way their
     # pairs: every form against brute force, and one query is its batch's row
-    rng = np.random.default_rng(10 + d)
-    boxes = random_boxes(rng, 2000, d, scale=0.3)
-    queries = random_boxes(rng, 300, d, scale=2.0)
-    tree = trimkit.Boxes(boxes)
-    truth = overlapping(boxes, queries)
-    assert np.array_equal(tree.intersection(queries), truth)
-    assert np.array_equal(tree.intersection(queries.reshape((-1, 2 * d))), truth)
-    for q, query in enumerate(queries):
-        row = truth[truth[:, 0] == q, 1]
-        for single in (query, query.reshape(2 * d)):
-            found = tree.intersection(single)
-            assert found.dtype == np.int64 and found.shape == row.shape
-            assert np.array_equal(found, row)
-    # some but not all queries hit something, so the comparison means something
-    assert 0 < len(np.unique(truth[:, 0])) < len(queries)
-    # one empty query is an empty column, an empty batch empty pairs
-    assert tree.intersection(np.full(2 * d, 1e6)).shape == (0,)
-    assert tree.intersection(np.zeros((0, 2 * d))).shape == (0, 2)
+    for dimension in (2, 3):
+        rng = np.random.default_rng(10 + dimension)
+        boxes = random_boxes(rng, 2000, dimension, scale=0.3)
+        queries = random_boxes(rng, 300, dimension, scale=2.0)
+        tree = trimkit.Boxes(boxes)
+        truth = overlapping(boxes, queries)
+        assert np.array_equal(tree.intersection(queries), truth)
+        assert np.array_equal(tree.intersection(queries.reshape((-1, 2 * dimension))), truth)
+        for query_index, query in enumerate(queries):
+            row = truth[truth[:, 0] == query_index, 1]
+            for single_query in (query, query.reshape(2 * dimension)):
+                found = tree.intersection(single_query)
+                assert found.dtype == np.int64 and found.shape == row.shape
+                assert np.array_equal(found, row)
+        # some but not all queries hit something, so the comparison means something
+        assert 0 < len(np.unique(truth[:, 0])) < len(queries)
+        # one empty query is an empty column, an empty batch empty pairs
+        assert tree.intersection(np.full(2 * dimension, 1e6)).shape == (0,)
+        assert tree.intersection(np.zeros((0, 2 * dimension))).shape == (0, 2)
 
 
 def test_boxes_query_shapes_refused():

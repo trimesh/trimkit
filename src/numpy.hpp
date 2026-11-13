@@ -89,10 +89,21 @@ struct RaysArgument {
 };
 
 // Boxes' queries as an argument: (2d,) or (2, d) for one query, (q, 2d) or
-// (q, 2, d) for many, each (q, 2, d) in memory. `Boxes::intersection` reads
-// it with `read`, as whichever of the three array shapes it is
+// (q, 2, d) for many, each (q, 2, d) in memory. `read_box_queries` reads it,
+// and the signature shows each array shape it takes
 struct BoxQueriesArgument {
     nb::handle object;
+};
+
+// What `read_box_queries` read: `count` queries of a minimum and a maximum
+// corner at `data`, each `dimension` float64, and whether it was given as
+// `one` query rather than a batch. Valid while it is: it holds the argument,
+// or its one copy
+struct BoxQueries {
+    AnyIn held;
+    const double* data = nullptr;
+    std::size_t count = 0;
+    bool one = false;
 };
 
 // What `read_rays` read: `count` rows of three, or one row that is every
@@ -429,6 +440,47 @@ inline void check_rays(const Rays& rays, const std::string& name) {
     } else {
         check_values(static_cast<const double*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
     }
+}
+
+// A box queries argument for boxes of `dimension`: one query, (2d,) flat as
+// (min..., max...) or (2, d) as two corners, or many, (q, 2d) or (q, 2, d),
+// told apart by the last extent as 2d is never d. Read as `read` takes any
+// array: its shape checked first, in place when exactly float64, else one
+// copy, converted with the warning when its dtype isn't, and its values
+// checked. Any other shape is the wrong type, as every argument's is
+inline BoxQueries read_box_queries(const BoxQueriesArgument& argument, std::size_t dimension, const std::string& name) {
+    // its shape as numpy sees it: none when it isn't array-like at all
+    const nb::object seen = detail::seen_as_array(argument.object);
+    std::vector<std::size_t> extents;
+    if (seen.is_valid()) {
+        for (const nb::handle extent : nb::borrow<nb::tuple>(seen.attr("shape"))) {
+            extents.push_back(nb::cast<std::size_t>(extent));
+        }
+    }
+    const std::size_t last = extents.empty() ? 0 : extents.back();
+    BoxQueries queries;
+    queries.one =
+        (extents.size() == 1 && last == 2 * dimension) || (extents.size() == 2 && extents[0] == 2 && last == dimension);
+    const bool many =
+        (extents.size() == 2 && last == 2 * dimension) || (extents.size() == 3 && extents[1] == 2 && last == dimension);
+    bool taken = false;
+    if (queries.one || many) {
+        taken = detail::any_readable(argument.object, &queries.held) && queries.held.dtype() == nb::dtype<double>();
+        if (!taken) {
+            const nb::object copy = detail::relaid(argument.object, seen, "float64", name);
+            taken = copy.is_valid() && detail::any_readable(copy, &queries.held) &&
+                    queries.held.dtype() == nb::dtype<double>();
+        }
+    }
+    if (!taken) {
+        type_error(name + " must be float64 of shape (" + std::to_string(2 * dimension) + ",) or (2, " +
+                   std::to_string(dimension) + ") for one query, or (*, " + std::to_string(2 * dimension) +
+                   ") or (*, 2, " + std::to_string(dimension) + ") for many, not " + describe(argument.object));
+    }
+    queries.data = static_cast<const double*>(queries.held.data());
+    queries.count = queries.one ? 1 : extents[0];
+    check_values(queries.data, 2 * dimension * queries.count, COORDINATE_LIMIT, name);
+    return queries;
 }
 
 // An array argument viewed: its dtype, shape and layout as `read` checks

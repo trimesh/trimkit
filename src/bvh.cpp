@@ -267,7 +267,7 @@ public:
     RayScene(const RayScene&) = delete;
     RayScene& operator=(const RayScene&) = delete;
 
-    RayScene(const trimkit::Meshes& meshes, trimkit::Flag use_gpu) {
+    RayScene(const trimkit::Meshes& meshes, trimkit::Flag use_gpu) : use_gpu_(use_gpu.value) {
         std::vector<trimkit::Mesh<std::uint64_t>> read = trimkit::read_meshes<std::uint64_t>(meshes);
         meshes_.resize(read.size());
         blas_.resize(read.size());
@@ -297,6 +297,28 @@ public:
     }
 
     std::size_t size() const { return meshes_.size(); }
+
+    // pickled as its meshes, exactly as it holds them, and `use_gpu` as asked:
+    // a load without a device answers on the CPU, as a build without one does
+    nb::dict constructor_arguments() const {
+        nb::list meshes;
+        for (const std::unique_ptr<RayMesh>& mesh : meshes_) {
+            const std::vector<Vec>& points = mesh->vertices();
+            std::vector<double> vertices(3 * points.size());
+            for (std::size_t i = 0; i < points.size(); i++) {
+                for (std::size_t axis = 0; axis < 3; axis++) {
+                    vertices[(3 * i) + axis] = points[i][static_cast<std::int32_t>(axis)];
+                }
+            }
+            std::vector<std::uint64_t> faces = mesh->faces();
+            meshes.append(nb::make_tuple(trimkit::to_numpy_rows(std::move(vertices), {3}),
+                                         trimkit::to_numpy_rows<std::int64_t>(std::move(faces), {3})));
+        }
+        const nb::dict arguments;
+        arguments["meshes"] = meshes;
+        arguments["use_gpu"] = use_gpu_;
+        return arguments;
+    }
 
     trimkit::Out<bool> intersect_any(const RaysArg& origins_argument, const RaysArg& directions_argument,
                                      const trimkit::InstanceMatrices& matrices_argument,
@@ -731,6 +753,8 @@ private:
     static constexpr double RELATIVE_STEP = 9.094947017729282e-13;  // 2^-40
 
     std::vector<std::unique_ptr<RayMesh>> meshes_;
+    // whether it was asked to trace on a device, which a pickle asks again
+    bool use_gpu_ = false;
     // each mesh's BVH, or null without faces, as every top level indexes them
     std::vector<tinybvh::BVH_Double*> blas_;
     // the top level last built, swapped whole: a query keeps the one it read.
@@ -770,6 +794,13 @@ public:
 
     std::size_t size() const { return boxes_.size() / 2; }
 
+    // pickled as the boxes it was built from
+    nb::dict constructor_arguments() const {
+        const nb::dict arguments;
+        arguments["boxes"] = boxes();
+        return arguments;
+    }
+
     // the box around every box: (2, d), or +inf then -inf with none
     trimkit::Out<double> bounds() const {
         std::vector<double> bounds(2 * dimension_);
@@ -804,32 +835,8 @@ public:
     // (q, 2, d) in memory, so they read as it and share one traversal; the
     // last extent tells the layouts apart, as 2d is never d
     trimkit::Out<std::int64_t> intersection(const BoxQueriesArgument& argument) const {
-        // its shape as numpy sees it: none when it isn't array-like at all
-        const nb::object seen = trimkit::detail::seen_as_array(argument.object);
-        std::vector<std::size_t> extents;
-        if (seen.is_valid()) {
-            for (const nb::handle extent : nb::borrow<nb::tuple>(seen.attr("shape"))) {
-                extents.push_back(nb::cast<std::size_t>(extent));
-            }
-        }
-        const std::size_t d = dimension_;
-        const std::size_t last = extents.empty() ? 0 : extents.back();
-        if (extents.size() == 1 && last == 2 * d) {
-            return answer(trimkit::read<double, -1>(argument.object, "queries").data(), 1, true);
-        }
-        if (extents.size() == 2 && extents[0] == 2 && last == d) {
-            return answer(trimkit::read<double, -1, -1>(argument.object, "queries").data(), 1, true);
-        }
-        if (extents.size() == 2 && last == 2 * d) {
-            return answer(trimkit::read<double, -1, -1>(argument.object, "queries").data(), extents[0], false);
-        }
-        if (extents.size() == 3 && extents[1] == 2 && last == d) {
-            return answer(trimkit::read<double, -1, 2, -1>(argument.object, "queries").data(), extents[0], false);
-        }
-        // a shape that's none of them is the wrong type, as every argument's is
-        trimkit::type_error("queries must be float64 of shape (" + std::to_string(2 * d) + ",) or (2, " +
-                            std::to_string(d) + ") for one query, or (*, " + std::to_string(2 * d) + ") or (*, 2, " +
-                            std::to_string(d) + ") for many, not " + trimkit::describe(argument.object));
+        const trimkit::BoxQueries queries = trimkit::read_box_queries(argument, dimension_, "queries");
+        return answer(queries.data, queries.count, queries.one);
     }
 
 private:
@@ -963,8 +970,8 @@ trimkit::BoxesObject trimkit::scene_boxes(const std::vector<double>& boxes) {
 void bind_bvh(nb::module_& m) {
     tinybvh::tinybvh_set_fatal_error_handler(throw_tinybvh_error);
 
-    nb::class_<RayScene>(m, "RayScene",
-                         R"(Meshes, each built once into a double precision BVH, and the only
+    trimkit::picklable_class<RayScene>(m, "RayScene",
+                                       R"(Meshes, each built once into a double precision BVH, and the only
 thing rays are cast against.
 
 Every query names its instances (which mesh, placed where), as a
@@ -1115,8 +1122,8 @@ Examples
 >>> hits.tolist()
 [True])");
 
-    nb::class_<Boxes>(m, "Boxes",
-                      R"(Axis-aligned boxes built into a BVH for overlap queries: a static,
+    trimkit::picklable_class<Boxes>(m, "Boxes",
+                                    R"(Axis-aligned boxes built into a BVH for overlap queries: a static,
 numpy-native replacement for a bulk-loaded R-tree.
 
 Parameters

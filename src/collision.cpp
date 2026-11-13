@@ -82,7 +82,31 @@ public:
         if (face_count_ > 0) {
             const nb::gil_scoped_release release;
             build(mesh.vertices.data(), mesh.vertices.shape(0), mesh.faces, convex);
+        } else {
+            // no model holds them, so a pickle can still give them back
+            loose_vertices_.assign(mesh.vertices.data(), mesh.vertices.data() + (3 * mesh.vertices.shape(0)));
         }
+    }
+
+    // the mesh as it was given: the model's own copy, in the order given
+    nb::tuple as_given() const {
+        std::vector<double> vertices = loose_vertices_;
+        std::vector<std::int64_t> faces(3 * face_count_);
+        if (model_) {
+            vertices.resize(3 * model_->vertices->size());
+            for (std::size_t i = 0; i < model_->vertices->size(); i++) {
+                for (std::size_t axis = 0; axis < 3; axis++) {
+                    vertices[(3 * i) + axis] = (*model_->vertices)[i][static_cast<Eigen::Index>(axis)];
+                }
+            }
+            for (std::size_t f = 0; f < face_count_; f++) {
+                for (std::size_t corner = 0; corner < 3; corner++) {
+                    faces[(3 * f) + corner] = (*model_->tri_indices)[f][static_cast<std::uint32_t>(corner)];
+                }
+            }
+        }
+        return nb::make_tuple(trimkit::to_numpy_rows(std::move(vertices), {3}),
+                              trimkit::to_numpy_rows(std::move(faces), {3}));
     }
 
     std::size_t size() const { return face_count_; }
@@ -123,6 +147,8 @@ private:
     }
 
     std::size_t face_count_ = 0;
+    // the vertices of a mesh without faces, which no model holds
+    std::vector<double> loose_vertices_;
     std::array<double, 6> box_{};
     std::shared_ptr<Model> model_;
     std::unique_ptr<Convex> convex_;
@@ -360,6 +386,21 @@ public:
 
     std::size_t size() const { return meshes_.size(); }
 
+    // pickled as its meshes as given and which of them are convex
+    nb::dict constructor_arguments() const {
+        nb::list meshes;
+        std::vector<std::uint8_t> convex(meshes_.size());
+        for (std::size_t i = 0; i < meshes_.size(); i++) {
+            meshes.append(meshes_[i]->as_given());
+            convex[i] = meshes_[i]->convex() != nullptr ? 1 : 0;
+        }
+        const std::size_t count = convex.size();
+        const nb::dict arguments;
+        arguments["meshes"] = meshes;
+        arguments["convex"] = trimkit::to_numpy<bool>(std::move(convex), {count});
+        return arguments;
+    }
+
     trimkit::Out<std::int64_t> collides(const trimkit::InstanceMatrices& matrices_argument,
                                         const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
                                         trimkit::Number<double> margin_argument) const {
@@ -593,8 +634,8 @@ private:
 }  // namespace
 
 void bind_collision(nb::module_& m) {
-    nb::class_<CollisionScene>(m, "CollisionScene",
-                               R"(Meshes to place and query against each other. A scene never changes:
+    trimkit::picklable_class<CollisionScene>(m, "CollisionScene",
+                                             R"(Meshes to place and query against each other. A scene never changes:
 each query names its own instances, so threads may share one.
 
 Every query takes its instances (which mesh, placed where) and the pairs

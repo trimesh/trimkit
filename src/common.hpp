@@ -21,6 +21,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // Each part of the one extension, src/PART.cpp, adds its functions and
@@ -473,6 +475,34 @@ inline Instances read_instances(const InstanceViews& views, std::size_t mesh_cou
         }
     }
     return instances;
+}
+
+// A bound class whose objects pickle, the only way the package binds one.
+// `T` says what it pickles as with `nb::dict constructor_arguments() const`:
+// its constructor's arguments, by their names, from which a load builds it
+// again (a compile error without it). Never an acceleration structure, which
+// is rebuilt: a pickle holds only arrays and Python values, named, so it loads
+// into any build whose constructor takes the same names.
+// tests/test_invariants.py round-trips every class the package binds
+template <typename T>
+nb::class_<T> picklable_class(nb::module_& m, const char* name, const char* doc) {
+    static_assert(std::is_same_v<decltype(std::declval<const T&>().constructor_arguments()), nb::dict>,
+                  "a bound class must say what it pickles as: nb::dict constructor_arguments() const");
+    nb::class_<T> bound(m, name, doc);
+    bound.def(
+        "__reduce__",
+        [](nb::handle self) {
+            const nb::dict arguments = nb::cast<const T&>(self).constructor_arguments();
+            const nb::object partial = nb::module_::import_("functools").attr("partial");
+            return nb::make_tuple(partial(nb::borrow(self.type()), **arguments), nb::make_tuple());
+        },
+        R"(Pickle as its constructor's arguments, by name: anything built from them is built again on load.
+
+Returns
+-------
+reduced : tuple
+  Its constructor with those arguments bound, as pickle and copy call it.)");
+    return bound;
 }
 
 }  // namespace trimkit

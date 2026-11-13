@@ -144,6 +144,15 @@ pairs) and sparse rows of what was found otherwise (hits, touching pairs,
 overlapping boxes), and `decompose` answers a list of `Mesh`, one per hull. Nothing a
 scene answers ever depends on what it was asked before, so threads can share one.
 
+Every class pickles as exactly the arguments its constructor took, by name:
+`Boxes` its `boxes`, `RayScene` its `meshes` and `use_gpu`, and `CollisionScene`
+its `meshes` and which are `convex`. A pickle holds only numpy arrays and Python
+values, never a BVH or a collision model, so loading one (or a `copy.deepcopy`)
+builds those again, taking as long as the constructor did, and answers bit for
+bit what the original does. It loads into any version of trimkit whose
+constructor takes the same names, and a `RayScene` pickled with `use_gpu=True`
+answers on the CPU, with its one warning, where no device is found.
+
 `RayScene`, `Boxes` and `CollisionScene` queries spread big batches, and
 `decompose` its hull splits and merge costs, across the cores they may run on
 (their affinity, within a cgroup's CPU quota), on one pool of workers that exit
