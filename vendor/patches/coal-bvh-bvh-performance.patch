@@ -1,0 +1,1694 @@
+kind: perf
+upstream: coal PR #858 (open), "Improve the performances of BVH-BVH collision
+detection", by coal maintainer lmontaut: its head, d7b7355, merged onto the
+pinned devel commit with no conflicts in include/ or src/ (rebased 2026-11-06).
+  https://github.com/coal-library/coal/pull/858
+  https://github.com/coal-library/coal/commit/d7b73551d8a530d88c03aa1e2d8a722daf1b941a
+Drop this patch once #858 is in devel.
+
+Status 2026-11-09: opened 2026-05-13; approved by maintainer jcarpent on
+2026-09-22; maintainer jorisv asked the same day for housekeeping only (delete
+collision_node.cpp and traversal_recurse.cpp, which the PR empties and drops
+from its CMake, and use constexpr now that C++17 is coal's floor); the author
+pushed one fix on 2026-10-02 and stopped, and on 2026-11-05 jorisv wrote "This
+PR is stall since a lot of time. Can you fix the last issues ?". So the change
+itself is reviewed and accepted; only the author's follow-through is missing.
+Revisit at each `update`: if it merges, `update` drops this patch; if it is
+closed instead, decide again whether 2x on mesh-mesh `collides` is worth
+owning these 1680 lines (660 of them are the recursion moving from
+traversal_recurse.cpp into traversal_recurse.h, counted twice).
+
+Mesh/mesh collision was 1.5-2x slower than FCL (coal issue #857): the
+traversal nodes are virtual, the relative transform is recomputed, and every
+pair of triangles runs iterative GJK+EPA. The PR devirtualizes the nodes,
+precomputes the relative transform, tests triangle pairs with a closed-form
+triangle-triangle specialization, and adds a fast path when contacts are off
+and the security margin is 0, which is every `collides` query.
+
+Measured 2026-11-02 (named pairs, boolean collision, us per configuration):
+G1 547 -> 256, Talos 914 -> 536, Panda 5 -> 2, with 0 disagreements against
+python-fcl.
+
+Two changes of ours on top of the head:
+- a plain assert where it calls COAL_ASSERT with only a condition, which does
+  not compile
+- the fast path only for two triangles that both have area: its closed-form
+  test reports any two zero-area triangles as overlapping, however far apart
+  (found by fuzz/collision.cpp: two point triangles 0.006 apart, and 10 apart
+  too). Those go through the GJK path the leaf always used.
+
+Found by fuzz/collision.cpp and kept as notes, not fixed here:
+- Two triangles without area (segments or points) whose closest points touch:
+  the mesh distance traversal reports 5.5e-6 where measuring every pair of
+  triangles with the same leaf function gives 0. coal devel does the same
+  without this patch, so it predates the PR; the harness allows 1e-5 when the
+  closest pair has a triangle without area. The input, as fuzz/collision.cpp
+  reads it, in hex:
+    0a010129000104000000ef0000000000000000002e08000000000000000000000000001b
+    000000000000000000000029000104000000ef00000000000000d4d4d4d400002e000000
+    0000000000000000000000000000003a00
+- Contacts at zero distance: the PR's box test and the leaf test round
+  either way when two triangles only touch, so a traversal may report a
+  touching pair the closed form doesn't, or miss one. The harness allows
+  either when the pair is within 1e-7, and never a miss of a pair that
+  truly interpenetrates.
+
+--- a/include/coal/BV/BV.h
++++ b/include/coal/BV/BV.h
+@@ -49,6 +49,17 @@
+ /** @brief Main namespace */
+ namespace coal {
+ 
++template <typename BV>
++inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                         const Vec3s& inv_T0, const BV& b1,
++                                         const BV& b2,
++                                         const CollisionRequest& request,
++                                         Scalar& sqrDistLowerBound) {
++  const Matrix3s R0(R0_transpose.transpose());
++  const Vec3s T0(-(R0 * inv_T0));
++  return overlap(R0, T0, b1, b2, request, sqrDistLowerBound);
++}
++
+ /// @cond IGNORE
+ namespace details {
+ 
+--- a/include/coal/BV/OBB.h
++++ b/include/coal/BV/OBB.h
+@@ -144,6 +144,14 @@
+                          const OBB& b2, const CollisionRequest& request,
+                          Scalar& sqrDistLowerBound);
+ 
++/// @brief Check collision between two obbs, reusing precomputed
++/// R0.transpose() and -R0.transpose() * T0 for the configuration of b1.
++COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                              const Vec3s& inv_T0,
++                                              const OBB& b1, const OBB& b2,
++                                              const CollisionRequest& request,
++                                              Scalar& sqrDistLowerBound);
++
+ /// Check collision between two boxes
+ /// @param B, T orientation and position of first box,
+ /// @param a half dimensions of first box,
+--- a/include/coal/BV/OBBRSS.h
++++ b/include/coal/BV/OBBRSS.h
+@@ -151,6 +151,17 @@
+   return overlap(R0, T0, b1.obb, b2.obb, request, sqrDistLowerBound);
+ }
+ 
++/// Check collision between two OBBRSS, reusing precomputed R0.transpose() and
++/// -R0.transpose() * T0 for the configuration of b1.
++inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                         const Vec3s& inv_T0, const OBBRSS& b1,
++                                         const OBBRSS& b2,
++                                         const CollisionRequest& request,
++                                         Scalar& sqrDistLowerBound) {
++  return overlapPrecomputedRTranspose(R0_transpose, inv_T0, b1.obb, b2.obb,
++                                      request, sqrDistLowerBound);
++}
++
+ /// @brief Computate distance between two OBBRSS, b1 is in configuation (R0, T0)
+ /// and b2 is in indentity; P and Q, is not NULL, returns the nearest points
+ inline Scalar distance(const Matrix3s& R0, const Vec3s& T0, const OBBRSS& b1,
+--- a/include/coal/BV/RSS.h
++++ b/include/coal/BV/RSS.h
+@@ -174,6 +174,14 @@
+                          const RSS& b2, const CollisionRequest& request,
+                          Scalar& sqrDistLowerBound);
+ 
++/// @brief Check collision between two RSSs, reusing precomputed
++/// R0.transpose() and -R0.transpose() * T0 for the configuration of b1.
++COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                              const Vec3s& inv_T0,
++                                              const RSS& b1, const RSS& b2,
++                                              const CollisionRequest& request,
++                                              Scalar& sqrDistLowerBound);
++
+ }  // namespace coal
+ 
+ #endif
+--- a/include/coal/BV/kIOS.h
++++ b/include/coal/BV/kIOS.h
+@@ -185,6 +185,14 @@
+                          const kIOS& b2, const CollisionRequest& request,
+                          Scalar& sqrDistLowerBound);
+ 
++/// @brief Check collision between two kIOSs, reusing precomputed
++/// R0.transpose() and -R0.transpose() * T0 for the configuration of b1.
++COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                              const Vec3s& inv_T0,
++                                              const kIOS& b1, const kIOS& b2,
++                                              const CollisionRequest& request,
++                                              Scalar& sqrDistLowerBound);
++
+ /// @brief Approximate distance between two kIOS bounding volumes
+ /// @todo P and Q is not returned, need implementation
+ COAL_DLLAPI Scalar distance(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,
+--- a/include/coal/collision_data.h
++++ b/include/coal/collision_data.h
+@@ -460,8 +460,11 @@
+   /// contact position) will return.
+   bool enable_contact;
+ 
+-  /// Whether a lower bound on distance is returned when objects are disjoint
+-  COAL_DEPRECATED_MESSAGE(A lower bound on distance is always computed.)
++  /// Whether a tight lower bound on distance is returned when objects are
++  /// disjoint.
++  /// Note: a lower bound on distance is always computed, but it is not
++  /// necessarily tight. Setting this flag to true allows to compute a tight
++  /// lower bound on distance, at the cost of additional computations.
+   bool enable_distance_lower_bound;
+ 
+   /// @brief Distance below which objects are considered in collision.
+--- a/include/coal/internal/intersect.h
++++ b/include/coal/internal/intersect.h
+@@ -183,6 +183,31 @@
+                                const Transform3s& tf, Vec3s& P, Vec3s& Q);
+ };
+ 
++namespace internal {
++/// @brief Returns true if triangles P1P2P3 and Q1Q2Q3 share at least one point.
++bool triangleTriangleOverlap(const Vec3s& P1, const Vec3s& P2, const Vec3s& P3,
++                             const Vec3s& Q1, const Vec3s& Q2, const Vec3s& Q3,
++                             Scalar& sqrDistLowerBound);
++
++/// @brief Intersect segment AB with triangle PQR.
++/// @param[out] X  intersection point on the triangle if the segment pierces it.
++/// @return true if the open segment (t∈(0,1]) crosses the triangle interior,
++///         false if parallel, misses, or the segment lies in the triangle's
++///         plane (coplanar — caller handles that case separately).
++bool segmentTriangleIntersection(const Vec3s& A, const Vec3s& B, const Vec3s& P,
++                                 const Vec3s& Q, const Vec3s& R, Vec3s& X);
++
++/// @brief Compute penetration distance, normal, and witness points of two
++/// triangles in collision Normal is normal of triangle 1 (P1, P2, P3),
++/// penetration depth is the minimal distance (Q1, Q2, Q3) should be translated
++/// along the normal so that the triangles are collision free.
++void computeTriangleTriangleContact(const Vec3s& P1, const Vec3s& P2,
++                                    const Vec3s& P3, const Vec3s& Q1,
++                                    const Vec3s& Q2, const Vec3s& Q3,
++                                    Scalar& signed_distance, Vec3s& normal,
++                                    Vec3s& p1, Vec3s& p2);
++}  // namespace internal
++
+ }  // namespace coal
+ 
+ /// @endcond
+--- a/include/coal/internal/intersect.hxx
++++ b/include/coal/internal/intersect.hxx
+@@ -325,6 +325,186 @@
+   return res;
+ }
+ 
++namespace internal {
++
++/// @brief SAT separating-axis helper.
++/// Returns true iff projections of {p1,p2,p3} and {q1,q2,q3} onto @p ax
++/// overlap (i.e., no separating gap exists on this axis).
++template <typename Vec3>
++inline bool project6(const Vec3& ax, const Vec3& p1, const Vec3& p2,
++                     const Vec3& p3, const Vec3& q1, const Vec3& q2,
++                     const Vec3& q3) {
++  using Scalar = typename Vec3::Scalar;
++  const Scalar P1 = ax.dot(p1), P2 = ax.dot(p2), P3 = ax.dot(p3);
++  const Scalar Q1 = ax.dot(q1), Q2 = ax.dot(q2), Q3 = ax.dot(q3);
++  const Scalar mn1 = std::min(P1, std::min(P2, P3));
++  const Scalar mx2 = std::max(Q1, std::max(Q2, Q3));
++  if (mn1 > mx2) return false;
++  const Scalar mx1 = std::max(P1, std::max(P2, P3));
++  const Scalar mn2 = std::min(Q1, std::min(Q2, Q3));
++  return mn2 <= mx1;
++}
++
++inline bool triangleTriangleOverlap(const Vec3s& P1, const Vec3s& P2,
++                                    const Vec3s& P3, const Vec3s& Q1,
++                                    const Vec3s& Q2, const Vec3s& Q3,
++                                    Scalar& sqrDistLowerBound) {
++  /// SAT-based triangle-triangle overlap test (boolean only).
++  ///
++  /// Adapted from FCL's Intersect<S>::intersect_Triangle
++  /// (Copyright Willow Garage / Open Source Robotics Foundation, BSD-2).
++  ///
++  /// Uses 17 separating axes: 2 face normals, 9 edge×edge cross-products, and
++  /// 3+3 edge×face-normal axes. The SAT correctly handles all configurations
++  /// including coplanar triangles — no special-case fallback is needed.
++  ///
++  /// Both triangles must be expressed in the same coordinate frame.
++  /// Returns true iff P1P2P3 and Q1Q2Q3 share at least one point.
++  /// On separation, sqrDistLowerBound is set to gap²/‖ax‖² for the first
++  /// separating axis found (a valid but potentially loose lower bound).
++
++  sqrDistLowerBound = 0;
++
++  // Translate so that P1 is at the origin; p1 becomes the zero vector.
++  const Vec3s p1 = Vec3s::Zero();
++  const Vec3s p2 = P2 - P1;
++  const Vec3s p3 = P3 - P1;
++  const Vec3s q1 = Q1 - P1;
++  const Vec3s q2 = Q2 - P1;
++  const Vec3s q3 = Q3 - P1;
++
++  const Vec3s f1 = q2 - q1;
++  const Vec3s f2 = q3 - q2;
++  const Vec3s f3 = q1 - q3;
++
++  // On the first separating axis found, capture gap²/‖ax‖² as a lower bound
++  // on the squared distance. For a unit axis u = ax/‖ax‖, the 1D separation
++  // gap_u = gap/‖ax‖ satisfies dist_3D ≥ gap_u, so gap_u² is valid.
++  auto checkAxis = [&](const Vec3s& ax) -> bool {
++    const Scalar P1p = ax.dot(p1), P2p = ax.dot(p2), P3p = ax.dot(p3);
++    const Scalar Q1p = ax.dot(q1), Q2p = ax.dot(q2), Q3p = ax.dot(q3);
++    const Scalar mn1 = std::min(P1p, std::min(P2p, P3p));
++    const Scalar mx2 = std::max(Q1p, std::max(Q2p, Q3p));
++    if (mn1 > mx2) {
++      const Scalar gap = mn1 - mx2;
++      sqrDistLowerBound = gap * gap / ax.squaredNorm();
++      return false;
++    }
++    const Scalar mx1 = std::max(P1p, std::max(P2p, P3p));
++    const Scalar mn2 = std::min(Q1p, std::min(Q2p, Q3p));
++    if (mn2 > mx1) {
++      const Scalar gap = mn2 - mx1;
++      sqrDistLowerBound = gap * gap / ax.squaredNorm();
++      return false;
++    }
++    return true;
++  };
++
++  const Vec3s e1 = p2;  // = p2 - p1  (p1 = 0)
++  if (!checkAxis(e1.cross(f1))) return false;
++  if (!checkAxis(e1.cross(f2))) return false;
++  if (!checkAxis(e1.cross(f3))) return false;
++
++  const Vec3s e2 = p3 - p2;
++  if (!checkAxis(e2.cross(f1))) return false;
++  if (!checkAxis(e2.cross(f2))) return false;
++  if (!checkAxis(e2.cross(f3))) return false;
++
++  const Vec3s e3 = -p3;  // = p1 - p3  (p1 = 0)
++  if (!checkAxis(e3.cross(f1))) return false;
++  if (!checkAxis(e3.cross(f2))) return false;
++  if (!checkAxis(e3.cross(f3))) return false;
++
++  const Vec3s n1 = e1.cross(e2);
++  if (!checkAxis(n1)) return false;
++
++  if (!checkAxis(e1.cross(n1))) return false;
++  if (!checkAxis(e2.cross(n1))) return false;
++  if (!checkAxis(e3.cross(n1))) return false;
++
++  const Vec3s m1 = f1.cross(f2);
++  if (!checkAxis(m1)) return false;
++
++  if (!checkAxis(f1.cross(m1))) return false;
++  if (!checkAxis(f2.cross(m1))) return false;
++  if (!checkAxis(f3.cross(m1))) return false;
++
++  return true;
++}
++
++inline bool segmentTriangleIntersection(const Vec3s& A, const Vec3s& B,
++                                        const Vec3s& P, const Vec3s& Q,
++                                        const Vec3s& R, Vec3s& X) {
++  using Scalar = typename Vec3s::Scalar;
++
++  const Vec3s AB = B - A;
++  const Vec3s N = (Q - P).cross(R - P);  // unnormalized triangle normal
++
++  const Scalar denom = N.dot(AB);
++  // Segment parallel (or nearly so) to the triangle's plane.
++  if (std::abs(denom) <= std::numeric_limits<Scalar>::epsilon() *
++                             (std::max)(N.norm() * AB.norm(), Scalar(1)))
++    return false;
++
++  const Scalar t = N.dot(P - A) / denom;
++  if (t < 0 || t > 1) return false;
++
++  X = A + t * AB;
++
++  // Inside-triangle test: X must be on the interior side of every directed
++  // edge (cross product with N must be non-negative).
++  if (N.dot((Q - P).cross(X - P)) < 0) return false;
++  if (N.dot((R - Q).cross(X - Q)) < 0) return false;
++  if (N.dot((P - R).cross(X - R)) < 0) return false;
++
++  return true;
++}
++
++inline void computeTriangleTriangleContact(const Vec3s& P1, const Vec3s& P2,
++                                           const Vec3s& P3, const Vec3s& Q1,
++                                           const Vec3s& Q2, const Vec3s& Q3,
++                                           Scalar& signed_distance,
++                                           Vec3s& normal, Vec3s& p1,
++                                           Vec3s& p2) {
++  // Normal from triangle 1's plane; penetration depth is an upper bound.
++  // Note: we make the assumption that the triangles are properly
++  // oriented, so the normal points outside of triangle 1 (this is
++  // coherent with the normal definiction in `Contact`, see
++  // `collision-data.h`).
++  normal = (P2 - P1).cross(P3 - P1).normalized();
++  Scalar depth1((P1 - Q1).dot(normal));
++  Scalar depth2((P1 - Q2).dot(normal));
++  Scalar depth3((P1 - Q3).dot(normal));
++  signed_distance = -std::max(depth1, std::max(depth2, depth3));
++
++  // Find a point in the intersection via edge-triangle sweep.
++  // For non-coplanar intersecting triangles the intersection is a
++  // segment; we collect all edge-piercing points and average them.
++  // For coplanar triangles (fast-path fallthrough) no edge pierces the
++  // other triangle's plane, so we fall back to the vertex average.
++  Vec3s P_sum = Vec3s::Zero();
++  int num_hits = 0;
++  auto testEdge = [&](const Vec3s& E0, const Vec3s& E1, const Vec3s& T0,
++                      const Vec3s& T1, const Vec3s& T2) {
++    Vec3s X;
++    if (segmentTriangleIntersection(E0, E1, T0, T1, T2, X)) {
++      P_sum += X;
++      ++num_hits;
++    }
++  };
++  testEdge(P1, P2, Q1, Q2, Q3);
++  testEdge(P2, P3, Q1, Q2, Q3);
++  testEdge(P3, P1, Q1, Q2, Q3);
++  testEdge(Q1, Q2, P1, P2, P3);
++  testEdge(Q2, Q3, P1, P2, P3);
++  testEdge(Q3, Q1, P1, P2, P3);
++  if (num_hits > 0)
++    p1 = p2 = P_sum / num_hits;
++  else
++    p1 = p2 = (P1 + P2 + P3 + Q1 + Q2 + Q3) / 6;
++}
++}  // namespace internal
++
+ }  // namespace coal
+ 
+ #endif  // COAL_INTERSECT_HXX
+--- a/include/coal/internal/traversal.h
++++ b/include/coal/internal/traversal.h
+@@ -46,13 +46,21 @@
+ namespace details {
+ template <bool enabled>
+ struct COAL_DLLAPI RelativeTransformation {
+-  RelativeTransformation() : R(Matrix3s::Identity()) {}
++  RelativeTransformation()
++      : R(Matrix3s::Identity()),
++        T(Vec3s::Zero()),
++        R_transpose(Matrix3s::Identity()),
++        inv_T(Vec3s::Zero()) {}
+ 
+   const Matrix3s& _R() const { return R; }
+   const Vec3s& _T() const { return T; }
++  const Matrix3s& _RTranspose() const { return R_transpose; }
++  const Vec3s& _InvT() const { return inv_T; }
+ 
+   Matrix3s R;
+   Vec3s T;
++  Matrix3s R_transpose;
++  Vec3s inv_T;
+ };
+ 
+ template <>
+@@ -63,6 +71,12 @@
+   static const Vec3s& _T() {
+     COAL_THROW_PRETTY("should never reach this point", std::logic_error);
+   }
++  static const Matrix3s& _RTranspose() {
++    COAL_THROW_PRETTY("should never reach this point", std::logic_error);
++  }
++  static const Vec3s& _InvT() {
++    COAL_THROW_PRETTY("should never reach this point", std::logic_error);
++  }
+ };
+ }  // namespace details
+ 
+--- a/include/coal/internal/traversal_node_bvhs.h
++++ b/include/coal/internal/traversal_node_bvhs.h
+@@ -156,9 +156,9 @@
+       disjoint = !this->model1->getBV(b1).overlap(
+           this->model2->getBV(b2), this->request, sqrDistLowerBound);
+     else {
+-      disjoint = !overlap(RT._R(), RT._T(), this->model2->getBV(b2).bv,
+-                          this->model1->getBV(b1).bv, this->request,
+-                          sqrDistLowerBound);
++      disjoint = !overlapPrecomputedRTranspose(
++          RT._RTranspose(), RT._InvT(), this->model2->getBV(b2).bv,
++          this->model1->getBV(b1).bv, this->request, sqrDistLowerBound);
+     }
+     if (disjoint)
+       internal::updateDistanceLowerBoundFromBV(this->request, *this->result,
+@@ -200,19 +200,110 @@
+     const Vec3s& Q2 = vertices2[tri_id2[1]];
+     const Vec3s& Q3 = vertices2[tri_id2[2]];
+ 
+-    TriangleP tri1(P1, P2, P3);
+-    TriangleP tri2(Q1, Q2, Q3);
+-
+-    // TODO(louis): MeshCollisionTraversalNode should have its own GJKSolver.
+-    GJKSolver solver(this->request);
++    // the closed-form test misses no overlap of two triangles with area, but
++    // reports any two zero-area ones as overlapping, however far apart: those
++    // go through GJK below
++    const bool both_have_area = (P2 - P1).cross(P3 - P1).squaredNorm() > 0 &&
++                                (Q2 - Q1).cross(Q3 - Q1).squaredNorm() > 0;
++    if ((!this->request.enable_contact) &&
++        (this->request.security_margin == 0) && both_have_area) {
++      // Fast path: no security margin, we don't care about contact or tight
++      // lower bound so there is no need for more expensive distance
++      // computation.
++
++      // Transform Q1/Q2/Q3 into mesh1's local frame using the pre-computed
++      // relative transform RT = (R1^T*R2, R1^T*(t2-t1)).
++      // P1/P2/P3 stay in mesh1's local frame — zero transform cost.
++      Vec3s Q1r, Q2r, Q3r;
++      if (RTIsIdentity) {
++        Q1r = Q1;
++        Q2r = Q2;
++        Q3r = Q3;
++      } else {
++        Q1r = RT._R() * Q1 + RT._T();
++        Q2r = RT._R() * Q2 + RT._T();
++        Q3r = RT._R() * Q3 + RT._T();
++      }
++      Scalar sqrDistLBFromTri = 0;
++      bool is_collision = internal::triangleTriangleOverlap(
++          P1, P2, P3, Q1r, Q2r, Q3r, sqrDistLBFromTri);
++      // fast path for collision checking without contact information and
++      // security margin, so no contact information is needed.
++      const Vec3s dummy = Vec3s::Constant(std::numeric_limits<Scalar>::max());
++      if (is_collision) {
++        sqrDistLowerBound = 0;
++        Scalar distance = 0;
++
++        internal::updateDistanceLowerBoundFromLeaf(
++            this->request, *(this->result), distance, dummy, dummy, dummy);
++
++        if (this->result->numContacts() < this->request.num_max_contacts) {
++          this->result->addContact(Contact(this->model1, this->model2,
++                                           primitive_id1, primitive_id2, dummy,
++                                           dummy, dummy, distance));
++        }
++      } else {
++        // SAT gave a positive lower bound on squared distance. Update both the
++        // traversal bound and result.distance_lower_bound.
++        sqrDistLowerBound = sqrDistLBFromTri;
++        internal::updateDistanceLowerBoundFromLeaf(
++            this->request, *(this->result), std::sqrt(sqrDistLBFromTri), dummy,
++            dummy, dummy);
++      }
++      return;
++    }
+ 
+     const bool compute_penetration =
+         this->request.enable_contact || (this->request.security_margin < 0);
++
+     Vec3s p1, p2, normal;
+-    DistanceResult distanceResult;
+-    Scalar distance = internal::ShapeShapeDistance<TriangleP, TriangleP>(
+-        &tri1, this->tf1, &tri2, this->tf2, &solver, compute_penetration, p1,
+-        p2, normal);
++    Scalar distance;
++    Scalar d2;
++    {
++      d2 = RTIsIdentity ? TriangleDistance::sqrTriDistance(P1, P2, P3, Q1, Q2,
++                                                           Q3, p1, p2)
++                        : TriangleDistance::sqrTriDistance(
++                              P1, P2, P3, Q1, Q2, Q3, RT._R(), RT._T(), p1, p2);
++    }
++
++    if (d2 > 0) {
++      // Triangles are separated: sqrTriDistance gives witness points in tf1's
++      // local frame for the oriented case, world frame for the identity case.
++      distance = sqrt(d2);
++      if (!RTIsIdentity) {
++        p1 = this->tf1.transform(p1);
++        p2 = this->tf1.transform(p2);
++      }
++      normal = (p2 - p1) / distance;
++    } else {
++      // Triangles intersect.
++      if (compute_penetration) {
++        // Transform vertices to world frame to compute penetration.
++        Vec3s a1, b1, c1, a2, b2, c2;
++        if (RTIsIdentity) {
++          a1 = P1;
++          b1 = P2;
++          c1 = P3;
++          a2 = Q1;
++          b2 = Q2;
++          c2 = Q3;
++        } else {
++          a1 = this->tf1.transform(P1);
++          b1 = this->tf1.transform(P2);
++          c1 = this->tf1.transform(P3);
++          a2 = this->tf2.transform(Q1);
++          b2 = this->tf2.transform(Q2);
++          c2 = this->tf2.transform(Q3);
++        }
++        internal::computeTriangleTriangleContact(a1, b1, c1, a2, b2, c2,
++                                                 distance, normal, p1, p2);
++      } else {
++        // No contact info required; set normal and witness points to arbitrary
++        // values.
++        distance = 0;
++        p1 = p2 = normal = Vec3s::Constant(std::numeric_limits<Scalar>::max());
++      }
++    }
+ 
+     const Scalar distToCollision = distance - this->request.security_margin;
+ 
+--- a/include/coal/internal/traversal_node_setup.h
++++ b/include/coal/internal/traversal_node_setup.h
+@@ -560,6 +560,8 @@
+   node.RT.R.noalias() = tf1.getRotation().transpose() * tf2.getRotation();
+   node.RT.T.noalias() = tf1.getRotation().transpose() *
+                         (tf2.getTranslation() - tf1.getTranslation());
++  node.RT.R_transpose.noalias() = node.RT.R.transpose();
++  node.RT.inv_T.noalias() = -(node.RT.R_transpose * node.RT.T);
+ 
+   return true;
+ }
+@@ -686,6 +688,8 @@
+ 
+   relativeTransform(tf1.getRotation(), tf1.getTranslation(), tf2.getRotation(),
+                     tf2.getTranslation(), node.RT.R, node.RT.T);
++  node.RT.R_transpose.noalias() = node.RT.R.transpose();
++  node.RT.inv_T.noalias() = -(node.RT.R_transpose * node.RT.T);
+ 
+   COAL_COMPILER_DIAGNOSTIC_POP
+ 
+--- a/include/coal/internal/traversal_recurse.h
++++ b/include/coal/internal/traversal_recurse.h
+@@ -47,31 +47,315 @@
+ 
+ namespace coal {
+ 
++/// @brief Bounding volume test structure
++struct COAL_LOCAL BVT {
++  /// @brief distance between bvs
++  Scalar d;
++
++  /// @brief bv indices for a pair of bvs in two models
++  unsigned int b1, b2;
++};
++
++/// @brief Comparer between two BVT
++struct COAL_LOCAL BVT_Comparer {
++  bool operator()(const BVT& lhs, const BVT& rhs) const {
++    return lhs.d > rhs.d;
++  }
++};
++
++struct COAL_LOCAL BVTQ {
++  BVTQ() : qsize(2) {}
++
++  bool empty() const { return pq.empty(); }
++
++  size_t size() const { return pq.size(); }
++
++  const BVT& top() const { return pq.top(); }
++
++  void push(const BVT& x) { pq.push(x); }
++
++  void pop() { pq.pop(); }
++
++  bool full() const { return (pq.size() + 1 >= qsize); }
++
++  std::priority_queue<BVT, std::vector<BVT>, BVT_Comparer> pq;
++
++  /// @brief Queue size
++  unsigned int qsize;
++};
++
+ /// Recurse function for collision
+ /// @param node collision node,
+ /// @param b1, b2 ids of bounding volume nodes for object 1 and object 2
+ /// @retval sqrDistLowerBound squared lower bound on distance between objects.
+-void collisionRecurse(CollisionTraversalNodeBase* node, unsigned int b1,
+-                      unsigned int b2, BVHFrontList* front_list,
+-                      Scalar& sqrDistLowerBound);
++template <typename Node>
++void collisionRecurse(Node* node, unsigned int b1, unsigned int b2,
++                      BVHFrontList* front_list, Scalar& sqrDistLowerBound) {
++  Scalar sqrDistLowerBound1 = 0, sqrDistLowerBound2 = 0;
++  bool l1 = node->isFirstNodeLeaf(b1);
++  bool l2 = node->isSecondNodeLeaf(b2);
++  if (l1 && l2) {
++    updateFrontList(front_list, b1, b2);
+ 
+-void collisionNonRecurse(CollisionTraversalNodeBase* node,
+-                         BVHFrontList* front_list, Scalar& sqrDistLowerBound);
++    node->leafCollides(b1, b2, sqrDistLowerBound);
++    return;
++  }
+ 
+-/// @brief Recurse function for distance
+-void distanceRecurse(DistanceTraversalNodeBase* node, unsigned int b1,
+-                     unsigned int b2, BVHFrontList* front_list);
++  if (node->BVDisjoints(b1, b2, sqrDistLowerBound)) {
++    updateFrontList(front_list, b1, b2);
++    return;
++  }
++  if (node->firstOverSecond(b1, b2)) {
++    unsigned int c1 = (unsigned int)node->getFirstLeftChild(b1);
++    unsigned int c2 = (unsigned int)node->getFirstRightChild(b1);
+ 
+-/// @brief Recurse function for distance, using queue acceleration
+-void distanceQueueRecurse(DistanceTraversalNodeBase* node, unsigned int b1,
+-                          unsigned int b2, BVHFrontList* front_list,
+-                          unsigned int qsize);
++    collisionRecurse<Node>(node, c1, b2, front_list, sqrDistLowerBound1);
++
++    // early stop is disabled is front_list is used
++    if (node->canStop() && !front_list) return;
++
++    collisionRecurse<Node>(node, c2, b2, front_list, sqrDistLowerBound2);
++    sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
++  } else {
++    unsigned int c1 = (unsigned int)node->getSecondLeftChild(b2);
++    unsigned int c2 = (unsigned int)node->getSecondRightChild(b2);
++
++    collisionRecurse<Node>(node, b1, c1, front_list, sqrDistLowerBound1);
++
++    // early stop is disabled is front_list is used
++    if (node->canStop() && !front_list) return;
++
++    collisionRecurse<Node>(node, b1, c2, front_list, sqrDistLowerBound2);
++    sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
++  }
++}
++
++template <typename Node>
++void collisionNonRecurse(Node* node, BVHFrontList* front_list,
++                         Scalar& sqrDistLowerBound) {
++  typedef std::pair<unsigned int, unsigned int> BVPair_t;
++  typedef std::vector<BVPair_t> Stack_t;
++
++  Stack_t pairs;
++  pairs.reserve(1000);
++  sqrDistLowerBound = std::numeric_limits<Scalar>::infinity();
++  Scalar sdlb = std::numeric_limits<Scalar>::infinity();
++
++  pairs.push_back(BVPair_t(0, 0));
++
++  while (!pairs.empty()) {
++    unsigned int a = pairs.back().first, b = pairs.back().second;
++    pairs.pop_back();
++
++    bool la = node->isFirstNodeLeaf(a);
++    bool lb = node->isSecondNodeLeaf(b);
++
++    // Leaf / Leaf case
++    if (la && lb) {
++      updateFrontList(front_list, a, b);
++
++      node->leafCollides(a, b, sdlb);
++      if (sdlb < sqrDistLowerBound) sqrDistLowerBound = sdlb;
++      if (node->canStop() && !front_list) return;
++      continue;
++    }
++
++    // Check the BV
++    if (node->BVDisjoints(a, b, sdlb)) {
++      if (sdlb < sqrDistLowerBound) sqrDistLowerBound = sdlb;
++      updateFrontList(front_list, a, b);
++      continue;
++    }
++
++    if (node->firstOverSecond(a, b)) {
++      unsigned int c1 = (unsigned int)node->getFirstLeftChild(a);
++      unsigned int c2 = (unsigned int)node->getFirstRightChild(a);
++      pairs.push_back(BVPair_t(c2, b));
++      pairs.push_back(BVPair_t(c1, b));
++    } else {
++      unsigned int c1 = (unsigned int)node->getSecondLeftChild(b);
++      unsigned int c2 = (unsigned int)node->getSecondRightChild(b);
++      pairs.push_back(BVPair_t(a, c2));
++      pairs.push_back(BVPair_t(a, c1));
++    }
++  }
++}
+ 
+ /// @brief Recurse function for front list propagation
+-void propagateBVHFrontListCollisionRecurse(CollisionTraversalNodeBase* node,
+-                                           const CollisionRequest& request,
++template <typename Node>
++void propagateBVHFrontListCollisionRecurse(Node* node,
++                                           const CollisionRequest& /*request*/,
+                                            CollisionResult& result,
+-                                           BVHFrontList* front_list);
++                                           BVHFrontList* front_list) {
++  Scalar sqrDistLowerBound = -1, sqrDistLowerBound1 = 0, sqrDistLowerBound2 = 0;
++  BVHFrontList::iterator front_iter;
++  BVHFrontList append;
++  for (front_iter = front_list->begin(); front_iter != front_list->end();
++       ++front_iter) {
++    unsigned int b1 = front_iter->left;
++    unsigned int b2 = front_iter->right;
++    bool l1 = node->isFirstNodeLeaf(b1);
++    bool l2 = node->isSecondNodeLeaf(b2);
++
++    if (l1 & l2) {
++      front_iter->valid = false;
++      collisionRecurse<Node>(node, b1, b2, &append, sqrDistLowerBound);
++    } else {
++      if (!node->BVDisjoints(b1, b2, sqrDistLowerBound)) {
++        front_iter->valid = false;
++        if (node->firstOverSecond(b1, b2)) {
++          unsigned int c1 = (unsigned int)node->getFirstLeftChild(b1);
++          unsigned int c2 = (unsigned int)node->getFirstRightChild(b1);
++
++          collisionRecurse<Node>(node, c1, b2, front_list, sqrDistLowerBound1);
++          collisionRecurse<Node>(node, c2, b2, front_list, sqrDistLowerBound2);
++          sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
++        } else {
++          unsigned int c1 = (unsigned int)node->getSecondLeftChild(b2);
++          unsigned int c2 = (unsigned int)node->getSecondRightChild(b2);
++
++          collisionRecurse<Node>(node, b1, c1, front_list, sqrDistLowerBound1);
++          collisionRecurse<Node>(node, b1, c2, front_list, sqrDistLowerBound2);
++          sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
++        }
++      }
++    }
++    result.updateDistanceLowerBound(sqrt(sqrDistLowerBound));
++  }
++
++  // clean the old front list (remove invalid node)
++  for (front_iter = front_list->begin(); front_iter != front_list->end();) {
++    if (!front_iter->valid)
++      front_iter = front_list->erase(front_iter);
++    else
++      ++front_iter;
++  }
++
++  for (front_iter = append.begin(); front_iter != append.end(); ++front_iter) {
++    front_list->push_back(*front_iter);
++  }
++}
++
++/// @brief Recurse function for distance
++template <typename Node>
++void distanceRecurse(Node* node, unsigned int b1, unsigned int b2,
++                     BVHFrontList* front_list) {
++  bool l1 = node->isFirstNodeLeaf(b1);
++  bool l2 = node->isSecondNodeLeaf(b2);
++
++  if (l1 && l2) {
++    updateFrontList(front_list, b1, b2);
++
++    node->leafComputeDistance(b1, b2);
++    return;
++  }
++
++  unsigned int a1, a2, c1, c2;
++
++  if (node->firstOverSecond(b1, b2)) {
++    a1 = (unsigned int)node->getFirstLeftChild(b1);
++    a2 = b2;
++    c1 = (unsigned int)node->getFirstRightChild(b1);
++    c2 = b2;
++  } else {
++    a1 = b1;
++    a2 = (unsigned int)node->getSecondLeftChild(b2);
++    c1 = b1;
++    c2 = (unsigned int)node->getSecondRightChild(b2);
++  }
++
++  Scalar d1 = node->BVDistanceLowerBound(a1, a2);
++  Scalar d2 = node->BVDistanceLowerBound(c1, c2);
++
++  if (d2 < d1) {
++    if (!node->canStop(d2))
++      distanceRecurse<Node>(node, c1, c2, front_list);
++    else
++      updateFrontList(front_list, c1, c2);
++
++    if (!node->canStop(d1))
++      distanceRecurse<Node>(node, a1, a2, front_list);
++    else
++      updateFrontList(front_list, a1, a2);
++  } else {
++    if (!node->canStop(d1))
++      distanceRecurse<Node>(node, a1, a2, front_list);
++    else
++      updateFrontList(front_list, a1, a2);
++
++    if (!node->canStop(d2))
++      distanceRecurse<Node>(node, c1, c2, front_list);
++    else
++      updateFrontList(front_list, c1, c2);
++  }
++}
++
++/// @brief Recurse function for distance, using queue acceleration
++template <typename Node>
++void distanceQueueRecurse(Node* node, unsigned int b1, unsigned int b2,
++                          BVHFrontList* front_list, unsigned int qsize) {
++  BVTQ bvtq;
++  bvtq.qsize = qsize;
++
++  BVT min_test;
++  min_test.b1 = b1;
++  min_test.b2 = b2;
++
++  while (1) {
++    bool l1 = node->isFirstNodeLeaf(min_test.b1);
++    bool l2 = node->isSecondNodeLeaf(min_test.b2);
++
++    if (l1 && l2) {
++      updateFrontList(front_list, min_test.b1, min_test.b2);
++
++      node->leafComputeDistance(min_test.b1, min_test.b2);
++    } else if (bvtq.full()) {
++      // queue should not get two more tests, recur
++      distanceQueueRecurse<Node>(node, min_test.b1, min_test.b2, front_list,
++                                 qsize);
++    } else {
++      // queue capacity is not full yet
++      BVT bvt1, bvt2;
++
++      if (node->firstOverSecond(min_test.b1, min_test.b2)) {
++        unsigned int c1 = (unsigned int)node->getFirstLeftChild(min_test.b1);
++        unsigned int c2 = (unsigned int)node->getFirstRightChild(min_test.b1);
++        bvt1.b1 = c1;
++        bvt1.b2 = min_test.b2;
++        bvt1.d = node->BVDistanceLowerBound(bvt1.b1, bvt1.b2);
++
++        bvt2.b1 = c2;
++        bvt2.b2 = min_test.b2;
++        bvt2.d = node->BVDistanceLowerBound(bvt2.b1, bvt2.b2);
++      } else {
++        unsigned int c1 = (unsigned int)node->getSecondLeftChild(min_test.b2);
++        unsigned int c2 = (unsigned int)node->getSecondRightChild(min_test.b2);
++        bvt1.b1 = min_test.b1;
++        bvt1.b2 = c1;
++        bvt1.d = node->BVDistanceLowerBound(bvt1.b1, bvt1.b2);
++
++        bvt2.b1 = min_test.b1;
++        bvt2.b2 = c2;
++        bvt2.d = node->BVDistanceLowerBound(bvt2.b1, bvt2.b2);
++      }
++
++      bvtq.push(bvt1);
++      bvtq.push(bvt2);
++    }
++
++    if (bvtq.empty())
++      break;
++    else {
++      min_test = bvtq.top();
++      bvtq.pop();
++
++      if (node->canStop(min_test.d)) {
++        updateFrontList(front_list, min_test.b1, min_test.b2);
++        break;
++      }
++    }
++  }
++}
+ 
+ }  // namespace coal
+ 
+--- a/include/coal/narrowphase/narrowphase.h
++++ b/include/coal/narrowphase/narrowphase.h
+@@ -372,6 +372,73 @@
+     return distance;
+   }
+ 
++  /// @brief Specialization of `shapeDistance` for the case where both shapes
++  /// are triangles. It is more efficient to pre-compute the relative
++  /// transformation between the two shapes before calling GJK/EPA.
++  Scalar shapeDistance(const TriangleP& s1, const Transform3s& tf1,
++                       const TriangleP& s2, const Transform3s& tf2,
++                       const bool /*compute_penetration*/, Vec3s& p1, Vec3s& p2,
++                       Vec3s& normal) const {
++    // Transform the triangles in world frame
++    const TriangleP t1(tf1.transform(s1.a), tf1.transform(s1.b),
++                       tf1.transform(s1.c));
++
++    const TriangleP t2(tf2.transform(s2.a), tf2.transform(s2.b),
++                       tf2.transform(s2.c));
++
++    // Reset GJK algorithm
++    //   We don't need to take into account swept-sphere radius in GJK
++    //   iterations; the result will be corrected after GJK terminates.
++    this->minkowski_difference
++        .set<::coal::details::SupportOptions::NoSweptSphere>(&t1, &t2);
++    this->gjk.reset(this->gjk_max_iterations, this->gjk_tolerance);
++
++    // Get GJK initial guess
++    Vec3s guess;
++    if (this->gjk_initial_guess == GJKInitialGuess::CachedGuess ||
++        this->enable_cached_guess) {
++      guess = this->cached_guess;
++    } else {
++      guess = (t1.a + t1.b + t1.c - t2.a - t2.b - t2.c) / 3;
++    }
++    support_func_guess_t support_hint;
++    this->epa.status =
++        details::EPA::DidNotRun;  // EPA is never called in this function
++
++    Vec3ps guess_ = guess.cast<SolverScalar>();
++    details::GJK::Status gjk_status =
++        this->gjk.evaluate(this->minkowski_difference, guess_, support_hint);
++
++    this->cached_guess = this->gjk.getGuessFromSimplex().cast<Scalar>();
++    this->support_func_cached_guess = this->gjk.support_hint;
++
++    // Retrieve witness points and normal
++    Vec3ps p1_, p2_, normal_;
++    this->gjk.getWitnessPointsAndNormal(this->minkowski_difference, p1_, p2_,
++                                        normal_);
++    p1 = p1_.cast<Scalar>();
++    p2 = p2_.cast<Scalar>();
++    normal = normal_.cast<Scalar>();
++    Scalar distance = Scalar(this->gjk.distance);
++
++    if (gjk_status == details::GJK::Collision) {
++      Vec3s u((t1.b - t1.a).cross(t1.c - t1.a));
++      normal = u.normalized();
++      Scalar depth1((t1.a - t2.a).dot(normal));
++      Scalar depth2((t1.a - t2.b).dot(normal));
++      Scalar depth3((t1.a - t2.c).dot(normal));
++      distance = -std::max(depth1, std::max(depth2, depth3));
++    } else {
++      // No collision
++      // TODO On degenerated case, the closest point may be wrong
++      // (i.e. an object face normal is colinear to gjk.ray
++      // assert (dist == (w0 - w1).norm());
++      assert(this->gjk.ray.norm() > this->gjk.getTolerance());
++    }
++
++    return distance;
++  }
++
+  protected:
+   /// @brief initialize GJK.
+   /// This method assumes `minkowski_difference` has been set.
+--- a/include/coal/serialization/collision_data.h
++++ b/include/coal/serialization/collision_data.h
+@@ -81,11 +81,8 @@
+                            collision_request));
+   ar& make_nvp("num_max_contacts", collision_request.num_max_contacts);
+   ar& make_nvp("enable_contact", collision_request.enable_contact);
+-  COAL_COMPILER_DIAGNOSTIC_PUSH
+-  COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
+   ar& make_nvp("enable_distance_lower_bound",
+                collision_request.enable_distance_lower_bound);
+-  COAL_COMPILER_DIAGNOSTIC_POP
+   ar& make_nvp("security_margin", collision_request.security_margin);
+   ar& make_nvp("break_distance", collision_request.break_distance);
+   ar& make_nvp("distance_upper_bound", collision_request.distance_upper_bound);
+--- a/src/BV/OBB.cpp
++++ b/src/BV/OBB.cpp
+@@ -361,13 +361,44 @@
+                     .array()
+                     .max(Scalar(0)));
+ 
+-  // Corner of b axis aligned bounding box the closest to the origin
+-  squaredLowerBoundDistance = internal::obbDisjoint_check_A_axis(T, a, b, Bf);
+-  if (squaredLowerBoundDistance > breakDistance2) return true;
+-
+-  squaredLowerBoundDistance =
+-      internal::obbDisjoint_check_B_axis(B, T, a, b, Bf);
+-  if (squaredLowerBoundDistance > breakDistance2) return true;
++  if (request.enable_distance_lower_bound) {
++    // request explicitly asks for a lower bound on the distance, so we compute
++    // it as tight as possible
++
++    // Corner of b axis aligned bounding box the closest to the origin
++    squaredLowerBoundDistance = internal::obbDisjoint_check_A_axis(T, a, b, Bf);
++    if (squaredLowerBoundDistance > breakDistance2) return true;
++
++    squaredLowerBoundDistance =
++        internal::obbDisjoint_check_B_axis(B, T, a, b, Bf);
++    if (squaredLowerBoundDistance > breakDistance2) return true;
++  } else {
++    // request does not explicitly ask for a lower bound on the distance, so we
++    // compute a lower bound that is not necessarily tight. this allows for
++    // early exit
++
++    // A-axis group: face normals of OBB1. Per-axis with accumulation and early
++    // exit. Valid lower bound because A[0..2] are orthonormal.
++    squaredLowerBoundDistance = 0;
++    for (int i = 0; i < 3; ++i) {
++      const Scalar gap = std::abs(T[i]) - a[i] - Bf.row(i).dot(b);
++      if (gap > 0) {
++        squaredLowerBoundDistance += gap * gap;
++        if (squaredLowerBoundDistance > breakDistance2) return true;
++      }
++    }
++
++    // B-axis group: face normals of OBB2. Per-axis with accumulation and early
++    // exit. Valid lower bound because B[0..2] are orthonormal.
++    squaredLowerBoundDistance = 0;
++    for (int i = 0; i < 3; ++i) {
++      const Scalar gap = std::abs(B.col(i).dot(T)) - Bf.col(i).dot(a) - b[i];
++      if (gap > 0) {
++        squaredLowerBoundDistance += gap * gap;
++        if (squaredLowerBoundDistance > breakDistance2) return true;
++      }
++    }
++  }
+ 
+   // Ai x Bj
+   int ja = 1, ka = 2;
+@@ -479,6 +510,19 @@
+ 
+   return !obbDisjointAndLowerBoundDistance(R, T, b1.extent, b2.extent, request,
+                                            sqrDistLowerBound);
++}
++
++bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                  const Vec3s& inv_T0, const OBB& b1,
++                                  const OBB& b2,
++                                  const CollisionRequest& request,
++                                  Scalar& sqrDistLowerBound) {
++  Vec3s Ttemp(R0_transpose * b2.To + inv_T0 - b1.To);
++  Vec3s T(b1.axes.transpose() * Ttemp);
++  Matrix3s R(b1.axes.transpose() * R0_transpose * b2.axes);
++
++  return !obbDisjointAndLowerBoundDistance(R, T, b1.extent, b2.extent, request,
++                                           sqrDistLowerBound);
+ }
+ 
+ OBB translate(const OBB& bv, const Vec3s& t) {
+--- a/src/BV/RSS.cpp
++++ b/src/BV/RSS.cpp
+@@ -757,6 +757,22 @@
+   return false;
+ }
+ 
++bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                  const Vec3s& inv_T0, const RSS& b1,
++                                  const RSS& b2,
++                                  const CollisionRequest& request,
++                                  Scalar& sqrDistLowerBound) {
++  Vec3s Ttemp(R0_transpose * b2.Tr + inv_T0 - b1.Tr);
++  Vec3s T(b1.axes.transpose() * Ttemp);
++  Matrix3s R(b1.axes.transpose() * R0_transpose * b2.axes);
++
++  Scalar dist = rectDistance(R, T, b1.length, b2.length) - b1.radius -
++                b2.radius - request.security_margin;
++  if (dist <= 0) return true;
++  sqrDistLowerBound = dist * dist;
++  return false;
++}
++
+ bool RSS::contain(const Vec3s& p) const {
+   Vec3s local_p = p - Tr;
+   // FIXME: Vec3s proj (axes.transpose() * local_p);
+--- a/src/BV/kIOS.cpp
++++ b/src/BV/kIOS.cpp
+@@ -177,6 +177,23 @@
+   return b1.overlap(b2_temp, request, sqrDistLowerBound);
+ }
+ 
++bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
++                                  const Vec3s& inv_T0, const kIOS& b1,
++                                  const kIOS& b2,
++                                  const CollisionRequest& request,
++                                  Scalar& sqrDistLowerBound) {
++  kIOS b2_temp = b2;
++  for (unsigned int i = 0; i < b2_temp.num_spheres; ++i) {
++    b2_temp.spheres[i].o.noalias() =
++        R0_transpose * b2_temp.spheres[i].o + inv_T0;
++  }
++
++  b2_temp.obb.To.noalias() = R0_transpose * b2_temp.obb.To + inv_T0;
++  b2_temp.obb.axes.applyOnTheLeft(R0_transpose);
++
++  return b1.overlap(b2_temp, request, sqrDistLowerBound);
++}
++
+ Scalar distance(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,
+                 const kIOS& b2, Vec3s* P, Vec3s* Q) {
+   kIOS b2_temp = b2;
+--- a/src/collision_node.cpp
++++ b/src/collision_node.cpp
+@@ -35,56 +35,5 @@
+ 
+ /** \author Jia Pan */
+ 
+-#include <../src/collision_node.h>
+-#include "coal/internal/traversal_recurse.h"
+-
+-namespace coal {
+-
+-void checkResultLowerBound(const CollisionResult& result,
+-                           Scalar sqrDistLowerBound) {
+-  COAL_UNUSED_VARIABLE(result);
+-  const Scalar dummy_precision = std::sqrt(Eigen::NumTraits<Scalar>::epsilon());
+-  COAL_UNUSED_VARIABLE(dummy_precision);
+-  if (sqrDistLowerBound == 0) {
+-    COAL_ASSERT(result.distance_lower_bound <= dummy_precision,
+-                "Distance lower bound should not be positive.",
+-                std::logic_error);
+-  } else {
+-    COAL_ASSERT(result.distance_lower_bound * result.distance_lower_bound -
+-                        sqrDistLowerBound <
+-                    dummy_precision,
+-                "Distance lower bound and sqrDistLowerBound should coincide.",
+-                std::logic_error);
+-  }
+-}
+-
+-void collide(CollisionTraversalNodeBase* node, const CollisionRequest& request,
+-             CollisionResult& result, BVHFrontList* front_list,
+-             bool recursive) {
+-  if (front_list && front_list->size() > 0) {
+-    propagateBVHFrontListCollisionRecurse(node, request, result, front_list);
+-  } else {
+-    Scalar sqrDistLowerBound = 0;
+-    if (recursive)
+-      collisionRecurse(node, 0, 0, front_list, sqrDistLowerBound);
+-    else
+-      collisionNonRecurse(node, front_list, sqrDistLowerBound);
+-    if (!std::isnan(sqrDistLowerBound)) {
+-      checkResultLowerBound(result, sqrDistLowerBound);
+-    }
+-  }
+-}
+-
+-void distance(DistanceTraversalNodeBase* node, BVHFrontList* front_list,
+-              unsigned int qsize) {
+-  node->preprocess();
+-
+-  if (qsize <= 2)
+-    distanceRecurse(node, 0, 0, front_list);
+-  else
+-    distanceQueueRecurse(node, 0, 0, front_list, qsize);
+-
+-  node->postprocess();
+-}
+-
+-}  // namespace coal
++// collide() and distance() are now inline templates in collision_node.h.
++// This file is intentionally empty.
+--- a/src/collision_node.h
++++ b/src/collision_node.h
+@@ -40,15 +40,36 @@
+ 
+ /// @cond INTERNAL
+ 
++#include <cmath>
++
+ #include "coal/BVH/BVH_front.h"
+ #include "coal/internal/traversal_node_base.h"
+ #include "coal/internal/traversal_node_bvhs.h"
++#include "coal/internal/traversal_recurse.h"
+ 
+ /// @brief collision and distance function on traversal nodes. these functions
+ /// provide a higher level abstraction for collision functions provided in
+ /// collision_func_matrix
+ namespace coal {
+ 
++inline void checkResultLowerBound(const CollisionResult& result,
++                                  Scalar sqrDistLowerBound) {
++  COAL_UNUSED_VARIABLE(result);
++  const Scalar dummy_precision = std::sqrt(Eigen::NumTraits<Scalar>::epsilon());
++  COAL_UNUSED_VARIABLE(dummy_precision);
++  if (sqrDistLowerBound == 0) {
++    COAL_ASSERT(result.distance_lower_bound <= dummy_precision,
++                "Distance lower bound should not be positive.",
++                std::logic_error);
++  } else {
++    COAL_ASSERT(result.distance_lower_bound * result.distance_lower_bound -
++                        sqrDistLowerBound <
++                    dummy_precision,
++                "Distance lower bound and sqrDistLowerBound should coincide.",
++                std::logic_error);
++  }
++}
++
+ /// collision on collision traversal node
+ ///
+ /// @param node node containing both objects to test,
+@@ -57,17 +78,36 @@
+ /// @param front_list list of nodes visited by the query, can be used to
+ ///        accelerate computation
+ /// \todo should be COAL_LOCAL but used in unit test.
+-COAL_DLLAPI void collide(CollisionTraversalNodeBase* node,
+-                         const CollisionRequest& request,
+-                         CollisionResult& result,
+-                         BVHFrontList* front_list = NULL,
+-                         bool recursive = true);
++template <typename Node>
++inline void collide(Node* node, const CollisionRequest& request,
++                    CollisionResult& result, BVHFrontList* front_list = nullptr,
++                    bool recursive = true) {
++  if (front_list && front_list->size() > 0) {
++    propagateBVHFrontListCollisionRecurse(node, request, result, front_list);
++  } else {
++    Scalar sqrDistLowerBound = 0;
++    if (recursive)
++      collisionRecurse(node, 0, 0, front_list, sqrDistLowerBound);
++    else
++      collisionNonRecurse(node, front_list, sqrDistLowerBound);
++    if (!std::isnan(sqrDistLowerBound))
++      checkResultLowerBound(result, sqrDistLowerBound);
++  }
++}
+ 
+ /// @brief distance computation on distance traversal node; can use front list
+ /// to accelerate \todo should be COAL_LOCAL but used in unit test.
+-COAL_DLLAPI void distance(DistanceTraversalNodeBase* node,
+-                          BVHFrontList* front_list = NULL,
+-                          unsigned int qsize = 2);
++template <typename Node>
++inline void distance(Node* node, BVHFrontList* front_list = nullptr,
++                     unsigned int qsize = 2) {
++  node->preprocess();
++  if (qsize <= 2)
++    distanceRecurse(node, 0, 0, front_list);
++  else
++    distanceQueueRecurse(node, 0, 0, front_list, qsize);
++  node->postprocess();
++}
++
+ }  // namespace coal
+ 
+ /// @endcond
+--- a/src/distance/triangle_triangle.cpp
++++ b/src/distance/triangle_triangle.cpp
+@@ -36,6 +36,7 @@
+ 
+ #include "coal/shape/geometric_shapes.h"
+ 
++#include "coal/internal/intersect.h"
+ #include "coal/internal/shape_shape_func.h"
+ #include "../narrowphase/details.h"
+ 
+@@ -48,10 +49,10 @@
+ Scalar ShapeShapeDistance<TriangleP, TriangleP>(
+     const CollisionGeometry* o1, const Transform3s& tf1,
+     const CollisionGeometry* o2, const Transform3s& tf2,
+-    const GJKSolver* solver, const bool, Vec3s& p1, Vec3s& p2, Vec3s& normal) {
++    const GJKSolver* /*solver*/, const bool /*compute_signed_distance*/,
++    Vec3s& p1, Vec3s& p2, Vec3s& normal) {
+   COAL_TRACY_ZONE_SCOPED_N(
+       "coal::internal::ShapeShapeDistance<TriangleP, TriangleP>");
+-  // Transform the triangles in world frame
+   const TriangleP& s1 = static_cast<const TriangleP&>(*o1);
+   const TriangleP t1(tf1.transform(s1.a), tf1.transform(s1.b),
+                      tf1.transform(s1.c));
+@@ -60,56 +61,19 @@
+   const TriangleP t2(tf2.transform(s2.a), tf2.transform(s2.b),
+                      tf2.transform(s2.c));
+ 
+-  // Reset GJK algorithm
+-  //   We don't need to take into account swept-sphere radius in GJK iterations;
+-  //   the result will be corrected after GJK terminates.
+-  solver->minkowski_difference
+-      .set<::coal::details::SupportOptions::NoSweptSphere>(&t1, &t2);
+-  solver->gjk.reset(solver->gjk_max_iterations, solver->gjk_tolerance);
+-
+-  // Get GJK initial guess
+-  Vec3s guess;
+-  if (solver->gjk_initial_guess == GJKInitialGuess::CachedGuess ||
+-      solver->enable_cached_guess) {
+-    guess = solver->cached_guess;
+-  } else {
+-    guess = (t1.a + t1.b + t1.c - t2.a - t2.b - t2.c) / 3;
+-  }
+-  support_func_guess_t support_hint;
+-  solver->epa.status =
+-      details::EPA::DidNotRun;  // EPA is never called in this function
+-
+-  Vec3ps guess_ = guess.cast<SolverScalar>();
+-  details::GJK::Status gjk_status =
+-      solver->gjk.evaluate(solver->minkowski_difference, guess_, support_hint);
+-
+-  solver->cached_guess = solver->gjk.getGuessFromSimplex().cast<Scalar>();
+-  solver->support_func_cached_guess = solver->gjk.support_hint;
+-
+-  // Retrieve witness points and normal
+-  Vec3ps p1_, p2_, normal_;
+-  solver->gjk.getWitnessPointsAndNormal(solver->minkowski_difference, p1_, p2_,
+-                                        normal_);
+-  p1 = p1_.cast<Scalar>();
+-  p2 = p2_.cast<Scalar>();
+-  normal = normal_.cast<Scalar>();
+-  Scalar distance = Scalar(solver->gjk.distance);
+-
+-  if (gjk_status == details::GJK::Collision) {
+-    Scalar penetrationDepth =
+-        details::computePenetration(t1.a, t1.b, t1.c, t2.a, t2.b, t2.c, normal);
+-    distance = -penetrationDepth;
+-  } else {
+-    // No collision
+-    // TODO On degenerated case, the closest point may be wrong
+-    // (i.e. an object face normal is colinear to gjk.ray
+-    // assert (dist == (w0 - w1).norm());
+-    assert(solver->gjk.ray.norm() > solver->gjk.getTolerance());
++  const Scalar d2 = TriangleDistance::sqrTriDistance(t1.a, t1.b, t1.c, t2.a,
++                                                     t2.b, t2.c, p1, p2);
++
++  if (d2 > 0) {
++    const Scalar d = sqrt(d2);
++    normal = (p2 - p1) / d;
++    return d;
+   }
+-  // assert(false && "should not reach this point");
+-  // return false;
+ 
+-  return distance;
++  Scalar signed_distance;
++  internal::computeTriangleTriangleContact(t1.a, t1.b, t1.c, t2.a, t2.b, t2.c,
++                                           signed_distance, p1, p2, normal);
++  return signed_distance;
+ }
+ }  // namespace internal
+ 
+--- a/src/traversal/traversal_recurse.cpp
++++ b/src/traversal/traversal_recurse.cpp
+@@ -35,326 +35,6 @@
+ 
+ /** \author Jia Pan */
+ 
+-#include "coal/internal/traversal_recurse.h"
+-
+-#include <vector>
+-
+-namespace coal {
+-void collisionRecurse(CollisionTraversalNodeBase* node, unsigned int b1,
+-                      unsigned int b2, BVHFrontList* front_list,
+-                      Scalar& sqrDistLowerBound) {
+-  Scalar sqrDistLowerBound1 = 0, sqrDistLowerBound2 = 0;
+-  bool l1 = node->isFirstNodeLeaf(b1);
+-  bool l2 = node->isSecondNodeLeaf(b2);
+-  if (l1 && l2) {
+-    updateFrontList(front_list, b1, b2);
+-
+-    // if(node->BVDisjoints(b1, b2, sqrDistLowerBound)) return;
+-    node->leafCollides(b1, b2, sqrDistLowerBound);
+-    return;
+-  }
+-
+-  if (node->BVDisjoints(b1, b2, sqrDistLowerBound)) {
+-    updateFrontList(front_list, b1, b2);
+-    return;
+-  }
+-  if (node->firstOverSecond(b1, b2)) {
+-    unsigned int c1 = (unsigned int)node->getFirstLeftChild(b1);
+-    unsigned int c2 = (unsigned int)node->getFirstRightChild(b1);
+-
+-    collisionRecurse(node, c1, b2, front_list, sqrDistLowerBound1);
+-
+-    // early stop is disabled is front_list is used
+-    if (node->canStop() && !front_list) return;
+-
+-    collisionRecurse(node, c2, b2, front_list, sqrDistLowerBound2);
+-    sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
+-  } else {
+-    unsigned int c1 = (unsigned int)node->getSecondLeftChild(b2);
+-    unsigned int c2 = (unsigned int)node->getSecondRightChild(b2);
+-
+-    collisionRecurse(node, b1, c1, front_list, sqrDistLowerBound1);
+-
+-    // early stop is disabled is front_list is used
+-    if (node->canStop() && !front_list) return;
+-
+-    collisionRecurse(node, b1, c2, front_list, sqrDistLowerBound2);
+-    sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
+-  }
+-}
+-
+-void collisionNonRecurse(CollisionTraversalNodeBase* node,
+-                         BVHFrontList* front_list, Scalar& sqrDistLowerBound) {
+-  typedef std::pair<unsigned int, unsigned int> BVPair_t;
+-  // typedef std::stack<BVPair_t, std::vector<BVPair_t> > Stack_t;
+-  typedef std::vector<BVPair_t> Stack_t;
+-
+-  Stack_t pairs;
+-  pairs.reserve(1000);
+-  sqrDistLowerBound = std::numeric_limits<Scalar>::infinity();
+-  Scalar sdlb = std::numeric_limits<Scalar>::infinity();
+-
+-  pairs.push_back(BVPair_t(0, 0));
+-
+-  while (!pairs.empty()) {
+-    unsigned int a = pairs.back().first, b = pairs.back().second;
+-    pairs.pop_back();
+-
+-    bool la = node->isFirstNodeLeaf(a);
+-    bool lb = node->isSecondNodeLeaf(b);
+-
+-    // Leaf / Leaf case
+-    if (la && lb) {
+-      updateFrontList(front_list, a, b);
+-
+-      // TODO should we test the BVs ?
+-      // if(node->BVDijsoints(a, b, sdlb)) {
+-      // if (sdlb < sqrDistLowerBound) sqrDistLowerBound = sdlb;
+-      // continue;
+-      //}
+-      node->leafCollides(a, b, sdlb);
+-      if (sdlb < sqrDistLowerBound) sqrDistLowerBound = sdlb;
+-      if (node->canStop() && !front_list) return;
+-      continue;
+-    }
+-
+-    // TODO shouldn't we test the leaf triangle against BV is la != lb
+-    // if (la && !lb) { // leaf triangle 1 against BV 2
+-    // } else if (!la && lb) { // BV 1 against leaf triangle 2
+-    // }
+-
+-    // Check the BV
+-    if (node->BVDisjoints(a, b, sdlb)) {
+-      if (sdlb < sqrDistLowerBound) sqrDistLowerBound = sdlb;
+-      updateFrontList(front_list, a, b);
+-      continue;
+-    }
+-
+-    if (node->firstOverSecond(a, b)) {
+-      unsigned int c1 = (unsigned int)node->getFirstLeftChild(a);
+-      unsigned int c2 = (unsigned int)node->getFirstRightChild(a);
+-      pairs.push_back(BVPair_t(c2, b));
+-      pairs.push_back(BVPair_t(c1, b));
+-    } else {
+-      unsigned int c1 = (unsigned int)node->getSecondLeftChild(b);
+-      unsigned int c2 = (unsigned int)node->getSecondRightChild(b);
+-      pairs.push_back(BVPair_t(a, c2));
+-      pairs.push_back(BVPair_t(a, c1));
+-    }
+-  }
+-}
+-
+-/** Recurse function for self collision
+- * Make sure node is set correctly so that the first and second tree are the
+- * same
+- */
+-void distanceRecurse(DistanceTraversalNodeBase* node, unsigned int b1,
+-                     unsigned int b2, BVHFrontList* front_list) {
+-  bool l1 = node->isFirstNodeLeaf(b1);
+-  bool l2 = node->isSecondNodeLeaf(b2);
+-
+-  if (l1 && l2) {
+-    updateFrontList(front_list, b1, b2);
+-
+-    node->leafComputeDistance(b1, b2);
+-    return;
+-  }
+-
+-  unsigned int a1, a2, c1, c2;
+-
+-  if (node->firstOverSecond(b1, b2)) {
+-    a1 = (unsigned int)node->getFirstLeftChild(b1);
+-    a2 = b2;
+-    c1 = (unsigned int)node->getFirstRightChild(b1);
+-    c2 = b2;
+-  } else {
+-    a1 = b1;
+-    a2 = (unsigned int)node->getSecondLeftChild(b2);
+-    c1 = b1;
+-    c2 = (unsigned int)node->getSecondRightChild(b2);
+-  }
+-
+-  Scalar d1 = node->BVDistanceLowerBound(a1, a2);
+-  Scalar d2 = node->BVDistanceLowerBound(c1, c2);
+-
+-  if (d2 < d1) {
+-    if (!node->canStop(d2))
+-      distanceRecurse(node, c1, c2, front_list);
+-    else
+-      updateFrontList(front_list, c1, c2);
+-
+-    if (!node->canStop(d1))
+-      distanceRecurse(node, a1, a2, front_list);
+-    else
+-      updateFrontList(front_list, a1, a2);
+-  } else {
+-    if (!node->canStop(d1))
+-      distanceRecurse(node, a1, a2, front_list);
+-    else
+-      updateFrontList(front_list, a1, a2);
+-
+-    if (!node->canStop(d2))
+-      distanceRecurse(node, c1, c2, front_list);
+-    else
+-      updateFrontList(front_list, c1, c2);
+-  }
+-}
+-
+-/** @brief Bounding volume test structure */
+-struct COAL_LOCAL BVT {
+-  /** @brief distance between bvs */
+-  Scalar d;
+-
+-  /** @brief bv indices for a pair of bvs in two models */
+-  unsigned int b1, b2;
+-};
+-
+-/** @brief Comparer between two BVT */
+-struct COAL_LOCAL BVT_Comparer {
+-  bool operator()(const BVT& lhs, const BVT& rhs) const {
+-    return lhs.d > rhs.d;
+-  }  // namespace coal
+-};
+-
+-struct COAL_LOCAL BVTQ {
+-  BVTQ() : qsize(2) {}
+-
+-  bool empty() const { return pq.empty(); }
+-
+-  size_t size() const { return pq.size(); }
+-
+-  const BVT& top() const { return pq.top(); }
+-
+-  void push(const BVT& x) { pq.push(x); }
+-
+-  void pop() { pq.pop(); }
+-
+-  bool full() const { return (pq.size() + 1 >= qsize); }
+-
+-  std::priority_queue<BVT, std::vector<BVT>, BVT_Comparer> pq;
+-
+-  /** @brief Queue size */
+-  unsigned int qsize;
+-};
+-
+-void distanceQueueRecurse(DistanceTraversalNodeBase* node, unsigned int b1,
+-                          unsigned int b2, BVHFrontList* front_list,
+-                          unsigned int qsize) {
+-  BVTQ bvtq;
+-  bvtq.qsize = qsize;
+-
+-  BVT min_test;
+-  min_test.b1 = b1;
+-  min_test.b2 = b2;
+-
+-  while (1) {
+-    bool l1 = node->isFirstNodeLeaf(min_test.b1);
+-    bool l2 = node->isSecondNodeLeaf(min_test.b2);
+-
+-    if (l1 && l2) {
+-      updateFrontList(front_list, min_test.b1, min_test.b2);
+-
+-      node->leafComputeDistance(min_test.b1, min_test.b2);
+-    } else if (bvtq.full()) {
+-      // queue should not get two more tests, recur
+-
+-      distanceQueueRecurse(node, min_test.b1, min_test.b2, front_list, qsize);
+-    } else {
+-      // queue capacity is not full yet
+-      BVT bvt1, bvt2;
+-
+-      if (node->firstOverSecond(min_test.b1, min_test.b2)) {
+-        unsigned int c1 = (unsigned int)node->getFirstLeftChild(min_test.b1);
+-        unsigned int c2 = (unsigned int)node->getFirstRightChild(min_test.b1);
+-        bvt1.b1 = c1;
+-        bvt1.b2 = min_test.b2;
+-        bvt1.d = node->BVDistanceLowerBound(bvt1.b1, bvt1.b2);
+-
+-        bvt2.b1 = c2;
+-        bvt2.b2 = min_test.b2;
+-        bvt2.d = node->BVDistanceLowerBound(bvt2.b1, bvt2.b2);
+-      } else {
+-        unsigned int c1 = (unsigned int)node->getSecondLeftChild(min_test.b2);
+-        unsigned int c2 = (unsigned int)node->getSecondRightChild(min_test.b2);
+-        bvt1.b1 = min_test.b1;
+-        bvt1.b2 = c1;
+-        bvt1.d = node->BVDistanceLowerBound(bvt1.b1, bvt1.b2);
+-
+-        bvt2.b1 = min_test.b1;
+-        bvt2.b2 = c2;
+-        bvt2.d = node->BVDistanceLowerBound(bvt2.b1, bvt2.b2);
+-      }
+-
+-      bvtq.push(bvt1);
+-      bvtq.push(bvt2);
+-    }
+-
+-    if (bvtq.empty())
+-      break;
+-    else {
+-      min_test = bvtq.top();
+-      bvtq.pop();
+-
+-      if (node->canStop(min_test.d)) {
+-        updateFrontList(front_list, min_test.b1, min_test.b2);
+-        break;
+-      }
+-    }
+-  }
+-}
+-
+-void propagateBVHFrontListCollisionRecurse(CollisionTraversalNodeBase* node,
+-                                           const CollisionRequest& /*request*/,
+-                                           CollisionResult& result,
+-                                           BVHFrontList* front_list) {
+-  Scalar sqrDistLowerBound = -1, sqrDistLowerBound1 = 0, sqrDistLowerBound2 = 0;
+-  BVHFrontList::iterator front_iter;
+-  BVHFrontList append;
+-  for (front_iter = front_list->begin(); front_iter != front_list->end();
+-       ++front_iter) {
+-    unsigned int b1 = front_iter->left;
+-    unsigned int b2 = front_iter->right;
+-    bool l1 = node->isFirstNodeLeaf(b1);
+-    bool l2 = node->isSecondNodeLeaf(b2);
+-
+-    if (l1 & l2) {
+-      front_iter->valid = false;  // the front node is no longer valid, in
+-                                  // collideRecurse will add again.
+-      collisionRecurse(node, b1, b2, &append, sqrDistLowerBound);
+-    } else {
+-      if (!node->BVDisjoints(b1, b2, sqrDistLowerBound)) {
+-        front_iter->valid = false;
+-        if (node->firstOverSecond(b1, b2)) {
+-          unsigned int c1 = (unsigned int)node->getFirstLeftChild(b1);
+-          unsigned int c2 = (unsigned int)node->getFirstRightChild(b1);
+-
+-          collisionRecurse(node, c1, b2, front_list, sqrDistLowerBound1);
+-          collisionRecurse(node, c2, b2, front_list, sqrDistLowerBound2);
+-          sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
+-        } else {
+-          unsigned int c1 = (unsigned int)node->getSecondLeftChild(b2);
+-          unsigned int c2 = (unsigned int)node->getSecondRightChild(b2);
+-
+-          collisionRecurse(node, b1, c1, front_list, sqrDistLowerBound1);
+-          collisionRecurse(node, b1, c2, front_list, sqrDistLowerBound2);
+-          sqrDistLowerBound = std::min(sqrDistLowerBound1, sqrDistLowerBound2);
+-        }
+-      }
+-    }
+-    result.updateDistanceLowerBound(sqrt(sqrDistLowerBound));
+-  }
+-
+-  // clean the old front list (remove invalid node)
+-  for (front_iter = front_list->begin(); front_iter != front_list->end();) {
+-    if (!front_iter->valid)
+-      front_iter = front_list->erase(front_iter);
+-    else
+-      ++front_iter;
+-  }
+-
+-  for (front_iter = append.begin(); front_iter != append.end(); ++front_iter) {
+-    front_list->push_back(*front_iter);
+-  }
+-}
+-
+-}  // namespace coal
++// All traversal recurse functions are now inline templates in
++// include/coal/internal/traversal_recurse-inl.h.
++// This file is intentionally empty.

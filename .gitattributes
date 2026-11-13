@@ -1,0 +1,4 @@
+# LF everywhere, so files in Windows wheels (README, METADATA, SBOM) match
+* text=auto eol=lf
+# vendored upstream bytes and our patches to them are hashed in trimkit.toml: never convert them
+vendor/** -text

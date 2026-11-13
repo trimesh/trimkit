@@ -1,0 +1,4 @@
+# the dev image needs only the lock for its tools
+*
+!pyproject.toml
+!uv.lock

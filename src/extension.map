@@ -1,0 +1,3 @@
+/* What every Linux extension exports: its init function and nothing else,
+   so nothing leaks into the process (see EXPORTS in scripts/builder.py). */
+{ global: PyInit_*; local: *; };

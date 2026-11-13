@@ -1,0 +1,81 @@
+kind: perf
+upstream: earcut.js (github.com/mapbox/earcut) PR #212, merged 2026-10-06 as
+  2c222c7, not yet ported to earcut.hpp (github.com/mapbox/earcut.hpp, whose
+  master matched our pin on 2026-11-01). Drop this once the port lands.
+
+earcut.js dropped vertex skipping in its PR #195 and earcut.hpp followed: each
+ear now continues from `next`, so every ear of a convex run fans from one
+vertex, the triangles grow long and each hashed point check scans O(n) points,
+which is quadratic. earcut.js declined to restore skipping (its issue #211) and
+fixed it in #212 instead: a strictly convex ring has no vertex that could block
+an ear, so check convexity once and skip the point checks until a candidate
+fails. Every vertex of a strictly convex ring is an ear, so the cut order and
+the triangles are exactly pristine's. A verbatim port of #212.
+
+Measured 2026-11-01 in the trimkit-dev image (g++ 14.2 -O3, i7-12700K, one
+pinned core), best of 7, pristine 177bd66 vs this patch alone:
+  regular 40,000-gon              683 ms  ->   2.1 ms
+  regular 100,000-gon            5067 ms  ->  15.4 ms
+  comb, 2,500 teeth               0.7 ms  ->   1.0 ms  (sub-millisecond noise)
+  rings with holes                unchanged: a ring with holes is never convex
+Correctness: identical triangles to pristine on 2,150 random and 34 degenerate
+polygons (differential run, 2026-11-01).
+Covered by: tests/test_earcut.py::test_degenerate_rings (a 100,000-gon under a
+time bound), fuzz/earcut.cpp.
+
+--- a/include/mapbox/earcut.hpp
++++ b/include/mapbox/earcut.hpp
+@@ -107,6 +107,7 @@
+     void earcutLinked(Node* ear);
+     bool isEar(Node* ear);
+     bool isEarHashed(Node* ear);
++    bool isConvex(Node* start);
+     Node* cureLocalIntersections(Node* start);
+     void splitEarcut(Node* start);
+     template <typename Polygon>
+@@ -380,6 +381,10 @@
+     Node* prev;
+     Node* next;
+     bool cured = false;
++    // trimkit (vendor/patches/earcut-convex-ring.patch, a port of earcut.js PR #212):
++    // a strictly convex ring has no vertex that could block an ear, so skip the point checks until a candidate fails;
++    // without this, a big convex ring is cut as one fan of long triangles and each hashed check scans O(n) points
++    bool convex = hashing ? isConvex(ear) : false;
+ 
+     // iterate through ears, slicing them one by one
+     while (ear->prev != ear->next) {
+@@ -387,7 +392,7 @@
+         next = ear->next;
+ 
+         // reflex check is hoisted here to avoid constructing the Triangle for reflex corners
+-        if (area(prev, ear, next) < 0 && (hashing ? isEarHashed(ear) : isEar(ear))) {
++        if (area(prev, ear, next) < 0 && (convex || (hashing ? isEarHashed(ear) : isEar(ear)))) {
+             // cut off the triangle
+             indices.emplace_back(prev->i);
+             indices.emplace_back(ear->i);
+@@ -401,6 +406,7 @@
+             continue;
+         }
+ 
++        convex = false;
+         ear = next;
+ 
+         // if we looped through the whole remaining polygon and can't find any more ears
+@@ -427,6 +433,17 @@
+             break;
+         }
+     }
++}
++
++// check whether every vertex of a ring is strictly convex (trimkit: earcut.js PR #212)
++template <typename N>
++bool Earcut<N>::isConvex(Node* start) {
++    Node* p = start;
++    do {
++        if (area(p->prev, p, p->next) >= 0) return false;
++        p = p->next;
++    } while (p != start);
++    return true;
+ }
+ 
+ // check whether a polygon node forms a valid ear with adjacent nodes

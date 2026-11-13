@@ -1,0 +1,56 @@
+# Run on our sources only, and on the headers in our own directories (the
+# header filter `uv run scripts tidy` derives from trimkit.toml): vendored
+# code is compiled as system headers.
+# EnumCastOutOfRange is off: it reads OR-ed bitmask enums (fast_float's
+# chars_format) as out of range. Our code is plain C-style C++, so the checks
+# that only argue against C idioms are off too: `static` functions rather
+# than anonymous namespaces, arrays passed as pointers, and explicit types
+# rather than `auto`, no [[nodiscard]] on every getter, and no rule-of-five
+# declarations a type doesn't need. Named constants are UPPER_CASE
+# (readability-identifier-naming).
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-macro-usage,
+  -misc-include-cleaner,
+  -modernize-avoid-c-arrays,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-uppercase-literal-suffix,
+  -readability-math-missing-parentheses,
+  -portability-avoid-pragma-once,
+  -cppcoreguidelines-use-enum-class,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-anonymous-namespace,
+  -modernize-use-nodiscard,
+  -cppcoreguidelines-special-member-functions,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -modernize-use-auto,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+WarningsAsErrors: '*'
+FormatStyle: none
+CheckOptions:
+  readability-identifier-naming.ConstexprVariableCase: UPPER_CASE
+  readability-identifier-naming.GlobalConstantCase: UPPER_CASE
+  readability-identifier-naming.StaticConstantCase: UPPER_CASE
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
