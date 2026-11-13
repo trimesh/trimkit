@@ -532,7 +532,7 @@ def test_no_leaks_and_shared_meshes():
             scene.intersect_any(*rays, *instances)
             scene.boxes(*instances).boxes()
         boxes = trimkit.Boxes(np.zeros((4, 2, 3)))
-        boxes.intersect(np.zeros((2, 2, 3)))
+        boxes.intersection(np.zeros((2, 2, 3)))
         boxes.bounds, boxes.boxes()
         del scenes, boxes
         """
@@ -572,11 +572,50 @@ def test_boxes_match_brute_force(d):
     queries = random_boxes(rng, 5000, d, scale=0.5)
     tree = trimkit.Boxes(boxes)
     assert len(tree) == len(boxes)
-    pairs = tree.intersect(queries)
+    pairs = tree.intersection(queries)
     assert pairs.shape[1] == 2 and pairs.dtype == np.int64
     assert np.array_equal(pairs, overlapping(boxes, queries))
     # some but not all queries hit something, so the comparison means something
     assert 0 < len(np.unique(pairs[:, 0])) < len(queries)
+
+
+@pytest.mark.parametrize("d", [2, 3])
+def test_boxes_every_query_form(d):
+    # one query flat or as corners answers its boxes, many either way their
+    # pairs: every form against brute force, and one query is its batch's row
+    rng = np.random.default_rng(10 + d)
+    boxes = random_boxes(rng, 2000, d, scale=0.3)
+    queries = random_boxes(rng, 300, d, scale=2.0)
+    tree = trimkit.Boxes(boxes)
+    truth = overlapping(boxes, queries)
+    assert np.array_equal(tree.intersection(queries), truth)
+    assert np.array_equal(tree.intersection(queries.reshape((-1, 2 * d))), truth)
+    for q, query in enumerate(queries):
+        row = truth[truth[:, 0] == q, 1]
+        for single in (query, query.reshape(2 * d)):
+            found = tree.intersection(single)
+            assert found.dtype == np.int64 and found.shape == row.shape
+            assert np.array_equal(found, row)
+    # some but not all queries hit something, so the comparison means something
+    assert 0 < len(np.unique(truth[:, 0])) < len(queries)
+    # one empty query is an empty column, an empty batch empty pairs
+    assert tree.intersection(np.full(2 * d, 1e6)).shape == (0,)
+    assert tree.intersection(np.zeros((0, 2 * d))).shape == (0, 2)
+
+
+def test_boxes_query_shapes_refused():
+    tree = trimkit.Boxes(np.zeros((1, 2, 3)))
+    for shape in [(3,), (5,), (3, 3), (1, 5), (1, 3, 3), (1, 2, 2), (1, 1, 2, 3), ()]:
+        with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
+            tree.intersection(np.zeros(shape))
+    with pytest.raises(TypeError, match="queries must be"):
+        tree.intersection("not boxes")
+    # None is refused by the binding itself, as for every array argument
+    with pytest.raises(TypeError):
+        tree.intersection(None)
+    # a shape that fits but a value that doesn't is a ValueError
+    with pytest.raises(ValueError, match="finite"):
+        tree.intersection(np.full(6, np.nan))
 
 
 def test_boxes_touching_and_degenerate():
@@ -587,8 +626,8 @@ def test_boxes_touching_and_degenerate():
     )
     points = np.array([[[0.5, 0.5, 0.5]] * 2, [[5, 5, 5]] * 2], dtype=np.float64)
     tree = trimkit.Boxes(np.concatenate([boxes, points]))
-    assert tree.intersect(boxes[:1]).tolist() == [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4]]
-    assert tree.intersect(points).tolist() == [[0, 0], [0, 4], [1, 5]]
+    assert tree.intersection(boxes[:1]).tolist() == [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4]]
+    assert tree.intersection(points).tolist() == [[0, 0], [0, 4], [1, 5]]
 
 
 def test_boxes_deeply_nested():
@@ -596,7 +635,7 @@ def test_boxes_deeply_nested():
     # spills to the heap rather than overflowing
     sizes = 2.0 ** -np.arange(1000, dtype=np.float64)
     bounds = np.stack([np.zeros((1000, 3)), np.repeat(sizes[:, None], 3, axis=1)], axis=1)
-    pairs = trimkit.Boxes(bounds).intersect(np.zeros((1, 2, 3)))
+    pairs = trimkit.Boxes(bounds).intersection(np.zeros((1, 2, 3)))
     assert pairs[:, 1].tolist() == list(range(1000))
 
 
@@ -610,7 +649,7 @@ def test_boxes_round_trip(d):
     assert copy.shape == boxes.shape and copy.tobytes() == boxes.tobytes()
     assert not np.shares_memory(copy, tree.boxes())
     assert np.array_equal(tree.bounds, [boxes[:, 0].min(axis=0), boxes[:, 1].max(axis=0)])
-    assert np.array_equal(trimkit.Boxes(copy).intersect(boxes), tree.intersect(boxes))
+    assert np.array_equal(trimkit.Boxes(copy).intersection(boxes), tree.intersection(boxes))
 
 
 def test_boxes_empty():
@@ -619,8 +658,8 @@ def test_boxes_empty():
     assert tree.boxes().shape == (0, 2, 3)
     assert tree.bounds.tolist() == [[np.inf] * 3, [-np.inf] * 3]
     assert trimkit.Boxes(np.zeros((0, 2, 2))).bounds.tolist() == [[np.inf] * 2, [-np.inf] * 2]
-    assert tree.intersect(np.zeros((3, 2, 3))).shape == (0, 2)
-    pairs = trimkit.Boxes(np.ones((2, 2, 2))).intersect(np.zeros((0, 2, 2)))
+    assert tree.intersection(np.zeros((3, 2, 3))).shape == (0, 2)
+    pairs = trimkit.Boxes(np.ones((2, 2, 2))).intersection(np.zeros((0, 2, 2)))
     assert pairs.shape == (0, 2)
 
 
@@ -633,8 +672,8 @@ def test_boxes_bad_input():
     ]:
         with pytest.raises(ValueError, match=match):
             trimkit.Boxes(bounds)
-    with pytest.raises(ValueError, match="dimension"):
-        trimkit.Boxes(good).intersect(np.zeros((1, 2, 2)))
+    with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
+        trimkit.Boxes(good).intersection(np.zeros((1, 2, 2)))
     with pytest.raises(TypeError):
         trimkit.Boxes(np.zeros((1, 3, 3)))
 

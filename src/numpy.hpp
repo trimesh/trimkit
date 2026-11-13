@@ -88,6 +88,13 @@ struct RaysArgument {
     nb::handle object;
 };
 
+// Boxes' queries as an argument: (2d,) or (2, d) for one query, (q, 2d) or
+// (q, 2, d) for many, each (q, 2, d) in memory. `Boxes::intersection` reads
+// it with `read`, as whichever of the three array shapes it is
+struct BoxQueriesArgument {
+    nb::handle object;
+};
+
 // What `read_rays` read: `count` rows of three, or one row that is every
 // ray's (`one`, with a count of 1), float64 or, for a float32 array taken as
 // it is, float32. Valid while it is: it holds the argument, or its one copy
@@ -718,6 +725,16 @@ struct rays_shown {
 };
 template <>
 struct type_caster<trimkit::RaysArgument> : passed_through<trimkit::RaysArgument, rays_shown> {};
+
+// `BoxQueriesArgument` shows up as each array shape it reads
+struct box_queries_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = make_caster<trimkit::In<double, -1>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<double, -1, -1>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<double, -1, 2, -1>>::Name;
+};
+template <>
+struct type_caster<trimkit::BoxQueriesArgument> : passed_through<trimkit::BoxQueriesArgument, box_queries_shown> {};
 
 // `MeshArgument` shows up as the `Mesh` alias
 struct mesh_shown {

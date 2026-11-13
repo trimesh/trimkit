@@ -105,7 +105,7 @@ _SLOW_CALLS = {
     "Boxes": (_big_boxes, lambda b: len(trimkit.Boxes(b))),
     "Boxes.bounds": (_big_boxes, lambda b: trimkit.Boxes(b).bounds),
     "Boxes.boxes": (_big_boxes, lambda b: trimkit.Boxes(b).boxes()),
-    "Boxes.intersect": (_big_boxes, lambda b: trimkit.Boxes(b).intersect(b)),
+    "Boxes.intersection": (_big_boxes, lambda b: trimkit.Boxes(b).intersection(b)),
     "CollisionScene.boxes": (_many_instances, lambda i: trimkit.CollisionScene([box()]).boxes(*i).boxes()),
     "CollisionScene": (
         _near_spheres,
@@ -158,7 +158,7 @@ def empty_calls():
         "Boxes": lambda: len(trimkit.Boxes(np.zeros((0, 2, 3)))),
         "Boxes.bounds": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).bounds,
         "Boxes.boxes": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).boxes(),
-        "Boxes.intersect": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).intersect(np.zeros((0, 2, 3))),
+        "Boxes.intersection": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).intersection(np.zeros((0, 2, 3))),
         "CollisionScene.boxes": lambda: trimkit.CollisionScene([]).boxes().boxes(),
         "CollisionScene": lambda: trimkit.CollisionScene([]).collides(),
         "CollisionScene.collides": lambda: trimkit.CollisionScene([(no_vertices, no_faces)] * 2).collides(),
@@ -312,7 +312,7 @@ def _array_arguments(big: bool = False) -> dict:
         ("Boxes", trimkit.Boxes, {"boxes": bounds}),
         ("Boxes.bounds", lambda: trimkit.Boxes(bounds).bounds, {}),
         ("Boxes.boxes", trimkit.Boxes(bounds).boxes, {}),
-        ("Boxes.intersect", trimkit.Boxes(bounds).intersect, {"queries": bounds}),
+        ("Boxes.intersection", trimkit.Boxes(bounds).intersection, {"queries": bounds}),
         (
             "CollisionScene",
             trimkit.CollisionScene,
@@ -549,11 +549,11 @@ def _long_query(name: str, scale: int):
     tree = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
     queries = rng.uniform(0, 100, (25_000 * scale, 3))
     bounds = np.stack([queries, queries + 3.0], axis=1)
-    return lambda: tree.intersect(bounds)
+    return lambda: tree.intersection(bounds)
 
 
 @pytest.mark.timing
-@pytest.mark.parametrize("name", ["decompose", "RayScene.intersect", "Boxes.intersect"])
+@pytest.mark.parametrize("name", ["decompose", "RayScene.intersect", "Boxes.intersection"])
 def test_ctrl_c_stops_long_calls(name):
     # every long loop polls for Ctrl-C with the GIL released: an interrupt
     # 50 ms in stops the call well before it would finish. Queries double
@@ -586,7 +586,7 @@ def test_ctrl_c_stops_long_calls(name):
 def test_random_ctrl_c_leaves_the_pool_healthy():
     # Ctrl-C at random moments in a long parallel query, workers mid-range
     # or not: each raises promptly, and the next call is whole and the same
-    call = _long_query("Boxes.intersect", 8)
+    call = _long_query("Boxes.intersection", 8)
     expected = call()
     for delay in np.random.default_rng(7).uniform(0.005, 0.2, 6):
         timer = threading.Timer(delay, _thread.interrupt_main)
@@ -624,7 +624,7 @@ matrices[:, :3, 3] = rng.uniform(0, 15, (300, 3))
 index = np.zeros(300, np.int64)
 boxes = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
 outputs = [
-    boxes.intersect(np.stack([queries, queries + 3.0], axis=1)),
+    boxes.intersection(np.stack([queries, queries + 3.0], axis=1)),
     *scene.intersect(origins, directions, maximum_hits=1),
     *scene.intersect(origins, directions),
     *solids.distances(matrices, index),
@@ -655,7 +655,7 @@ def test_one_core_matches_every_core():
 def test_fork_after_a_parallel_call():
     # a child forked while the parent's workers are alive starts its own and
     # answers the same; Python warns about forking with threads alive
-    call = _long_query("Boxes.intersect", 2)
+    call = _long_query("Boxes.intersection", 2)
     expected = call()
     read, write = os.pipe()
     with warnings.catch_warnings():
@@ -684,7 +684,7 @@ def test_workers_exit_when_idle():
     # an idle process holds no threads of ours
     if len(os.sched_getaffinity(0)) < 2:
         pytest.skip("one CPU: queries never wake workers")
-    call = _long_query("Boxes.intersect", 2)
+    call = _long_query("Boxes.intersection", 2)
 
     def threads() -> int:
         return len(os.listdir("/proc/self/task"))

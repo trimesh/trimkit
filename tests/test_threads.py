@@ -78,7 +78,7 @@ def test_scheduler_stress():
         boxes = rng.uniform(0, 100, (size, 3))
         rays = rng.normal(size=(2, size, 3)) * 0.1
         queries += [
-            lambda b=boxes: tree.intersect(np.stack([b, b + 3.0], axis=1)),
+            lambda b=boxes: tree.intersection(np.stack([b, b + 3.0], axis=1)),
             lambda r=rays: first_hits(scene, *r),
             lambda r=rays: scene.intersect(*r),
         ]

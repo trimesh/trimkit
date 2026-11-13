@@ -63,6 +63,8 @@ using FacesArg = trimkit::Array<std::int64_t, -1, 3>;
 using BoundsArg = trimkit::Array<double, -1, 2, -1>;
 using Bounds = trimkit::In<double, -1, 2, -1>;
 
+using BoxQueriesArgument = trimkit::BoxQueriesArgument;
+
 // A BVH as tinybvh builds it, with its test of a ray against one known
 // triangle callable: tinybvh keeps that protected, and every hit of
 // `intersect` is measured with it
@@ -757,7 +759,7 @@ public:
                                  ")");
         }
         const nb::gil_scoped_release release;
-        build(corners_of(boxes, "boxes"));
+        build(corners_of(boxes.data(), boxes.shape(0), "boxes"));
     }
 
     // 3D boxes as (minimum, maximum) corner pairs, already checked
@@ -796,22 +798,53 @@ public:
         return trimkit::to_numpy_rows(std::move(boxes), {2, dimension_});
     }
 
-    trimkit::Out<std::int64_t> intersect(const BoundsArg& queries_argument) const {
-        const Bounds queries = trimkit::read(queries_argument, "queries");
-        if (dimension_of(queries) != dimension_) {
-            trimkit::value_error("queries must have the boxes' dimension, " + std::to_string(dimension_));
+    // every box overlapping each query, touching included like rtree: one
+    // query, (2d,) or (2, d), answers its sorted boxes, (n,), and many,
+    // (q, 2d) or (q, 2, d), their [query, box] rows, (k, 2). Every form is
+    // (q, 2, d) in memory, so they read as it and share one traversal; the
+    // last extent tells the layouts apart, as 2d is never d
+    trimkit::Out<std::int64_t> intersection(const BoxQueriesArgument& argument) const {
+        // its shape as numpy sees it: none when it isn't array-like at all
+        const nb::object seen = trimkit::detail::seen_as_array(argument.object);
+        std::vector<std::size_t> extents;
+        if (seen.is_valid()) {
+            for (const nb::handle extent : nb::borrow<nb::tuple>(seen.attr("shape"))) {
+                extents.push_back(nb::cast<std::size_t>(extent));
+            }
         }
-        const std::size_t n = queries.shape(0);
-        const std::vector<Vec> boxes = corners_of(queries, "queries");
-        // [query, box] rows, in query order
+        const std::size_t d = dimension_;
+        const std::size_t last = extents.empty() ? 0 : extents.back();
+        if (extents.size() == 1 && last == 2 * d) {
+            return answer(trimkit::read<double, -1>(argument.object, "queries").data(), 1, true);
+        }
+        if (extents.size() == 2 && extents[0] == 2 && last == d) {
+            return answer(trimkit::read<double, -1, -1>(argument.object, "queries").data(), 1, true);
+        }
+        if (extents.size() == 2 && last == 2 * d) {
+            return answer(trimkit::read<double, -1, -1>(argument.object, "queries").data(), extents[0], false);
+        }
+        if (extents.size() == 3 && extents[1] == 2 && last == d) {
+            return answer(trimkit::read<double, -1, 2, -1>(argument.object, "queries").data(), extents[0], false);
+        }
+        // a shape that's none of them is the wrong type, as every argument's is
+        trimkit::type_error("queries must be float64 of shape (" + std::to_string(2 * d) + ",) or (2, " +
+                            std::to_string(d) + ") for one query, or (*, " + std::to_string(2 * d) + ") or (*, 2, " +
+                            std::to_string(d) + ") for many, not " + trimkit::describe(argument.object));
+    }
+
+private:
+    // `count` queries of (2, d) corners at `data`: their sorted boxes for
+    // `one` query, else [query, box] rows in query order
+    trimkit::Out<std::int64_t> answer(const double* data, std::size_t count, bool one) const {
+        const std::vector<Vec> corners = corners_of(data, count, "queries");
         trimkit::Gathered<std::int64_t> pairs;
         trimkit::gather_in_parallel<std::int64_t>(
-            n, &pairs, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& rows) {
+            count, &pairs, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& rows) {
                 Stack stack = make_stack();
                 std::vector<std::int64_t> boxes_hit;
                 for (std::size_t q = begin; q < end; q++) {
                     boxes_hit.clear();
-                    overlapping(boxes[2 * q], boxes[(2 * q) + 1], stack,
+                    overlapping(corners[2 * q], corners[(2 * q) + 1], stack,
                                 [&](std::uint64_t box) { boxes_hit.push_back(static_cast<std::int64_t>(box)); });
                     // ascending boxes, so the same query always reads the same
                     std::sort(boxes_hit.begin(), boxes_hit.end());
@@ -821,10 +854,19 @@ public:
                     }
                 }
             });
-        return trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(pairs), {2});
+        auto rows = trimkit::gathered_rows(pairs);
+        if (!one) {
+            return trimkit::to_numpy_rows<std::int64_t>(std::move(rows), {2});
+        }
+        // one query: its column of boxes
+        const std::int64_t* row = trimkit::elements(rows);
+        std::vector<std::int64_t> boxes(rows.size() / 2);
+        for (std::size_t i = 0; i < boxes.size(); i++) {
+            boxes[i] = row[(2 * i) + 1];
+        }
+        return trimkit::to_numpy(std::move(boxes), {boxes.size()});
     }
 
-private:
     void build(std::vector<Vec>&& corners) {
         boxes_ = std::move(corners);
         for (std::size_t corner = 0; corner < boxes_.size(); corner += 2) {
@@ -844,11 +886,10 @@ private:
         return bounds.ndim() == 3 ? bounds.shape(2) : 0;
     }
 
-    // (min, max) corner pairs as 3D points, each pair checked to be ordered
-    std::vector<Vec> corners_of(const trimkit::In<double, -1, 2, -1>& bounds, const char* name) const {
-        const std::size_t n = bounds.shape(0);
+    // `n` (min, max) corner pairs of the boxes' dimension at `b`, as 3D
+    // points, each pair checked to be ordered
+    std::vector<Vec> corners_of(const double* b, std::size_t n, const char* name) const {
         const std::size_t d = dimension_;
-        const double* b = bounds.data();
         std::vector<Vec> corners(2 * n);
         for (std::size_t i = 0; i < n; i++) {
             const double* lo = b + (2 * d * i);
@@ -1131,26 +1172,34 @@ Examples
 >>> boxes = tree.boxes()
 >>> boxes.shape
 (2, 2, 2))")
-        .def("intersect", &Boxes::intersect, nb::arg("queries"),
-             R"(Every box overlapping each query box, touching included.
+        .def("intersection", &Boxes::intersection, nb::arg("queries"),
+             R"(Every box overlapping one query box or each of many, touching included.
+
+A superset of an R-tree's `intersection`: one query box, flat as
+(min..., max...) or as its two corners, answers the boxes it overlaps,
+and a batch of either answers every overlap at once.
 
 Parameters
 ----------
-queries : (m, 2, d) float64
-  Each query's minimum and maximum corner, in the boxes' dimension.
+queries : (2d,), (2, d), (m, 2d) or (m, 2, d) float64
+  One query's or each query's minimum and maximum corner, in the
+  boxes' dimension d: flat, (min..., max...), or as two corners.
 
 Returns
 -------
-pairs : (k, 2) int64
-  Rows of [query, box] for every overlap, sorted by query
-  and then box.
+hits : (n,) or (k, 2) int64
+  For one query, every box it overlaps, ascending. For many,
+  rows of [query, box] for every overlap, sorted by query and
+  then box.
 
 Examples
 --------
 >>> import numpy as np
 >>> import trimkit
 >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
->>> pairs = tree.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]]))
->>> pairs.tolist()
+>>> hits = tree.intersection(np.array([0.5, 0.5, 2.5, 2.5]))
+>>> hits.tolist()
+[0, 1]
+>>> tree.intersection(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
 [[0, 0], [0, 1]])");
 }

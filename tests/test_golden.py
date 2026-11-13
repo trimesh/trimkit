@@ -134,7 +134,7 @@ def golden() -> dict:
     matrices, index = exact_instances()
     tree = trimkit.Boxes(scene.boxes(matrices, index).boxes())
     origins, _ = exact_rays()
-    answers["Boxes.intersect"] = [tree.intersect(np.stack([origins - 0.25, origins + 0.25], axis=1))]
+    answers["Boxes.intersection"] = [tree.intersection(np.stack([origins - 0.25, origins + 0.25], axis=1))]
     return {name: digest(arrays) for name, arrays in answers.items()}
 
 

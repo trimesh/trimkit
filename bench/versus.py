@@ -148,7 +148,7 @@ row(
     "trimkit.Boxes",
     "rtree",
     rtree_both,
-    lambda: trimkit.Boxes(bounds).intersect(queries),
+    lambda: trimkit.Boxes(bounds).intersection(queries),
     repeat=2,
     note="build 100k boxes, query 20k",
 )

@@ -279,28 +279,36 @@ class Boxes:
         (2, 2, 2)
         """
 
-    def intersect(self, queries: Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)]) -> NDArray[numpy.int64]:
+    def intersection(self, queries: Annotated[NDArray[numpy.float64], dict(shape=(None,), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, None), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)]) -> NDArray[numpy.int64]:
         """
-        Every box overlapping each query box, touching included.
+        Every box overlapping one query box or each of many, touching included.
+
+        A superset of an R-tree's `intersection`: one query box, flat as
+        (min..., max...) or as its two corners, answers the boxes it overlaps,
+        and a batch of either answers every overlap at once.
 
         Parameters
         ----------
-        queries : (m, 2, d) float64
-          Each query's minimum and maximum corner, in the boxes' dimension.
+        queries : (2d,), (2, d), (m, 2d) or (m, 2, d) float64
+          One query's or each query's minimum and maximum corner, in the
+          boxes' dimension d: flat, (min..., max...), or as two corners.
 
         Returns
         -------
-        pairs : (k, 2) int64
-          Rows of [query, box] for every overlap, sorted by query
-          and then box.
+        hits : (n,) or (k, 2) int64
+          For one query, every box it overlaps, ascending. For many,
+          rows of [query, box] for every overlap, sorted by query and
+          then box.
 
         Examples
         --------
         >>> import numpy as np
         >>> import trimkit
         >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
-        >>> pairs = tree.intersect(np.array([[[0.5, 0.5], [2.5, 2.5]]]))
-        >>> pairs.tolist()
+        >>> hits = tree.intersection(np.array([0.5, 0.5, 2.5, 2.5]))
+        >>> hits.tolist()
+        [0, 1]
+        >>> tree.intersection(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
         [[0, 0], [0, 1]]
         """
 

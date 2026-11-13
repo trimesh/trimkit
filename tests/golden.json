@@ -187,7 +187,7 @@
   ],
   "sha256": "8bb3dc60150c6205d854bec63bb15a5324621303b4cfcfbd5dec1a9c10a213ef"
  },
- "Boxes.intersect": {
+ "Boxes.intersection": {
   "arrays": [
    [
     "int64",

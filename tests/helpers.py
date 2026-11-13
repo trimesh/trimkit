@@ -414,7 +414,7 @@ def small_calls() -> dict:
         "Boxes": lambda: len(trimkit.Boxes(boxes)),
         "Boxes.bounds": lambda: trimkit.Boxes(boxes).bounds,
         "Boxes.boxes": lambda: trimkit.Boxes(boxes).boxes(),
-        "Boxes.intersect": lambda: trimkit.Boxes(boxes).intersect(boxes),
+        "Boxes.intersection": lambda: trimkit.Boxes(boxes).intersection(boxes),
         "CollisionScene": lambda: spheres().collides(overlapping, which),
         "CollisionScene.boxes": lambda: spheres().boxes(overlapping, which).boxes(),
         "CollisionScene.collides": lambda: spheres().collides(overlapping, which, margin=0.1),

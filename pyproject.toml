@@ -8,7 +8,7 @@ backend-path = ["scripts"]
 
 [project]
 name = "trimkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin stable-ABI numpy bindings to mature geometry libraries: rays and boxes, collision, triangulation, convex decomposition, UV atlases, simplification, draco and SVG paths."
 readme = "README.md"
 requires-python = ">=3.12"
