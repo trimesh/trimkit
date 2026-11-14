@@ -31,7 +31,7 @@
 // coal's sources/: collide and distance over a traversal node
 #include <collision_node.h>
 
-#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/variant.h>
 
 #include <algorithm>
@@ -42,8 +42,8 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -57,7 +57,10 @@ using Model = coal::BVHModel<coal::OBBRSS>;
 using Convex = coal::ConvexTpl<coal::Triangle32>;
 using MeshConvexCollision = coal::MeshShapeCollisionTraversalNode<coal::OBBRSS, coal::ConvexBase32, 0>;
 using MeshConvexDistance = coal::MeshShapeDistanceTraversalNodeOBBRSS<coal::ConvexBase32>;
-using Distances = std::tuple<trimkit::Out<double>, trimkit::Out<double>, trimkit::Out<double>>;
+using FacesArg = trimkit::Array<std::int64_t, -1, 2>;
+using DistancesArg = trimkit::Array<double, -1>;
+using PointsArg = trimkit::Array<double, -1, 2, 3>;
+using NormalsArg = trimkit::Array<double, -1, 3>;
 
 // a dropped template argument would select the overloads that write to the
 // shared model, so pin the read-only ones here (the OBBRSS mesh/convex
@@ -259,12 +262,47 @@ bool collide_pair(const Placed& a, const Placed& b, const coal::CollisionRequest
     return result.isCollision();
 }
 
+// One row of a CollisionResult: a pair of instances, or one contact of a
+// pair, with the face of each instance's mesh it is at (-1 for a convex
+// solid), its signed distance, the witness point on each instance, and the
+// unit direction from the first toward the second
+struct Row {
+    std::int64_t pair[2];
+    std::int64_t faces[2];
+    double distance;
+    double points[6];
+    double normal[3];
+};
+
 // a pair farther apart than asked about: infinitely far, nowhere
-void write_far(double* distance, double* points, double* normal) {
+void write_far(Row* row) {
     constexpr double NOTHING = std::numeric_limits<double>::quiet_NaN();
-    *distance = std::numeric_limits<double>::infinity();
-    std::fill(points, points + 6, NOTHING);
-    std::fill(normal, normal + 3, NOTHING);
+    row->faces[0] = row->faces[1] = coal::Contact::NONE;
+    row->distance = std::numeric_limits<double>::infinity();
+    std::fill(row->points, row->points + 6, NOTHING);
+    std::fill(row->normal, row->normal + 3, NOTHING);
+}
+
+// What coal measured or found for a pair, in the pair's (a, b) order: coal
+// measures from its first shape, which is b when `swapped` (a convex a against
+// a mesh b, whose surface goes first), so its faces and witness points trade
+// places and its normal, from its first shape toward its second, turns around
+void write_witness(bool swapped, std::int64_t first_face, std::int64_t second_face,
+                   const std::array<coal::Vec3s, 2>& witnesses, const coal::Vec3s& normal, double distance, Row* row) {
+    row->faces[0] = swapped ? second_face : first_face;
+    row->faces[1] = swapped ? first_face : second_face;
+    row->distance = distance;
+    const double flip = swapped ? -1.0 : 1.0;
+    for (Eigen::Index axis = 0; axis < 3; axis++) {
+        row->points[axis] = witnesses[swapped ? 1 : 0][axis];
+        row->points[3 + axis] = witnesses[swapped ? 0 : 1][axis];
+        row->normal[axis] = flip * normal[axis];
+    }
+}
+
+// whether coal puts b first for this pair: a convex a against a mesh b
+bool swapped_for(const Placed& a, const Placed& b) {
+    return a.mesh->convex() != nullptr && b.mesh->convex() == nullptr;
 }
 
 // The distance between two placed meshes, its closest points (a's, then b's)
@@ -275,8 +313,7 @@ void write_far(double* distance, double* points, double* normal) {
 // GJK by its own early stop, a hierarchy by never descending into boxes
 // farther than the closest distance so far, which starts at the bound.
 void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest& request, double upper_bound,
-                   coal::GJKSolver& solver, coal::DistanceResult& result, double* distance, double* points,
-                   double* normal) {
+                   coal::GJKSolver& solver, coal::DistanceResult& result, Row* row) {
     // just past the bound, so a pair exactly that far is still measured
     const double past = std::isinf(upper_bound) ? std::numeric_limits<double>::max()
                                                 : std::nextafter(upper_bound, std::numeric_limits<double>::infinity());
@@ -284,7 +321,7 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
     const Convex* solid_a = a.mesh->convex();
     const Convex* solid_b = b.mesh->convex();
     // coal measures from its first shape: a, unless a convex a goes second
-    bool swapped = false;
+    const bool swapped = swapped_for(a, b);
     double measured = 0.0;
     if (solid_a != nullptr && solid_b != nullptr) {
         start_solver(solver, request);
@@ -292,11 +329,10 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
         measured = coal::ShapeShapeDistance<coal::ConvexBase32, coal::ConvexBase32>(
             solid_a, a.transform, solid_b, b.transform, &solver, request, result);
         if (solver.gjk.status == coal::details::GJK::NoCollisionEarlyStopped) {
-            write_far(distance, points, normal);  // proven farther than the bound
+            write_far(row);  // proven farther than the bound
             return;
         }
     } else if (solid_a != nullptr || solid_b != nullptr) {
-        swapped = solid_a != nullptr;
         const Placed& surface = swapped ? b : a;
         const Placed& solid = swapped ? a : b;
         start_solver(solver, request);
@@ -319,16 +355,10 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
                                        : coal::Vec3s::Constant(std::numeric_limits<double>::quiet_NaN());
     }
     if (measured > upper_bound) {
-        write_far(distance, points, normal);
+        write_far(row);
         return;
     }
-    *distance = measured;
-    const double flip = swapped ? -1.0 : 1.0;
-    for (Eigen::Index axis = 0; axis < 3; axis++) {
-        points[axis] = result.nearest_points[swapped ? 1 : 0][axis];
-        points[3 + axis] = result.nearest_points[swapped ? 0 : 1][axis];
-        normal[axis] = flip * result.normal[axis];
-    }
+    write_witness(swapped, result.b1, result.b2, result.nearest_points, result.normal, measured, row);
 }
 
 // The instances of pair `p`: row p of `rows`, or with no rows, the p-th
@@ -357,6 +387,108 @@ struct Candidates final : coal::CollisionCallBackBase {
         pairs.push_back({std::min(i, j), std::max(i, j)});
         return false;  // keep going: every candidate is wanted
     }
+};
+
+// an array argument, `rows` of it, copied: a row count other than the
+// pairs' is refused
+template <typename T, nb::ssize_t... Shape>
+trimkit::Out<T> copied_rows(const trimkit::Array<T, Shape...>& argument, const char* name, std::size_t rows) {
+    const trimkit::In<T, Shape...> given = trimkit::view(argument, name);
+    if (given.shape(0) != rows) {
+        trimkit::value_error(std::string(name) + " must have one row per pair");
+    }
+    std::vector<T> values(given.data(), given.data() + given.size());
+    if constexpr (sizeof...(Shape) == 1) {
+        return trimkit::to_numpy(std::move(values), {rows});
+    } else if constexpr (sizeof...(Shape) == 2) {
+        return trimkit::to_numpy(std::move(values), {rows, static_cast<std::size_t>(given.shape(1))});
+    } else {
+        return trimkit::to_numpy(std::move(values), {rows, static_cast<std::size_t>(given.shape(1)),
+                                                     static_cast<std::size_t>(given.shape(2))});
+    }
+}
+
+// the same for an optional one: None stays None
+template <typename T, nb::ssize_t... Shape>
+std::optional<trimkit::Out<T>> copied(const trimkit::Array<T, Shape...>& argument, const char* name, std::size_t rows) {
+    if (argument.is_none()) {
+        return std::nullopt;
+    }
+    return copied_rows(argument, name, rows);
+}
+
+// What a query found, one row per pair or per contact: which instances, and,
+// when the query measured them, the faces, signed distances, witness points
+// and normals, each None when it didn't
+class CollisionResult {
+public:
+    // from Python, as a pickle loads one: checked and copied like any input
+    CollisionResult(const PairsArg& pairs_argument, const FacesArg& faces_argument,
+                    const DistancesArg& distances_argument, const PointsArg& points_argument,
+                    const NormalsArg& normals_argument)
+        : pairs_(copied_rows(pairs_argument, "pairs", trimkit::view(pairs_argument, "pairs").shape(0))) {
+        const std::size_t rows = size();
+        faces_ = copied(faces_argument, "faces", rows);
+        distances_ = copied(distances_argument, "distances", rows);
+        points_ = copied(points_argument, "points", rows);
+        normals_ = copied(normals_argument, "normals", rows);
+    }
+
+    // from a query that found only pairs
+    explicit CollisionResult(trimkit::Out<std::int64_t> pairs) : pairs_(std::move(pairs)) {}
+
+    // from a query's rows, every field measured
+    explicit CollisionResult(const std::vector<trimkit::Unset<Row>>& rows) : pairs_(pairs_of(rows)) {
+        const std::size_t count = rows.size();
+        std::vector<std::int64_t> faces(2 * count);
+        std::vector<double> distances(count);
+        std::vector<double> points(6 * count);
+        std::vector<double> normals(3 * count);
+        for (std::size_t r = 0; r < count; r++) {
+            const Row& found = rows[r].value;
+            std::copy_n(found.faces, 2, &faces[2 * r]);
+            distances[r] = found.distance;
+            std::copy_n(found.points, 6, &points[6 * r]);
+            std::copy_n(found.normal, 3, &normals[3 * r]);
+        }
+        faces_ = trimkit::to_numpy_rows(std::move(faces), {2});
+        distances_ = trimkit::to_numpy(std::move(distances), {count});
+        points_ = trimkit::to_numpy_rows(std::move(points), {2, 3});
+        normals_ = trimkit::to_numpy_rows(std::move(normals), {3});
+    }
+
+    std::size_t size() const { return pairs_.shape(0); }
+    trimkit::Out<std::int64_t> pairs() const { return pairs_; }
+    std::optional<trimkit::Out<std::int64_t>> faces() const { return faces_; }
+    std::optional<trimkit::Out<double>> distances() const { return distances_; }
+    std::optional<trimkit::Out<double>> points() const { return points_; }
+    std::optional<trimkit::Out<double>> normals() const { return normals_; }
+
+    // pickled as its arrays, None where the query measured nothing
+    nb::dict constructor_arguments() const {
+        const nb::dict arguments;
+        arguments["pairs"] = pairs_;
+        arguments["faces"] = faces_;
+        arguments["distances"] = distances_;
+        arguments["points"] = points_;
+        arguments["normals"] = normals_;
+        return arguments;
+    }
+
+private:
+    static trimkit::Out<std::int64_t> pairs_of(const std::vector<trimkit::Unset<Row>>& rows) {
+        std::vector<std::int64_t> pairs(2 * rows.size());
+        for (std::size_t r = 0; r < rows.size(); r++) {
+            std::copy_n(rows[r].value.pair, 2, &pairs[2 * r]);
+        }
+        return trimkit::to_numpy_rows(std::move(pairs), {2});
+    }
+
+    trimkit::Out<std::int64_t> pairs_;
+    std::optional<trimkit::Out<std::int64_t>> faces_;
+    std::optional<trimkit::Out<double>> distances_;
+    std::optional<trimkit::Out<double>> points_;
+    std::optional<trimkit::Out<double>> normals_;
 };
 
 class CollisionScene {
@@ -401,13 +533,18 @@ public:
         return arguments;
     }
 
-    trimkit::Out<std::int64_t> collides(const trimkit::InstanceMatrices& matrices_argument,
-                                        const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
-                                        trimkit::Number<double> margin_argument) const {
+    CollisionResult collides(const trimkit::InstanceMatrices& matrices_argument,
+                             const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
+                             trimkit::Number<double> margin_argument, trimkit::Flag return_distance,
+                             trimkit::Number<std::int64_t> maximum_contacts_argument) const {
         const double margin = margin_argument;
         // NaN fails both comparisons, so it is refused too
         if (margin < 0.0 || margin > trimkit::COORDINATE_LIMIT || std::isnan(margin)) {
             trimkit::value_error(std::string("margin must be at least 0 and within ") + trimkit::COORDINATE_LIMIT_TEXT);
+        }
+        const std::int64_t maximum_contacts = maximum_contacts_argument;
+        if (maximum_contacts < 1) {
+            trimkit::value_error("maximum_contacts must be at least 1");
         }
         const std::vector<Placed> placed = place(matrices_argument, index_argument);
         // the pairs to test: the given rows, or the boxes' candidates
@@ -420,6 +557,9 @@ public:
         }
         const std::int64_t* rows = pairs.data();
         const std::size_t pair_count = pairs.size() / 2;
+        if (return_distance.value) {
+            return CollisionResult(contacts(placed, rows, pair_count, margin, maximum_contacts));
+        }
         coal::CollisionRequest request(coal::NO_REQUEST, 1);
         request.security_margin = margin;
         // one pass: each pair culled, then tested, keeping those that touch
@@ -437,12 +577,44 @@ public:
                     }
                 }
             });
-        return trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(touching), {2});
+        return CollisionResult(trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(touching), {2}));
     }
 
-    Distances distances(const trimkit::InstanceMatrices& matrices_argument,
-                        const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
-                        trimkit::Number<double> upper_bound_argument) const {
+    // Every contact of each pair that touches, as many as `maximum_contacts`
+    // per pair, as coal's contact request finds them through the same cull and
+    // kernels as `collides`: in pair order, each pair's in coal's
+    static std::vector<trimkit::Unset<Row>> contacts(const std::vector<Placed>& placed, const std::int64_t* rows,
+                                                     std::size_t pair_count, double margin,
+                                                     std::int64_t maximum_contacts) {
+        coal::CollisionRequest request(coal::CONTACT, static_cast<std::size_t>(maximum_contacts));
+        request.security_margin = margin;
+        trimkit::Gathered<Row> found;
+        trimkit::gather_in_parallel<Row>(
+            pair_count, &found, [&](std::size_t begin, std::size_t end, std::vector<Row>& kept) {
+                coal::GJKSolver solver;
+                coal::CollisionResult result;
+                for (std::size_t p = begin; p < end; p++) {
+                    const Placed& a = placed[static_cast<std::size_t>(rows[2 * p])];
+                    const Placed& b = placed[static_cast<std::size_t>(rows[(2 * p) + 1])];
+                    if (!may_touch(a, b, request) || !collide_pair(a, b, request, solver, result)) {
+                        continue;
+                    }
+                    const bool swapped = swapped_for(a, b);
+                    for (const coal::Contact& contact : result.getContacts()) {
+                        Row& row = kept.emplace_back();
+                        row.pair[0] = rows[2 * p];
+                        row.pair[1] = rows[(2 * p) + 1];
+                        write_witness(swapped, contact.b1, contact.b2, contact.nearest_points, contact.normal,
+                                      contact.penetration_depth, &row);
+                    }
+                }
+            });
+        return trimkit::gathered_rows(found);
+    }
+
+    CollisionResult distances(const trimkit::InstanceMatrices& matrices_argument,
+                              const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
+                              trimkit::Number<double> upper_bound_argument) const {
         const double upper_bound = upper_bound_argument;
         if (!(upper_bound > 0.0)) {
             trimkit::value_error("upper_bound must be positive");
@@ -466,12 +638,8 @@ public:
             pair_count = given.size() / 2;
         }
         // every row written once, by its pair, so none is filled first
-        std::vector<trimkit::Unset<double>> distance(pair_count);
-        std::vector<trimkit::Unset<double>> points(6 * pair_count);
-        std::vector<trimkit::Unset<double>> normals(3 * pair_count);
-        double* distance_out = trimkit::elements(distance);
-        double* points_out = trimkit::elements(points);
-        double* normals_out = trimkit::elements(normals);
+        std::vector<trimkit::Unset<Row>> measured(pair_count);
+        Row* out = trimkit::elements(measured);
         const coal::DistanceRequest request;
         // one pass: each pair culled, then measured
         trimkit::in_parallel(pair_count, [&](std::size_t begin, std::size_t end) {
@@ -481,19 +649,18 @@ public:
                 std::size_t first = 0;
                 std::size_t second = 0;
                 pair_at(rows, starts, p, &first, &second);
+                out[p].pair[0] = static_cast<std::int64_t>(first);
+                out[p].pair[1] = static_cast<std::int64_t>(second);
                 const Placed& a = placed[first];
                 const Placed& b = placed[second];
                 if (may_be_within(a, b, upper_bound)) {
-                    distance_pair(a, b, request, upper_bound, solver, result, &distance_out[p], &points_out[6 * p],
-                                  &normals_out[3 * p]);
+                    distance_pair(a, b, request, upper_bound, solver, result, &out[p]);
                 } else {
-                    write_far(&distance_out[p], &points_out[6 * p], &normals_out[3 * p]);
+                    write_far(&out[p]);
                 }
             }
         });
-        return {trimkit::to_numpy<double>(std::move(distance), {pair_count}),
-                trimkit::to_numpy_rows<double>(std::move(points), {2, 3}),
-                trimkit::to_numpy_rows<double>(std::move(normals), {3})};
+        return CollisionResult(measured);
     }
 
     // the box each instance is culled by, as these instances place it
@@ -634,6 +801,159 @@ private:
 }  // namespace
 
 void bind_collision(nb::module_& m) {
+    trimkit::picklable_class<CollisionResult>(m, "CollisionResult",
+                                              R"(What a collision or distance query found: one row per pair of
+instances, or per contact of a pair, as `CollisionScene.collides` and
+`CollisionScene.distances` return it.
+
+Every row names its pair of instances. A query that measured them also
+fills each row's faces, signed distance, witness points and normal, and
+each of those is None when it didn't, as `collides` without
+`return_distance`: an answer not computed is never a placeholder.
+
+Parameters
+----------
+pairs : (c, 2) int64
+  The instances of each row.
+faces : (c, 2) int64, optional
+  The face of each instance's mesh the row is at, or -1 for a convex
+  solid, which has no face to name.
+distances : (c,) float64, optional
+  The signed distance between the pair at the row, negative by how deep
+  they overlap.
+points : (c, 2, 3) float64, optional
+  The witness point on each instance, in the scene: closest when apart,
+  deepest when overlapping.
+normals : (c, 3) float64, optional
+  The unit direction from the first instance toward the second along
+  which the distance is measured.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> result = trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64))
+>>> len(result), result.distances is None
+(1, True))")
+        .def(nb::init<const PairsArg&, const FacesArg&, const DistancesArg&, const PointsArg&, const NormalsArg&>(),
+             nb::arg("pairs"), nb::arg("faces").none() = nb::none(), nb::arg("distances").none() = nb::none(),
+             nb::arg("points").none() = nb::none(), nb::arg("normals").none() = nb::none())
+        .def("__len__", &CollisionResult::size, R"(How many rows it holds.
+
+Returns
+-------
+count : int
+  The number of rows it holds: pairs, or contacts.)")
+        .def_prop_ro("pairs", &CollisionResult::pairs, nb::rv_policy::move,
+                     R"(The instances of each row.
+
+Returns
+-------
+pairs : (c, 2) int64
+  Each row's pair of instances, first then second.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+>>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+>>> placed = np.tile(np.eye(4), (2, 1, 1))
+>>> placed[1, 0, 3] = 0.5
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+>>> pairs = result.pairs
+>>> pairs.tolist()
+[[0, 1]])")
+        .def_prop_ro("faces", &CollisionResult::faces, nb::rv_policy::move,
+                     R"(The face of each instance's mesh each row is at, or None.
+
+Returns
+-------
+faces : (c, 2) int64 or None
+  Each row's face of each instance's mesh, -1 for a convex solid; None
+  when the query measured nothing.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+>>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+>>> placed = np.tile(np.eye(4), (2, 1, 1))
+>>> placed[1, 0, 3] = 0.5
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+>>> faces = result.faces
+>>> faces.tolist()
+[[-1, -1]])")
+        .def_prop_ro("distances", &CollisionResult::distances, nb::rv_policy::move,
+                     R"(The signed distance of each row, or None.
+
+Returns
+-------
+distances : (c,) float64 or None
+  Each row's signed distance, negative by how deep the pair overlaps;
+  None when the query measured nothing.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+>>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+>>> placed = np.tile(np.eye(4), (2, 1, 1))
+>>> placed[1, 0, 3] = 0.5
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+>>> distances = result.distances
+>>> bool(distances[0] < 0.0)
+True)")
+        .def_prop_ro("points", &CollisionResult::points, nb::rv_policy::move,
+                     R"(The witness point on each instance of each row, or None.
+
+Returns
+-------
+points : (c, 2, 3) float64 or None
+  Each row's witness point on each instance, in the scene; None when
+  the query measured nothing.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+>>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+>>> placed = np.tile(np.eye(4), (2, 1, 1))
+>>> placed[1, 0, 3] = 0.5
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+>>> points = result.points
+>>> points.shape
+(1, 2, 3))")
+        .def_prop_ro("normals", &CollisionResult::normals, nb::rv_policy::move,
+                     R"(The unit normal of each row, or None.
+
+Returns
+-------
+normals : (c, 3) float64 or None
+  Each row's unit direction from the first instance toward the second;
+  None when the query measured nothing.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+>>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+>>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+>>> placed = np.tile(np.eye(4), (2, 1, 1))
+>>> placed[1, 0, 3] = 0.5
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+>>> normals = result.normals
+>>> bool(np.isclose(np.linalg.norm(normals[0]), 1.0))
+True)");
+
     trimkit::picklable_class<CollisionScene>(m, "CollisionScene",
                                              R"(Meshes to place and query against each other. A scene never changes:
 each query names its own instances, so threads may share one.
@@ -717,8 +1037,8 @@ Examples
 [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])")
         .def("collides", &CollisionScene::collides, nb::arg("instance_matrices").none() = nb::none(),
              nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),
-             nb::arg("margin") = 0.0,
-             R"(The pairs of instances that touch.
+             nb::arg("margin") = 0.0, nb::arg("return_distance") = trimkit::Flag{}, nb::arg("maximum_contacts") = 1,
+             R"(The pairs of instances that touch, and optionally where.
 
 Parameters
 ----------
@@ -732,13 +1052,22 @@ pairs : (p, 2) int64, optional
   their bounding boxes.
 margin : float
   Also count pairs closer than this.
+return_distance : bool
+  Also measure where each touching pair touches: one row per contact,
+  with its faces, signed distance, witness points and normal. Without
+  it only the pairs are found, as fast as the test allows.
+maximum_contacts : int
+  With `return_distance`, the most contacts to report per pair, which
+  bounds the work: 1 is the deepest a convex pair has, and a mesh's
+  first found. At least 1.
 
 Returns
 -------
-pairs : (c, 2) int64
+result : CollisionResult
   Each pair of instances that touches or overlaps: rows of `pairs` in
-  its order, or by default each touching i < j in ascending order.
-  Empty when nothing touches.
+  its order, or by default each touching i < j in ascending order, and
+  with `return_distance` one row per contact of each. Its other fields
+  are None without `return_distance`. Empty when nothing touches.
 
 Examples
 --------
@@ -749,9 +1078,9 @@ Examples
 >>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
 >>> placed = np.tile(np.eye(4), (2, 1, 1))
 >>> placed[1, 0, 3] = 0.5
->>> pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))
->>> pairs.tolist()
-[[0, 1]])")
+>>> result = scene.collides(placed, np.zeros(2, dtype=np.int64))
+>>> result.pairs.tolist(), result.distances is None
+([[0, 1]], True))")
         .def("distances", &CollisionScene::distances, nb::arg("instance_matrices").none() = nb::none(),
              nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),
              nb::arg("upper_bound") = std::numeric_limits<double>::infinity(),
@@ -773,15 +1102,12 @@ upper_bound : float
 
 Returns
 -------
-distances : (p,) float64
-  The distance between each pair. A pair with a convex mesh has a signed
-  distance, negative by how deep it reaches into the solid; two surfaces
-  are 0 once their triangles touch.
-points : (p, 2, 3) float64
-  The closest point on each instance of a pair, in the scene.
-normals : (p, 3) float64
-  The unit direction from the first instance toward the second along
-  which the distance is measured, or NaN for two surfaces that touch.
+result : CollisionResult
+  One row per pair, every field filled. A pair with a convex mesh has a
+  signed distance, negative by how deep it reaches into the solid; two
+  surfaces are 0 once their triangles touch, with a NaN normal. A pair
+  farther than `upper_bound` is infinitely far, with -1 faces and NaN
+  points and normal.
 
 Examples
 --------
@@ -792,7 +1118,7 @@ Examples
 >>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
 >>> placed = np.tile(np.eye(4), (2, 1, 1))
 >>> placed[1, 0, 3] = 2.0
->>> distances, points, normals = scene.distances(placed, np.zeros(2, dtype=np.int64))
->>> distances.tolist(), normals.tolist()
+>>> result = scene.distances(placed, np.zeros(2, dtype=np.int64))
+>>> result.distances.tolist(), result.normals.tolist()
 ([1.0], [[1.0, 0.0, 0.0]]))");
 }

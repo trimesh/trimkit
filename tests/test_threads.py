@@ -82,7 +82,11 @@ def test_scheduler_stress():
             lambda r=rays: first_hits(scene, *r),
             lambda r=rays: scene.intersect(*r),
         ]
-    queries += [lambda: solids.distances(matrices, index), lambda: solids.collides(matrices, index)]
+    queries += [
+        lambda: solids.distances(matrices, index),
+        lambda: solids.collides(matrices, index),
+        lambda: solids.collides(matrices, index, return_distance=True, maximum_contacts=4),
+    ]
     expected = [_flatten(query()) for query in queries]
 
     def mixed(seed: int) -> bool:

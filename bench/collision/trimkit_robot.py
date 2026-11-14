@@ -73,25 +73,25 @@ def transforms(configurations) -> np.ndarray:
 zero = transforms([np.clip(np.zeros(len(lower)), lower, upper)])[0]
 always = np.mean(
     [
-        mask(scene.collides(m, pairs=candidates), candidates)
+        mask(scene.collides(m, pairs=candidates).pairs, candidates)
         for m in transforms(rng.uniform(lower, upper, (1000, len(lower))))
     ],
     axis=0,
 )
-keep = ~mask(scene.collides(zero, pairs=candidates), candidates) & (always < 0.95)
+keep = ~mask(scene.collides(zero, pairs=candidates).pairs, candidates) & (always < 0.95)
 pairs = np.ascontiguousarray(candidates[keep])
 matrices = transforms(rng.uniform(lower, upper, (config_count, len(lower))))
 
 start = time.perf_counter()
 found = [scene.collides(m, pairs=pairs) for m in matrices]
 collide_us = (time.perf_counter() - start) / config_count * 1e6
-hits = np.array([mask(f, pairs) for f in found])
+hits = np.array([mask(result.pairs, pairs) for result in found])
 start = time.perf_counter()
 any_hit = [len(scene.collides(m, pairs=pairs)) > 0 for m in matrices]
 start = time.perf_counter()
 measured = [scene.distances(m, pairs=pairs) for m in matrices]
 distance_us = (time.perf_counter() - start) / config_count * 1e6
-distances = np.array([d for d, _, _ in measured])
+distances = np.array([result.distances for result in measured])
 
 print(
     f"## {robot_name} [{mode}]: {len(nodes)} bodies, {sum(len(g.faces) for g in geometry)} faces, "
@@ -132,7 +132,7 @@ else:
     surfaces = trimkit.CollisionScene(meshes)
     errors = []
     for c in range(min(100, config_count)):
-        exact = surfaces.distances(matrices[c], pairs=pairs)[0]
+        exact = surfaces.distances(matrices[c], pairs=pairs).distances
         apart = ~hits[c] & (exact > 1e-6)
         errors.append(np.abs(distances[c][apart] - exact[apart]))
     errors = np.concatenate(errors)

@@ -474,6 +474,194 @@ def simplify(vertices: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), o
     (4, [0, 1, 2, 3])
     """
 
+class CollisionResult:
+    """
+    What a collision or distance query found: one row per pair of
+    instances, or per contact of a pair, as `CollisionScene.collides` and
+    `CollisionScene.distances` return it.
+
+    Every row names its pair of instances. A query that measured them also
+    fills each row's faces, signed distance, witness points and normal, and
+    each of those is None when it didn't, as `collides` without
+    `return_distance`: an answer not computed is never a placeholder.
+
+    Parameters
+    ----------
+    pairs : (c, 2) int64
+      The instances of each row.
+    faces : (c, 2) int64, optional
+      The face of each instance's mesh the row is at, or -1 for a convex
+      solid, which has no face to name.
+    distances : (c,) float64, optional
+      The signed distance between the pair at the row, negative by how deep
+      they overlap.
+    points : (c, 2, 3) float64, optional
+      The witness point on each instance, in the scene: closest when apart,
+      deepest when overlapping.
+    normals : (c, 3) float64, optional
+      The unit direction from the first instance toward the second along
+      which the distance is measured.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import trimkit
+    >>> result = trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64))
+    >>> len(result), result.distances is None
+    (1, True)
+    """
+
+    def __init__(self, pairs: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)], faces: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)] | None = None, distances: Annotated[NDArray[numpy.float64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, points: Annotated[NDArray[numpy.float64], dict(shape=(None, 2, 3), order='C', device='cpu', writable=False)] | None = None, normals: Annotated[NDArray[numpy.float64], dict(shape=(None, 3), order='C', device='cpu', writable=False)] | None = None) -> None: ...
+
+    def __reduce__(self) -> tuple:
+        """
+        Pickle as its constructor's arguments, by name: anything built from them is built again on load.
+
+        Returns
+        -------
+        reduced : tuple
+          Its constructor with those arguments bound, as pickle and copy call it.
+        """
+
+    def __len__(self) -> int:
+        """
+        How many rows it holds.
+
+        Returns
+        -------
+        count : int
+          The number of rows it holds: pairs, or contacts.
+        """
+
+    @property
+    def pairs(self) -> NDArray[numpy.int64]:
+        """
+        The instances of each row.
+
+        Returns
+        -------
+        pairs : (c, 2) int64
+          Each row's pair of instances, first then second.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+        >>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+        >>> placed = np.tile(np.eye(4), (2, 1, 1))
+        >>> placed[1, 0, 3] = 0.5
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+        >>> pairs = result.pairs
+        >>> pairs.tolist()
+        [[0, 1]]
+        """
+
+    @property
+    def faces(self) -> NDArray[numpy.int64] | None:
+        """
+        The face of each instance's mesh each row is at, or None.
+
+        Returns
+        -------
+        faces : (c, 2) int64 or None
+          Each row's face of each instance's mesh, -1 for a convex solid; None
+          when the query measured nothing.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+        >>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+        >>> placed = np.tile(np.eye(4), (2, 1, 1))
+        >>> placed[1, 0, 3] = 0.5
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+        >>> faces = result.faces
+        >>> faces.tolist()
+        [[-1, -1]]
+        """
+
+    @property
+    def distances(self) -> NDArray[numpy.float64] | None:
+        """
+        The signed distance of each row, or None.
+
+        Returns
+        -------
+        distances : (c,) float64 or None
+          Each row's signed distance, negative by how deep the pair overlaps;
+          None when the query measured nothing.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+        >>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+        >>> placed = np.tile(np.eye(4), (2, 1, 1))
+        >>> placed[1, 0, 3] = 0.5
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+        >>> distances = result.distances
+        >>> bool(distances[0] < 0.0)
+        True
+        """
+
+    @property
+    def points(self) -> NDArray[numpy.float64] | None:
+        """
+        The witness point on each instance of each row, or None.
+
+        Returns
+        -------
+        points : (c, 2, 3) float64 or None
+          Each row's witness point on each instance, in the scene; None when
+          the query measured nothing.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+        >>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+        >>> placed = np.tile(np.eye(4), (2, 1, 1))
+        >>> placed[1, 0, 3] = 0.5
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+        >>> points = result.points
+        >>> points.shape
+        (1, 2, 3)
+        """
+
+    @property
+    def normals(self) -> NDArray[numpy.float64] | None:
+        """
+        The unit normal of each row, or None.
+
+        Returns
+        -------
+        normals : (c, 3) float64 or None
+          Each row's unit direction from the first instance toward the second;
+          None when the query measured nothing.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
+        >>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
+        >>> placed = np.tile(np.eye(4), (2, 1, 1))
+        >>> placed[1, 0, 3] = 0.5
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
+        >>> normals = result.normals
+        >>> bool(np.isclose(np.linalg.norm(normals[0]), 1.0))
+        True
+        """
+
 class CollisionScene:
     """
     Meshes to place and query against each other. A scene never changes:
@@ -574,9 +762,9 @@ class CollisionScene:
         [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
         """
 
-    def collides(self, instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, pairs: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)] | None = None, margin: float | numpy.floating = 0.0) -> NDArray[numpy.int64]:
+    def collides(self, instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, pairs: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)] | None = None, margin: float | numpy.floating = 0.0, return_distance: bool | numpy.bool_ = False, maximum_contacts: int | numpy.integer = 1) -> CollisionResult:
         """
-        The pairs of instances that touch.
+        The pairs of instances that touch, and optionally where.
 
         Parameters
         ----------
@@ -590,13 +778,22 @@ class CollisionScene:
           their bounding boxes.
         margin : float
           Also count pairs closer than this.
+        return_distance : bool
+          Also measure where each touching pair touches: one row per contact,
+          with its faces, signed distance, witness points and normal. Without
+          it only the pairs are found, as fast as the test allows.
+        maximum_contacts : int
+          With `return_distance`, the most contacts to report per pair, which
+          bounds the work: 1 is the deepest a convex pair has, and a mesh's
+          first found. At least 1.
 
         Returns
         -------
-        pairs : (c, 2) int64
+        result : CollisionResult
           Each pair of instances that touches or overlaps: rows of `pairs` in
-          its order, or by default each touching i < j in ascending order.
-          Empty when nothing touches.
+          its order, or by default each touching i < j in ascending order, and
+          with `return_distance` one row per contact of each. Its other fields
+          are None without `return_distance`. Empty when nothing touches.
 
         Examples
         --------
@@ -607,12 +804,12 @@ class CollisionScene:
         >>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
         >>> placed = np.tile(np.eye(4), (2, 1, 1))
         >>> placed[1, 0, 3] = 0.5
-        >>> pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))
-        >>> pairs.tolist()
-        [[0, 1]]
+        >>> result = scene.collides(placed, np.zeros(2, dtype=np.int64))
+        >>> result.pairs.tolist(), result.distances is None
+        ([[0, 1]], True)
         """
 
-    def distances(self, instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, pairs: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)] | None = None, upper_bound: float | numpy.floating = float('inf')) -> tuple[NDArray[numpy.float64], NDArray[numpy.float64], NDArray[numpy.float64]]:
+    def distances(self, instance_matrices: Annotated[NDArray[numpy.float64], dict(shape=(None, 4, 4), order='C', device='cpu', writable=False)] | None = None, instance_index: Annotated[NDArray[numpy.int64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, *, pairs: Annotated[NDArray[numpy.int64], dict(shape=(None, 2), order='C', device='cpu', writable=False)] | None = None, upper_bound: float | numpy.floating = float('inf')) -> CollisionResult:
         """
         The distance between each pair of instances, and where it is.
 
@@ -632,15 +829,12 @@ class CollisionScene:
 
         Returns
         -------
-        distances : (p,) float64
-          The distance between each pair. A pair with a convex mesh has a signed
-          distance, negative by how deep it reaches into the solid; two surfaces
-          are 0 once their triangles touch.
-        points : (p, 2, 3) float64
-          The closest point on each instance of a pair, in the scene.
-        normals : (p, 3) float64
-          The unit direction from the first instance toward the second along
-          which the distance is measured, or NaN for two surfaces that touch.
+        result : CollisionResult
+          One row per pair, every field filled. A pair with a convex mesh has a
+          signed distance, negative by how deep it reaches into the solid; two
+          surfaces are 0 once their triangles touch, with a NaN normal. A pair
+          farther than `upper_bound` is infinitely far, with -1 faces and NaN
+          points and normal.
 
         Examples
         --------
@@ -651,7 +845,7 @@ class CollisionScene:
         >>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
         >>> placed = np.tile(np.eye(4), (2, 1, 1))
         >>> placed[1, 0, 3] = 2.0
-        >>> distances, points, normals = scene.distances(placed, np.zeros(2, dtype=np.int64))
-        >>> distances.tolist(), normals.tolist()
+        >>> result = scene.distances(placed, np.zeros(2, dtype=np.int64))
+        >>> result.distances.tolist(), result.normals.tolist()
         ([1.0], [[1.0, 0.0, 0.0]])
         """

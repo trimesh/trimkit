@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-from helpers import box, collision_boxes, sphere
+from helpers import box, collision_boxes, collision_fields, sphere
 
 import trimkit
 
@@ -46,8 +46,8 @@ def scene(convex, *meshes) -> trimkit.CollisionScene:
 def test_bare_query_is_the_scene_as_built(convex):
     # no instances given: each mesh once, where it is, every pair
     touching = scene(convex, box(), box((0.5, 0, 0), (1.5, 1, 1)), box((5, 0, 0), (6, 1, 1)))
-    assert touching.collides().tolist() == [[0, 1]]
-    distances, _, _ = touching.distances()
+    assert touching.collides().pairs.tolist() == [[0, 1]]
+    distances = touching.distances().distances
     assert distances[1:] == pytest.approx([4.0, 3.5])
 
 
@@ -58,12 +58,15 @@ def test_found_pairs_match_named_pairs():
     index = np.zeros(4, np.int64)
     collision_boxes(four, [box()], matrices, index)
     explicit = np.column_stack(np.triu_indices(4, 1)).astype(np.int64)
-    assert four.collides(matrices, index).tolist() == four.collides(matrices, index, pairs=explicit).tolist()
-    assert four.collides(matrices, index).tolist() == [[0, 1], [2, 3]]
+    assert (
+        four.collides(matrices, index).pairs.tolist()
+        == four.collides(matrices, index, pairs=explicit).pairs.tolist()
+    )
+    assert four.collides(matrices, index).pairs.tolist() == [[0, 1], [2, 3]]
     # named pairs come back as named, in their order
     assert four.collides(
         matrices, index, pairs=np.array([[3, 2], [1, 3], [1, 0]], dtype=np.int64)
-    ).tolist() == [
+    ).pairs.tolist() == [
         [3, 2],
         [1, 0],
     ]
@@ -73,17 +76,18 @@ def test_convex_meshes_are_solids():
     # a small box inside a big one: their triangles never touch, but as
     # convex solids they overlap, with a negative signed distance
     inner, outer = box((0.4, 0.4, 0.4), (0.6, 0.6, 0.6)), box()
-    assert scene(False, inner, outer).collides().tolist() == []
-    assert scene(True, inner, outer).collides().tolist() == [[0, 1]]
-    assert scene(False, inner, outer).distances()[0][0] == pytest.approx(0.4)
+    assert scene(False, inner, outer).collides().pairs.tolist() == []
+    assert scene(True, inner, outer).collides().pairs.tolist() == [[0, 1]]
+    assert scene(False, inner, outer).distances().distances[0] == pytest.approx(0.4)
     # as solids: the least translation that separates them, 0.6 along an axis
-    assert scene(True, inner, outer).distances()[0][0] == pytest.approx(-0.6, abs=1e-9)
+    assert scene(True, inner, outer).distances().distances[0] == pytest.approx(-0.6, abs=1e-9)
 
 
 @pytest.mark.parametrize("convex", [False, True])
 def test_box_distance_points_and_normal(convex):
     two = scene(convex)
-    distances, points, normals = two.distances(placed(0.0, 1.5), np.zeros(2, np.int64))
+    result = two.distances(placed(0.0, 1.5), np.zeros(2, np.int64))
+    distances, points, normals = result.distances, result.points, result.normals
     assert distances == pytest.approx([0.5])
     # the closest points are on the facing sides, the normal from first to second
     assert points[0, 0, 0] == pytest.approx(1.0)
@@ -92,35 +96,36 @@ def test_box_distance_points_and_normal(convex):
 
 
 def test_mesh_normal_is_nan_once_touching():
-    _, _, normals = scene(False).distances(placed(0.0, 0.5), np.zeros(2, np.int64))
+    normals = scene(False).distances(placed(0.0, 0.5), np.zeros(2, np.int64)).normals
     assert np.isnan(normals).all()
 
 
 @pytest.mark.parametrize("convex", [False, True])
 def test_margin_counts_near_pairs(convex):
     two, matrices, index = scene(convex), placed(0.0, 1.5), np.zeros(2, np.int64)
-    assert two.collides(matrices, index).tolist() == []
-    assert two.collides(matrices, index, margin=0.4).tolist() == []
-    assert two.collides(matrices, index, margin=0.6).tolist() == [[0, 1]]
+    assert two.collides(matrices, index).pairs.tolist() == []
+    assert two.collides(matrices, index, margin=0.4).pairs.tolist() == []
+    assert two.collides(matrices, index, margin=0.6).pairs.tolist() == [[0, 1]]
 
 
 def test_upper_bound_skips_far_pairs():
     two, matrices, index = scene(True), placed(0.0, 1.5), np.zeros(2, np.int64)
-    distances, points, normals = two.distances(matrices, index, upper_bound=0.4)
+    result = two.distances(matrices, index, upper_bound=0.4)
+    distances, points, normals = result.distances, result.points, result.normals
     assert distances.tolist() == [np.inf]
     assert np.isnan(points).all() and np.isnan(normals).all()
-    assert two.distances(matrices, index, upper_bound=0.6)[0] == pytest.approx([0.5])
+    assert two.distances(matrices, index, upper_bound=0.6).distances == pytest.approx([0.5])
 
 
 def test_empty_meshes_never_touch():
     # placed anywhere, even right on the other mesh, and its box is the point
     empty = (np.zeros((0, 3)), np.zeros((0, 3), np.int64))
     both = scene(False, empty, box())
-    assert both.collides().tolist() == []
-    assert both.distances()[0].tolist() == [np.inf]
+    assert both.collides().pairs.tolist() == []
+    assert both.distances().distances.tolist() == [np.inf]
     on_top = placed((0.5, 0.5, 0.5), 0.0)
     collision_boxes(both, [empty, box()], on_top)
-    assert both.collides(on_top).tolist() == []
+    assert both.collides(on_top).pairs.tolist() == []
 
 
 def separated(first: np.ndarray, second: np.ndarray) -> bool:
@@ -149,7 +154,7 @@ def test_agrees_with_separating_axes(convex):
     matrices = placed(*rng.uniform(0, 3, (count, 3)), rotations=[rotation(rng) for _ in range(count)])
     cubes = scene(convex)
     collision_boxes(cubes, [box()], matrices, np.zeros(count, np.int64))
-    found = cubes.collides(matrices, np.zeros(count, np.int64))
+    found = cubes.collides(matrices, np.zeros(count, np.int64)).pairs
     pairs = np.column_stack(np.triu_indices(count, 1)).astype(np.int64)
     touching = {tuple(row) for row in found.tolist()}
     hits = [tuple(row) in touching for row in pairs.tolist()]
@@ -165,8 +170,8 @@ def test_both_kernels_agree_on_distance():
     count = 20
     matrices = placed(*rng.uniform(0, 8, (count, 3)), rotations=[rotation(rng) for _ in range(count)])
     index = np.zeros(count, np.int64)
-    meshes, _, _ = scene(False).distances(matrices, index)
-    solids, _, _ = scene(True).distances(matrices, index)
+    meshes = scene(False).distances(matrices, index).distances
+    solids = scene(True).distances(matrices, index).distances
     apart = solids > 1e-6
     assert apart.any()
     assert meshes[apart] == pytest.approx(solids[apart], abs=1e-6)
@@ -210,14 +215,14 @@ def test_convex_scalar_is_every_mesh():
         mask = np.full(len(meshes), scalar)
         every = trimkit.CollisionScene(meshes, convex=scalar).distances(matrices)
         masked = trimkit.CollisionScene(meshes, convex=mask).distances(matrices)
-        for a, b in zip(every, masked, strict=True):
+        for a, b in zip(collision_fields(every), collision_fields(masked), strict=True):
             assert np.array_equal(a, b, equal_nan=True)
     # the default is none, and the two answers differ: one solid inside the
     # other is penetrated, two surfaces crossing touch
-    default = trimkit.CollisionScene(meshes).distances(matrices)
-    assert np.array_equal(default[0], trimkit.CollisionScene(meshes, convex=False).distances(matrices)[0])
-    assert default[0][0] == 0.0
-    assert trimkit.CollisionScene(meshes, convex=True).distances(matrices)[0][0] < 0.0
+    default = trimkit.CollisionScene(meshes).distances(matrices).distances
+    assert np.array_equal(default, trimkit.CollisionScene(meshes, convex=False).distances(matrices).distances)
+    assert default[0] == 0.0
+    assert trimkit.CollisionScene(meshes, convex=True).distances(matrices).distances[0] < 0.0
 
 
 def test_convex_is_a_promise():
@@ -231,11 +236,11 @@ def test_convex_is_a_promise():
     matrices, pairs = placed(0.0, 0.0), np.array([[0, 1]], dtype=np.int64)
     honest = scene(True, box(), probe).distances(matrices, pairs=pairs)
     promised = scene(True, dented, probe).distances(matrices, pairs=pairs)
-    for a, b in zip(honest, promised, strict=True):
+    for a, b in zip(collision_fields(honest), collision_fields(promised), strict=True):
         assert np.array_equal(a, b)
-    assert np.isclose(promised[0][0], -0.1)
+    assert np.isclose(promised.distances[0], -0.1)
     # measured as the surface it is, the probe sits in the dent untouched
-    assert scene(False, dented, probe).collides(matrices, pairs=pairs).shape == (0, 2)
+    assert scene(False, dented, probe).collides(matrices, pairs=pairs).pairs.shape == (0, 2)
     with pytest.raises(ValueError, match=r"^meshes\[0\] is convex, so it needs faces$"):
         trimkit.CollisionScene([(vertices, faces[:0])], convex=True)
     with pytest.raises(ValueError, match="one row per mesh"):
@@ -260,7 +265,7 @@ def test_shared_scene():
     with ThreadPoolExecutor(8) as pool:
         results = list(pool.map(lambda _: shared.distances(matrices, index), range(16)))
     for result in results:
-        for got, want in zip(result, expected, strict=True):
+        for got, want in zip(collision_fields(result), collision_fields(expected), strict=True):
             assert np.array_equal(got, want, equal_nan=True)
 
 
@@ -270,8 +275,8 @@ def test_one_mesh_many_instances():
     one = scene(False)
     three = scene(False, box(), box(), box())
     matrices = placed(0.0, 0.5, 5.0)
-    assert one.collides(matrices, np.zeros(3, np.int64)).tolist() == [[0, 1]]
-    assert three.collides(matrices).tolist() == [[0, 1]]
+    assert one.collides(matrices, np.zeros(3, np.int64)).pairs.tolist() == [[0, 1]]
+    assert three.collides(matrices).pairs.tolist() == [[0, 1]]
 
 
 def test_convex_is_a_solid_against_every_mesh():
@@ -280,16 +285,17 @@ def test_convex_is_a_solid_against_every_mesh():
     inner, outer = box((0.4, 0.4, 0.4), (0.6, 0.6, 0.6)), box()
     mixed = scene([False, True], inner, outer)
     flipped = scene([True, False], outer, inner)
-    assert mixed.collides().tolist() == [[0, 1]]
-    assert flipped.collides().tolist() == [[0, 1]]
+    assert mixed.collides().pairs.tolist() == [[0, 1]]
+    assert flipped.collides().pairs.tolist() == [[0, 1]]
     # the inner surface is 0.4 inside the solid's boundary, either way round
-    assert mixed.distances()[0][0] == pytest.approx(-0.4, abs=1e-9)
-    assert flipped.distances()[0][0] == pytest.approx(-0.4, abs=1e-9)
+    assert mixed.distances().distances[0] == pytest.approx(-0.4, abs=1e-9)
+    assert flipped.distances().distances[0] == pytest.approx(-0.4, abs=1e-9)
     # apart, a mixed pair measures the same as two surfaces, either way round
     matrices = placed(0.0, 2.0)
     for order in ([False, True], [True, False]):
         two = scene(order, box(), box())
-        distance, points, normals = two.distances(matrices)
+        result = two.distances(matrices)
+        distance, points, normals = result.distances, result.points, result.normals
         assert distance == pytest.approx([1.0])
         assert points[0, 0, 0] == pytest.approx(1.0) and points[0, 1, 0] == pytest.approx(2.0)
         assert normals[0] == pytest.approx([1.0, 0.0, 0.0])
@@ -314,8 +320,8 @@ def test_boxes_bound_tightly():
     # boxes don't meet, where its vertices' box, turned, reaches past y = 3
     turned_box, beside_box = bars.boxes(matrices).boxes()
     assert turned_box[1, 1] < beside_box[0, 1]
-    assert bars.distances(matrices, upper_bound=1.0)[0].tolist() == [np.inf]
-    assert bars.distances(matrices)[0] == pytest.approx([2.9])
+    assert bars.distances(matrices, upper_bound=1.0).distances.tolist() == [np.inf]
+    assert bars.distances(matrices).distances == pytest.approx([2.9])
 
 
 @pytest.mark.parametrize("convex", [(False, False), (False, True), (True, False), (True, True)])
@@ -325,19 +331,22 @@ def test_upper_bound_is_exact(convex):
     # at most that far is measured exactly as without a bound
     two = scene(list(convex), sphere(), sphere())
     matrices = placed(0.0, (2.2, 2.2, 2.2))
-    measured, points, normals = two.distances(matrices)
+    result = two.distances(matrices)
+    measured, points, normals = result.distances, result.points, result.normals
     gap = measured[0]
     # the gap a brute-force minimum over every vertex of either sphere against
     # every triangle of the other gives (2026-11-09), from each kernel alike
     assert gap == pytest.approx(1.813354063143859, abs=1e-9)
-    far, far_points, far_normals = two.distances(matrices, upper_bound=1.0)
+    result = two.distances(matrices, upper_bound=1.0)
+    far, far_points, far_normals = result.distances, result.points, result.normals
     assert far.tolist() == [np.inf]
     assert np.isnan(far_points).all() and np.isnan(far_normals).all()
     for bound in (gap, np.nextafter(gap, np.inf), 2.0):
-        near, near_points, near_normals = two.distances(matrices, upper_bound=bound)
+        result = two.distances(matrices, upper_bound=bound)
+        near, near_points, near_normals = result.distances, result.points, result.normals
         assert near.tolist() == measured.tolist()
         assert np.array_equal(near_points, points) and np.array_equal(near_normals, normals)
-    assert two.distances(matrices, upper_bound=np.nextafter(gap, 0.0))[0].tolist() == [np.inf]
+    assert two.distances(matrices, upper_bound=np.nextafter(gap, 0.0)).distances.tolist() == [np.inf]
 
 
 @pytest.mark.parametrize("offset", [1.7, 0.6], ids=["apart", "penetrating"])
@@ -348,7 +357,8 @@ def test_distance_gradient(offset):
     rng = np.random.default_rng(3)
     two = scene(True, *[box((-0.5,) * 3, (0.5,) * 3)] * 2)
     turned = placed(0.0, (offset, 0.2, 0.1), rotations=[np.eye(3), rotation(rng)])
-    distance, points, normals = two.distances(turned)
+    result = two.distances(turned)
+    distance, points, normals = result.distances, result.points, result.normals
     lever = points[0, 1] - turned[1, :3, 3]
     step = 1e-4
     for _ in range(4):
@@ -358,7 +368,7 @@ def test_distance_gradient(offset):
         for sign in (1.0, -1.0):
             matrices = turned.copy()
             matrices[1, :3, 3] += sign * step * direction
-            moved.append(two.distances(matrices)[0][0])
+            moved.append(two.distances(matrices).distances[0])
         assert (moved[0] - moved[1]) / (2 * step) == pytest.approx(normals[0] @ direction, abs=1e-3)
         moved = []
         for sign in (1.0, -1.0):
@@ -373,7 +383,7 @@ def test_distance_gradient(offset):
             spin = np.eye(3) + np.sin(angle) * axis + (1 - np.cos(angle)) * axis @ axis
             matrices = turned.copy()
             matrices[1, :3, :3] = spin @ turned[1, :3, :3]
-            moved.append(two.distances(matrices)[0][0])
+            moved.append(two.distances(matrices).distances[0])
         assert (moved[0] - moved[1]) / (2 * step) == pytest.approx(
             np.cross(lever, normals[0]) @ direction, abs=1e-3
         )
@@ -398,14 +408,23 @@ def test_stacked_poses_are_one_call():
     stacked = chain.distances(matrices, index, pairs=pairs)
     touching = chain.collides(matrices, index, pairs=pairs)
     alone = [chain.distances(matrices[count * pose : count * (pose + 1)], pairs=one) for pose in range(poses)]
-    for stacked_output, alone_output in zip(stacked, zip(*alone, strict=True), strict=True):
+    # the same rows, each pose's pairs offset to its own instances
+    shifted = [
+        trimkit.CollisionResult(
+            result.pairs + count * pose, result.faces, result.distances, result.points, result.normals
+        )
+        for pose, result in enumerate(alone)
+    ]
+    for stacked_output, *alone_output in zip(
+        collision_fields(stacked), *(collision_fields(result) for result in shifted), strict=True
+    ):
         assert np.array_equal(stacked_output, np.concatenate(alone_output), equal_nan=True)
     expected = [
-        chain.collides(matrices[count * pose : count * (pose + 1)], pairs=one) + count * pose
+        chain.collides(matrices[count * pose : count * (pose + 1)], pairs=one).pairs + count * pose
         for pose in range(poses)
     ]
     assert len(touching) > 0
-    assert touching.tolist() == np.concatenate(expected).tolist()
+    assert touching.pairs.tolist() == np.concatenate(expected).tolist()
 
 
 def test_pairs_and_options_are_keywords():
@@ -416,4 +435,146 @@ def test_pairs_and_options_are_keywords():
         two.collides(None, None, np.array([[0, 1]], dtype=np.int64))
     with pytest.raises(TypeError):
         two.distances(None, None, np.array([[0, 1]], dtype=np.int64))
-    assert two.collides(pairs=np.array([[0, 1]], dtype=np.int64), margin=1.5).tolist() == [[0, 1]]
+    assert two.collides(pairs=np.array([[0, 1]], dtype=np.int64), margin=1.5).pairs.tolist() == [[0, 1]]
+
+
+def overlap_depth(first: np.ndarray, second: np.ndarray) -> float:
+    """
+    How deep two unit cubes placed by rigid transforms overlap: the least
+    translation that separates them, which for two boxes is the smallest
+    overlap along the separating axis theorem's fifteen axes, exactly.
+    """
+    corners = np.array([[x, y, z, 1.0] for x in (0, 1) for y in (0, 1) for z in (0, 1)])
+    a = (corners @ first.T)[:, :3]
+    b = (corners @ second.T)[:, :3]
+    axes = [*first[:3, :3].T, *second[:3, :3].T]
+    axes += [np.cross(u, v) for u in first[:3, :3].T for v in second[:3, :3].T]
+    depths = []
+    for axis in axes:
+        length = np.linalg.norm(axis)
+        if length < 1e-12:
+            continue
+        pa, pb = a @ (axis / length), b @ (axis / length)
+        depths.append(min(pa.max() - pb.min(), pb.max() - pa.min()))
+    return min(depths)
+
+
+def test_coincident_convex_cubes_overlap_by_their_width():
+    # two unit cubes in the same place, as solids: each contact is 1 deep
+    # along a unit axis, at no face, with witness points in both cubes
+    cubes = scene(True)
+    result = cubes.collides(placed(0.0, 0.0), np.zeros(2, np.int64), return_distance=True)
+    assert result.pairs.tolist() == [[0, 1]]
+    assert result.faces.tolist() == [[-1, -1]]
+    assert result.distances == pytest.approx([-1.0], abs=1e-9)
+    assert np.sort(np.abs(result.normals[0])) == pytest.approx([0.0, 0.0, 1.0], abs=1e-9)
+    assert ((result.points >= -1e-9) & (result.points <= 1.0 + 1e-9)).all()
+
+
+def test_contact_depth_is_the_separating_axis_overlap():
+    # random rigid poses of two convex unit cubes: every touching pair's one
+    # contact is exactly as deep as the separating axes say, its normal turns
+    # the pair apart, and the pairs are the ones `collides` finds alone
+    rng = np.random.default_rng(11)
+    cubes = scene(True)
+    measured = 0
+    for _ in range(60):
+        matrices = placed(0.0, rng.uniform(-1.2, 1.2, 3), rotations=[rotation(rng), rotation(rng)])
+        index = np.zeros(2, np.int64)
+        result = cubes.collides(matrices, index, return_distance=True)
+        assert result.pairs.tolist() == cubes.collides(matrices, index).pairs.tolist()
+        if len(result) == 0:
+            assert separated(matrices[0], matrices[1])
+            continue
+        measured += 1
+        assert result.distances[0] == pytest.approx(-overlap_depth(matrices[0], matrices[1]), abs=1e-6)
+        assert np.linalg.norm(result.normals[0]) == pytest.approx(1.0)
+        # moving the second cube along the normal by the depth separates them
+        moved = matrices.copy()
+        moved[1, :3, 3] += result.normals[0] * (-result.distances[0] + 1e-6)
+        assert separated(moved[0], moved[1])
+    assert measured > 10
+
+
+def test_mesh_contacts_name_real_faces():
+    # two triangle surfaces crossing: every contact names a real triangle of
+    # each mesh, and each witness point lies on its own triangle's plane
+    rng = np.random.default_rng(12)
+    meshes = [sphere(10, 20), box()]
+    surfaces = scene(False, *meshes)
+    for _ in range(10):
+        # a unit sphere centered beside the unit box, so their surfaces cross
+        center = np.array([1.0, 0.5, 0.5]) + rng.uniform(-0.2, 0.2, 3)
+        matrices = placed(center, 0.0, rotations=[rotation(rng), np.eye(3)])
+        result = surfaces.collides(matrices, return_distance=True, maximum_contacts=50)
+        assert len(result) > 0
+        for side in range(2):
+            vertices, faces = meshes[side]
+            assert ((result.faces[:, side] >= 0) & (result.faces[:, side] < len(faces))).all()
+            corners = (
+                vertices[faces[result.faces[:, side]]] @ matrices[side, :3, :3].T + matrices[side, :3, 3]
+            )
+            normal = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+            offset = ((result.points[:, side] - corners[:, 0]) * normal).sum(axis=1)
+            assert np.abs(offset).max() < 1e-9
+
+
+def test_maximum_contacts_bounds_rows_per_pair():
+    # at most that many contacts per pair, every touching pair still named,
+    # and asking for more never finds fewer
+    rng = np.random.default_rng(13)
+    surfaces = scene(False, sphere(10, 20), sphere(10, 20), box())
+    matrices = placed(0.0, (0.5, 0.2, 0.0), (0.2, 0.5, 0.3), rotations=[rotation(rng) for _ in range(3)])
+    touching = surfaces.collides(matrices).pairs.tolist()
+    assert len(touching) > 1
+    found = []
+    for maximum in (1, 2, 5, 50):
+        result = surfaces.collides(matrices, return_distance=True, maximum_contacts=maximum)
+        rows, counts = np.unique(result.pairs, axis=0, return_counts=True)
+        assert rows.tolist() == touching
+        assert (counts <= maximum).all()
+        found.append(len(result))
+    assert found == sorted(found) and found[0] == len(touching) and found[-1] > found[0]
+    with pytest.raises(ValueError, match="maximum_contacts"):
+        surfaces.collides(matrices, return_distance=True, maximum_contacts=0)
+
+
+def test_fields_are_none_unless_measured():
+    # without `return_distance` a query finds only pairs: the rest is None,
+    # never a placeholder, and a result built by hand holds what it's given
+    cubes = scene(True)
+    matrices, index = placed(0.0, 0.5, 5.0), np.zeros(3, np.int64)
+    fast = cubes.collides(matrices, index)
+    assert fast.pairs.tolist() == [[0, 1]] and len(fast) == 1
+    assert fast.faces is None and fast.distances is None and fast.points is None and fast.normals is None
+    measured = cubes.collides(matrices, index, return_distance=True)
+    assert (
+        all(field is not None for field in collision_fields(measured))
+        and len(collision_fields(measured)) == 5
+    )
+    given = trimkit.CollisionResult(
+        np.array([[0, 1], [2, 3]], dtype=np.int64), distances=np.array([1.0, np.inf])
+    )
+    assert given.distances.tolist() == [1.0, np.inf] and given.faces is None and len(given) == 2
+    with pytest.raises(ValueError, match="one row per pair"):
+        trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64), distances=np.zeros(2))
+    with pytest.raises(TypeError, match="faces"):
+        trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64), faces=np.zeros((1, 2)))
+
+
+def test_distance_faces_are_real_or_convex():
+    # a distance names the closest triangle of each mesh, -1 for a convex
+    # solid, and -1 for both when the pair is past the bound
+    meshes = [sphere(10, 20), box()]
+    matrices = placed(0.0, 3.0)
+    for convex in ([False, False], [False, True], [True, False], [True, True]):
+        result = scene(convex, *meshes).distances(matrices)
+        for side in range(2):
+            face = result.faces[0, side]
+            if convex[side]:
+                assert face == -1
+            else:
+                assert 0 <= face < len(meshes[side][1])
+        far = scene(convex, *meshes).distances(matrices, upper_bound=0.5)
+        assert far.faces.tolist() == [[-1, -1]] and far.distances.tolist() == [np.inf]

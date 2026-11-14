@@ -29,6 +29,7 @@ from helpers import (
     LITTLE_ENDIAN,
     box,
     circle,
+    collision_fields,
     first_hits,
     leaves,
     longest_gil_stall,
@@ -109,13 +110,53 @@ _SLOW_CALLS = {
     "Boxes.boxes": (_big_boxes, lambda b: trimkit.Boxes(b).boxes()),
     "Boxes.intersection": (_big_boxes, lambda b: trimkit.Boxes(b).intersection(b)),
     "CollisionScene.boxes": (_many_instances, lambda i: trimkit.CollisionScene([box()]).boxes(*i).boxes()),
+    "CollisionResult": (
+        _near_spheres,
+        lambda i: len(
+            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200])
+        ),
+    ),
+    "CollisionResult.pairs": (
+        _near_spheres,
+        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]).pairs,
+    ),
+    "CollisionResult.faces": (
+        _near_spheres,
+        lambda i: (
+            trimkit.CollisionScene([i[0]])
+            .collides(i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8)
+            .faces
+        ),
+    ),
+    "CollisionResult.distances": (
+        _near_spheres,
+        lambda i: (
+            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]).distances
+        ),
+    ),
+    "CollisionResult.points": (
+        _near_spheres,
+        lambda i: (
+            trimkit.CollisionScene([i[0]])
+            .collides(i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8)
+            .points
+        ),
+    ),
+    "CollisionResult.normals": (
+        _near_spheres,
+        lambda i: (
+            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]).normals
+        ),
+    ),
     "CollisionScene": (
         _near_spheres,
         lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]),
     ),
     "CollisionScene.collides": (
         _near_spheres,
-        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]),
+        lambda i: trimkit.CollisionScene([i[0]]).collides(
+            i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8
+        ),
     ),
     "CollisionScene.distances": (
         _near_spheres,
@@ -162,6 +203,12 @@ def empty_calls():
         "Boxes.boxes": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).boxes(),
         "Boxes.intersection": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).intersection(np.zeros((0, 2, 3))),
         "CollisionScene.boxes": lambda: trimkit.CollisionScene([]).boxes().boxes(),
+        "CollisionResult": lambda: len(trimkit.CollisionResult(np.zeros((0, 2), dtype=np.int64))),
+        "CollisionResult.pairs": lambda: trimkit.CollisionScene([]).collides().pairs,
+        "CollisionResult.faces": lambda: trimkit.CollisionScene([]).collides(return_distance=True).faces,
+        "CollisionResult.distances": lambda: trimkit.CollisionScene([]).distances().distances,
+        "CollisionResult.points": lambda: trimkit.CollisionScene([]).distances().points,
+        "CollisionResult.normals": lambda: trimkit.CollisionScene([]).collides(return_distance=True).normals,
         "CollisionScene": lambda: trimkit.CollisionScene([]).collides(),
         "CollisionScene.collides": lambda: trimkit.CollisionScene([(no_vertices, no_faces)] * 2).collides(),
         "CollisionScene.distances": lambda: trimkit.CollisionScene([]).distances(),
@@ -221,6 +268,32 @@ def pickled_objects() -> dict:
             ],
             lambda scene: scene.distances(),
         ),
+        "CollisionResult": (
+            [
+                {
+                    "pairs": np.array([[0, 1], [1, 2]], dtype=np.int64),
+                    "faces": np.array([[3, -1], [-1, -1]], dtype=np.int64),
+                    "distances": np.array([-0.25, np.inf]),
+                    "points": np.array([[[1.0, 0.0, 0.0], [0.75, 0.0, 0.0]], [[np.nan] * 3, [np.nan] * 3]]),
+                    "normals": np.array([[1.0, 0.0, 0.0], [np.nan] * 3]),
+                },
+                {
+                    "pairs": np.array([[0, 1]], dtype=np.int64),
+                    "faces": None,
+                    "distances": None,
+                    "points": None,
+                    "normals": None,
+                },
+                {
+                    "pairs": np.zeros((0, 2), dtype=np.int64),
+                    "faces": None,
+                    "distances": None,
+                    "points": None,
+                    "normals": None,
+                },
+            ],
+            lambda result: result,
+        ),
     }
 
 
@@ -242,7 +315,7 @@ def test_every_class_pickles():
                 assert sorted(constructor.keywords) == sorted(keywords)
                 for key, given in keywords.items():
                     reduced = constructor.keywords[key]
-                    if isinstance(given, bool):
+                    if isinstance(given, bool) or given is None:
                         assert reduced is given
                         continue
                     for argument, truth in zip(leaves(reduced), leaves(given), strict=True):
@@ -331,6 +404,13 @@ def test_values_must_be_bounded(name):
             for bad in bad_values:
                 broken = array.copy()
                 broken.flat[0] = bad
+                if name == "CollisionResult":
+                    # it holds a query's answers, as a pickle gives them back:
+                    # a pair past the bound is infinitely far, with NaN points
+                    # and normal, so it keeps any value exactly
+                    held = getattr(function(**{**arguments, argument: broken}), argument)
+                    assert np.array_equal(held, broken, equal_nan=True)
+                    continue
                 with pytest.raises(ValueError, match="must be finite"):
                     function(**{**arguments, argument: _replace(value, path, broken)})
 
@@ -400,8 +480,18 @@ def _array_arguments(big: bool = False) -> dict:
             collision_scene.boxes,
             {"instance_matrices": placed, "instance_index": np.zeros(instance_count, np.int64)},
         ),
-        ("CollisionScene.collides", collision_scene.collides, instances),
+        ("CollisionScene.collides", collision_scene.collides, {**instances, "return_distance": True}),
         ("CollisionScene.distances", collision_scene.distances, instances),
+        (
+            "CollisionResult",
+            trimkit.CollisionResult,
+            collision_scene.distances(**instances).__reduce__()[0].keywords,
+        ),
+        ("CollisionResult.pairs", lambda: collision_scene.collides(**instances).pairs, {}),
+        ("CollisionResult.faces", lambda: collision_scene.distances(**instances).faces, {}),
+        ("CollisionResult.distances", lambda: collision_scene.distances(**instances).distances, {}),
+        ("CollisionResult.points", lambda: collision_scene.distances(**instances).points, {}),
+        ("CollisionResult.normals", lambda: collision_scene.distances(**instances).normals, {}),
         ("triangulate", trimkit.triangulate, {"exterior": circle(40_000 if big else 8)}),
         ("decompose", trimkit.decompose, {"vertices": vertices, "faces": faces, "resolution": 20_000}),
         ("parametrize", trimkit.parametrize, {"vertices": vertices, "faces": faces}),
@@ -535,6 +625,8 @@ def _results(result) -> list:
     # what a call answers, comparable: its arrays, bytes, strings and numbers
     if isinstance(result, (tuple, list)):
         return [r for item in result for r in _results(item)]
+    if isinstance(result, trimkit.CollisionResult):
+        return collision_fields(result)
     if isinstance(result, trimkit.Boxes):
         return [result.boxes()]
     # what a scene holds, so its constructor's layouts are compared too
@@ -566,6 +658,8 @@ def _arrays(value) -> list:
     # every array in an argument or a result, through tuples and lists
     if isinstance(value, (tuple, list)):
         return [a for item in value for a in _arrays(item)]
+    if isinstance(value, trimkit.CollisionResult):
+        return collision_fields(value)
     return [value] if isinstance(value, np.ndarray) else []
 
 
@@ -686,7 +780,7 @@ _PARALLEL_QUERIES = """
 import hashlib, os, sys
 import numpy as np
 sys.path.insert(0, sys.argv[2])
-from helpers import sphere
+from helpers import collision_fields, sphere
 import trimkit
 if sys.argv[1] == "one":
     os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
@@ -704,8 +798,9 @@ outputs = [
     boxes.intersection(np.stack([queries, queries + 3.0], axis=1)),
     *scene.intersect(origins, directions, maximum_hits=1),
     *scene.intersect(origins, directions),
-    *solids.distances(matrices, index),
-    solids.collides(matrices, index),
+    *collision_fields(solids.distances(matrices, index)),
+    *collision_fields(solids.collides(matrices, index)),
+    *collision_fields(solids.collides(matrices, index, return_distance=True, maximum_contacts=4)),
 ]
 print(hashlib.sha256(b"".join(np.ascontiguousarray(a).tobytes() for a in outputs)).hexdigest())
 """
@@ -914,6 +1009,11 @@ def _scalar_calls():
         ),
         "convex": (lambda v: trimkit.CollisionScene([box()], convex=v).distances(placed, which), True),
         "margin": (lambda v: (scene().collides(placed, which, margin=v),), 1),
+        "return_distance": (lambda v: scene().collides(placed, which, margin=4.0, return_distance=v), True),
+        "maximum_contacts": (
+            lambda v: scene().collides(placed, which, margin=4.0, return_distance=True, maximum_contacts=v),
+            2,
+        ),
         "maximum_hits": (
             lambda v: trimkit.RayScene([(vertices, faces)]).intersect(
                 np.zeros((2, 3)), np.eye(3)[:2], maximum_hits=v
@@ -949,6 +1049,7 @@ def test_numpy_scalars_are_python_scalars(name):
         "resolution",
         "quantization_bits",
         "maximum_hits",
+        "maximum_contacts",
     )
     for scalar in _numpy_kinds(value):
         if integral and isinstance(scalar, (float, np.floating)):
@@ -959,7 +1060,7 @@ def test_numpy_scalars_are_python_scalars(name):
             assert np.array_equal(got, same, equal_nan=True) if isinstance(got, np.ndarray) else got == same
 
 
-@pytest.mark.parametrize("name", ["lock_border", "convex", "use_gpu"])
+@pytest.mark.parametrize("name", ["lock_border", "convex", "use_gpu", "return_distance"])
 @pytest.mark.parametrize("wrong", [0, 1, None, "yes", np.int64(1)])
 def test_nothing_else_is_a_bool(name, wrong):
     with pytest.raises(TypeError):

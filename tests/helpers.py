@@ -323,10 +323,23 @@ def leaves(result) -> list:
     """
     Every array, bytes, str, int or float in a result, in a fixed order.
     """
+    import trimkit
+
     if isinstance(result, (tuple, list)):
         return [a for r in result for a in leaves(r)]
+    if isinstance(result, trimkit.CollisionResult):
+        return leaves(collision_fields(result))
     assert isinstance(result, (np.ndarray, bytes, str, int, float)), type(result)
     return [result]
+
+
+def collision_fields(result) -> list:
+    """
+    A CollisionResult's arrays in a fixed order, those it holds: its pairs
+    always, the rest when its query measured them.
+    """
+    fields = (result.pairs, result.faces, result.distances, result.points, result.normals)
+    return [field for field in fields if field is not None]
 
 
 def public_api() -> list[str]:
@@ -415,9 +428,19 @@ def small_calls() -> dict:
         "Boxes.bounds": lambda: trimkit.Boxes(boxes).bounds,
         "Boxes.boxes": lambda: trimkit.Boxes(boxes).boxes(),
         "Boxes.intersection": lambda: trimkit.Boxes(boxes).intersection(boxes),
+        "CollisionResult": lambda: len(spheres().distances(apart, which)),
+        "CollisionResult.pairs": lambda: spheres().collides(overlapping, which).pairs,
+        "CollisionResult.faces": lambda: spheres().collides(overlapping, which, return_distance=True).faces,
+        "CollisionResult.distances": lambda: spheres().distances(apart, which).distances,
+        "CollisionResult.points": lambda: spheres().distances(apart, which).points,
+        "CollisionResult.normals": lambda: (
+            spheres().collides(overlapping, which, return_distance=True).normals
+        ),
         "CollisionScene": lambda: spheres().collides(overlapping, which),
         "CollisionScene.boxes": lambda: spheres().boxes(overlapping, which).boxes(),
-        "CollisionScene.collides": lambda: spheres().collides(overlapping, which, margin=0.1),
+        "CollisionScene.collides": lambda: spheres().collides(
+            overlapping, which, margin=0.1, return_distance=True, maximum_contacts=4
+        ),
         "CollisionScene.distances": lambda: spheres().distances(apart, which),
         "triangulate": lambda: trimkit.triangulate(circle(500)),
         "exchange.svg_parse": lambda: trimkit.exchange.svg_parse(path),

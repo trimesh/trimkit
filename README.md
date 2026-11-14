@@ -50,8 +50,12 @@ ray, instance, face, distance = rays.intersect(
 # if you say it is, but it isn't, it won't break, just the
 # returned queries will be wrong 
 solids = trimkit.CollisionScene([(vertices, faces)], convex=True)
-touching = solids.collides(matrices, index)
-distances, points, normals = solids.distances(matrices, index)
+# which pairs touch, and with `return_distance` where: faces, depths, points, normals
+touching = solids.collides(matrices, index).pairs
+contacts = solids.collides(matrices, index, return_distance=True)
+# every pair's signed distance, witness points, normal and closest faces
+measured = solids.distances(matrices, index)
+distances, points, normals = measured.distances, measured.points, measured.normals
 ```
 
 ## Packaging
@@ -99,10 +103,16 @@ Everything below this line is LLM output.
 | `decompose` | Decompose a closed triangle mesh into approximately convex hulls.<br>`hulls = trimkit.decompose(vertices, faces, maximum_hulls=1)` |
 | `parametrize` | Cut a mesh into charts and pack them into a UV atlas.<br>`vertex_sources, faces, uv = trimkit.parametrize(vertices, faces)` |
 | `simplify` | Collapse edges by quadric error until at most `face_count` faces remain.<br>`vertices, faces, vertex_sources = trimkit.simplify(vertices, faces, 4)` |
+| `CollisionResult` | What a collision or distance query found: one row per pair of instances, or per contact of a pair, as `CollisionScene.collides` and `CollisionScene.distances` return it.<br>`result = trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64))` |
+| `CollisionResult.pairs` | The instances of each row.<br>`pairs = result.pairs` |
+| `CollisionResult.faces` | The face of each instance's mesh each row is at, or None.<br>`faces = result.faces` |
+| `CollisionResult.distances` | The signed distance of each row, or None.<br>`distances = result.distances` |
+| `CollisionResult.points` | The witness point on each instance of each row, or None.<br>`points = result.points` |
+| `CollisionResult.normals` | The unit normal of each row, or None.<br>`normals = result.normals` |
 | `CollisionScene` | Meshes to place and query against each other. A scene never changes: each query names its own instances, so threads may share one.<br>`scene = trimkit.CollisionScene([(vertices, faces)], convex=True)` |
 | `CollisionScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = scene.boxes()` |
-| `CollisionScene.collides` | The pairs of instances that touch.<br>`pairs = scene.collides(placed, np.zeros(2, dtype=np.int64))` |
-| `CollisionScene.distances` | The distance between each pair of instances, and where it is.<br>`distances, points, normals = scene.distances(placed, np.zeros(2, dtype=np.int64))` |
+| `CollisionScene.collides` | The pairs of instances that touch, and optionally where.<br>`result = scene.collides(placed, np.zeros(2, dtype=np.int64))` |
+| `CollisionScene.distances` | The distance between each pair of instances, and where it is.<br>`result = scene.distances(placed, np.zeros(2, dtype=np.int64))` |
 | `__version__` | This package's version.<br>`isinstance(trimkit.__version__, str)` |
 | `Mesh` | A triangle mesh as the scenes take it and `decompose` returns it: a (vertices, faces) pair of (n, 3) float64 vertices and (m, 3) int64 triangle indices into them, given as a tuple, list or any sequence of two.<br>`mesh: trimkit.Mesh = (np.zeros((3, 3)), np.array([[0, 1, 2]], dtype=np.int64))` |
 | `exchange.DracoKind` | What a draco attribute holds, as `draco_encode` takes it.<br>`POSITION, NORMAL, TEXCOORD, COLOR, GENERIC` |
