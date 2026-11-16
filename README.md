@@ -1,6 +1,6 @@
 # trimkit
 
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, that have mature iterative solutions and are very slow in Python. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, providing bindings to mature implementations of iterative algorithms that are not vectorizable and untenably slow in Python (e.g. quadric edge collapse, collisions, etc). Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
 
 ```
 pip install trimkit
@@ -17,7 +17,7 @@ There's been many bindings to mostly the same underlying implementations of poly
 
 Most of the underlying geometry implementations in this package are mature and currently used by `trimesh` with different bindings. New to the pod are `tinybvh`, `coal`, `meshoptimizer`, and the SVG parser. `tinybvh` is the biggest change, and was picked because it looks well written, benchmarks look good, packaging embree has been a continuous source of pain, and it also provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of the flexible collision library (currently used by trimesh as `python-fcl`), that has more accurate convex distances. `meshoptimizer` is well-regarded, and easier to package than `open3d` or `fast-simplification`, small, and it never moves vertices.
 
-The weekly GitHub Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to lint, fuzz, and lock down in one place.
+The regularly scheduled GitHub Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to lint, fuzz, and lock down in one place.
 
 ### Example
 
@@ -63,7 +63,7 @@ distances, points, normals = measured.distances, measured.points, measured.norma
 
 ### Packaging
 
-This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`. It runs `clang` with profile-guided-optimization, and tries to get everything it can out of performance.
+This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`. It runs `clang` with profile-guided-optimization, and tries to get everything it can out of performance and bundle size.
 
 This builds `abi3` wheels on `python >= 312`, for Windows, Mac, and Linux. Linux has 4 (`glibc`/`MUSL`,`x86_64`/`aarch64`),  Mac has 2 (`x86_64`/`arm`), and Windows has 3 (`x86_64`/`arm`/`x86`), or 9 wheels per release.
 
@@ -85,7 +85,15 @@ This does not and will never load meshes, parse XML, or support anything that is
 - API: never expand without permission.
 - Geometry: these algorithms were mostly written by domain experts and have been run by millions of users. The standard of proof is extremely high for any change. Start with multiple failing tests, an absolutely solid root causea THIN fix that doesn't require new subsystems, and is justified from multiple angles and multiple cases, including performance data. And present the case coherently to a user: do not make changes to this without an explicit go-ahead, with success criteria established before implementing including failing tests; and a plan on how the change is going to be 50 lines or less to hot geometry code. 
 
-Basically: `nanobind` and the underlying geometry header should be doing 99% of the work. The main exceptions to this are three vibed out core files: `parallel.hpp` (because I couldn't find a thin "multiplatform rayon but for C++"), `svgpath.hpp` (because it's a very easy pass through a string that is very slow in Python), and `contour.hpp` (because marching cubes is a simple algorithm, `scikit-image` is great but it's quite heavy and was used ONLY for marching cubes, and this way we can support sparse+run+dense with one function signature, reducing call complexity).
+Basically: `nanobind` and the underlying geometry header should be doing 99% of the work. The main exceptions to this are three vibed out core logic:
+- `parallel.hpp`
+  - Because I couldn't find a thin "multiplatform rayon but for C++"
+- `svgpath.hpp`
+  - Because it's a very easy pass through a string that is very slow in Python
+- `contour.hpp`
+  - because marching cubes is a simple algorithm, `scikit-image` is great but it's quite heavy and was used ONLY for marching cubes, and this way we can support sparse+run+dense with one function signature, reducing call complexity.
+- the tinybvh vulkan path
+  - because tinybvh is still doing most of the work, and because GPU rays are SO much faster. On my machine the check is 150x faster, but readback/overhead brings it to only a 2x win. But the future is GPU and this can probably be improved on the same API. A lot of the slowness is because I insisted on f64 rays because I have years and years of "the ray check was wrong" which are pretty much all float32 not having enough precision. It does an f32 check, f64 refine which is only a 20% performance hit over pure f32. 
 
 
 ## // Claude Slop

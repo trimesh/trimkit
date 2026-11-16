@@ -425,7 +425,9 @@ class Config:
     """
 
     build_dir: Path  # absolute: objects, and PGO's profiles
-    strict: bool = False  # warnings in our sources are errors
+    # only compilers the gate has passed, and warnings in our sources are
+    # errors but with pgo=use, whose warnings its generate build judged
+    strict: bool = False
     sanitize: str = ""  # clang's -fsanitize= list, for every object
     pgo: str = ""  # profile-guided: "generate" instruments, "use" reads profiles/merged.profdata
     fuzz: bool = False  # also the libFuzzer harnesses in fuzz/, sanitized
@@ -752,15 +754,9 @@ def instrumentation(config: Config) -> Flags:
         generate = f"-fprofile-generate={config.profiles}"
         flags += Flags((generate,), (generate,))
     if config.pgo == "use":
-        # code the training never ran stays optimized normally, and a stale
-        # profile only steers less well: neither may fail a strict build
-        flags += Flags(
-            (
-                f"-fprofile-use={config.profile}",
-                "-Wno-profile-instr-unprofiled",
-                "-Wno-profile-instr-out-of-date",
-            )
-        )
+        # what the profile says about itself (stale, mismatched) is printed,
+        # never an error: plan() judges warnings in the generate build instead
+        flags += Flags((f"-fprofile-use={config.profile}",))
     return flags
 
 
@@ -823,7 +819,11 @@ def plan(manifest: Manifest, target: Target) -> str:
     # sanitized builds are for reports, which want lines and symbols
     stripped = NONE if config.debug or config.sanitizers else STRIP[platform.os]
     abi = FREE_THREADED if python.free_threaded else STABLE_ABI
-    ours = WARNINGS + (STRICT if config.strict else NONE)
+    # a profile-guided build's diagnostics depend on its training as well as
+    # its sources: on Mach-O, which has no COMDATs, an inline function shaped
+    # differently in two objects warns. Its sources were judged already, in
+    # the instrumented build that trained it (pgo.py), so it is never -Werror
+    ours = WARNINGS + (STRICT if config.strict and config.pgo != "use" else NONE)
     if "undefined" in config.sanitizers:
         ours += OURS_SANITIZED
     edges: list[str] = []
@@ -1031,6 +1031,14 @@ def check() -> None:
                     if f"vendor/{name}" in planned
                 ]
                 count += 1
+    # a release's warnings are errors in the build that trains it, never in
+    # the one its profile guides (plan)
+    platform = Platform("macos", "aarch64", False)
+    for pgo, werror in (("generate", True), ("use", False)):
+        config = Config(Path("/build").resolve(), strict=True, pgo=pgo)
+        planned = plan(manifest, Target(platform, Python.example(platform), Tools.example(platform), config))
+        if ("-Werror" in planned) != werror:
+            errors.append(f"strict pgo={pgo} {'lacks' if werror else 'has'} -Werror")
     # a system upstream's header is the one its vendored copy provides, as
     # the sources include it
     for upstream in manifest.upstreams.values():

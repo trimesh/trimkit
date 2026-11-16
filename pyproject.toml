@@ -84,7 +84,8 @@ manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 musllinux-x86_64-image = "musllinux_1_2"
 musllinux-aarch64-image = "musllinux_1_2"
-# release wheels fail on any warning in our sources
+# release wheels fail on any warning in our sources, judged in pgo.py's
+# instrumented build: strict here gates the compilers alone (builder.plan)
 config-settings = { strict = "true", pgo = "use" }
 # the test dependencies by hash too, then the wheel under test
 before-test = "uv pip install --require-hashes --no-deps -r {project}/requirements.txt"

@@ -6,8 +6,10 @@ build environment (`sys.executable`):
 1. install the build requirements and test dependencies from
    requirements.txt, by hash
 2. build an instrumented copy (`pgo=generate`) into the wheel's own build
-   directory and run the test suite, but for its wall-clock bounds, which
-   writes the profiles there
+   directory, strictly: this is where the wheel's warnings are errors, as
+   the profile-guided build's own can depend on the profile (builder.plan).
+   Then run the test suite, but for its wall-clock bounds, which writes
+   the profiles there
 3. merge them with the build's own llvm-profdata, found and checked as
    every tool is (builder.Tools), into the one file `pgo=use` reads, and
    uninstall the instrumented copy, so the wheel is then built in that same
@@ -41,7 +43,7 @@ def main() -> None:
     pip = ["uv", "pip", "install", "-q", "--python", sys.executable]
     run(*pip, "--require-hashes", "--no-deps", "-r", str(ROOT / "requirements.txt"))
     shutil.rmtree(config.profiles, ignore_errors=True)
-    run(*pip, "--no-build-isolation", "--no-deps", "-C", "pgo=generate", ".")
+    run(*pip, "--no-build-isolation", "--no-deps", "-C", "strict=true", "-C", "pgo=generate", ".")
     # from elsewhere, so the tests import the installed copy, not `src/`
     with tempfile.TemporaryDirectory() as elsewhere:
         run(
