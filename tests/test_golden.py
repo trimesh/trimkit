@@ -28,7 +28,7 @@ def lattice_sphere(n: int) -> tuple[np.ndarray, np.ndarray]:
     squares and sums are exact, and sqrt and division are correctly rounded
     everywhere, so every vertex is the same double on every platform.
     """
-    side = np.arange(-n, n + 1)
+    side = np.arange(-n, n + 1, dtype=np.int64)
     grid = np.stack(np.meshgrid(side, side, side, indexing="ij"), axis=-1).reshape(-1, 3)
     on_surface = (np.abs(grid) == n).any(axis=1)
     points = grid[on_surface].astype(np.float64)
@@ -72,14 +72,16 @@ def exact_directions() -> np.ndarray:
 
 
 def exact_rays() -> tuple[np.ndarray, np.ndarray]:
-    side = np.arange(-6, 7) / 4.0  # dyadic
+    side = np.arange(-6, 7, dtype=np.int64) / 4.0  # dyadic
     origins = np.stack(np.meshgrid(side, side, side, indexing="ij"), axis=-1).reshape(-1, 3)
     directions = exact_directions()
     # every origin with a direction, cycling through them deterministically
     o = origins
-    d = directions[np.arange(len(o)) % len(directions)]
+    d = directions[np.arange(len(o), dtype=np.int64) % len(directions)]
     # and each origin with a second direction, reversed
-    return np.vstack([o, o]), np.vstack([d, -directions[(np.arange(len(o)) * 7) % len(directions)]])
+    return np.vstack([o, o]), np.vstack(
+        [d, -directions[(np.arange(len(o), dtype=np.int64) * 7) % len(directions)]]
+    )
 
 
 def exact_instances() -> tuple[np.ndarray, np.ndarray]:
@@ -94,7 +96,7 @@ def exact_instances() -> tuple[np.ndarray, np.ndarray]:
         if k % 4 == 2:
             m[1, 1] = -1.5
         matrices.append(m)
-    return np.array(matrices), (np.arange(12) % 2).astype(np.int64)
+    return np.array(matrices), (np.arange(12, dtype=np.int64) % 2).astype(np.int64)
 
 
 def meshes() -> list:

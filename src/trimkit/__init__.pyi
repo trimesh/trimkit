@@ -30,7 +30,7 @@ True
 
 Notes
 -----
-Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float dbeabee, jk-jeon/dragonbox beeeef9, google/draco d429de8 +patches, jbikker/tinybvh c9be310 +patches, KhronosGroup/Vulkan-Headers 753d0fa, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1.
+Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float 8ec5968, jk-jeon/dragonbox beeeef9, google/draco 80bd29b +patches, jbikker/tinybvh c9be310 +patches, KhronosGroup/Vulkan-Headers b26454f, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1.
 """
 
 from collections.abc import Sequence
@@ -891,7 +891,7 @@ def contour(voxels: Annotated[NDArray[numpy.int64], dict(shape=(None, None), ord
     --------
     >>> import numpy as np
     >>> import trimkit
-    >>> runs = np.array([[0, 0, 0, 1]])
+    >>> runs = np.array([[0, 0, 0, 1]], dtype=np.int64)
     >>> vertices, faces, vertex_sources = trimkit.contour(runs)
     >>> len(vertices), len(faces), vertex_sources.tolist()
     (6, 8, [0, 0, 0, 0, 0, 0])

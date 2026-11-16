@@ -401,7 +401,8 @@ static const char* read_voxels(const VoxelInput& input, const Parallel& parallel
     const std::size_t size_y = input.volume_shape[1];
     const std::size_t size_z = input.volume_shape[2];
     for (const std::size_t extent : input.volume_shape) {
-        if (extent >= static_cast<std::size_t>(INDEX_LIMIT)) {
+        // compared as 64 bits: a 32-bit size_t would cut the limit to nothing
+        if (static_cast<std::uint64_t>(extent) >= static_cast<std::uint64_t>(INDEX_LIMIT)) {
             return "voxels must be within 2^52 of zero";
         }
     }

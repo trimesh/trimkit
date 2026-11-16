@@ -279,7 +279,7 @@ def case_contour(data: atheris.FuzzedDataProvider):
             # rows that don't overlap, so they are meshed: each in a column of its own
             voxels = voxels.copy()
             voxels[:, :3] %= 9
-            voxels[:, 0] = np.arange(len(voxels))
+            voxels[:, 0] = np.arange(len(voxels), dtype=np.int64)
             voxels[:, 3:] = voxels[:, 3:] % 9
     weights = array(data, None) if data.ConsumeBool() else None
     vertices, faces, vertex_sources = trimkit.contour(voxels, weights=weights, threshold=threshold)

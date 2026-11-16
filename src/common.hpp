@@ -186,24 +186,39 @@ std::exception_ptr on_pool(std::size_t count, const Body& body, bool eager, Inte
     return job.error;
 }
 
-// The shape of every batch query: `body(begin, end)` over [0, count) with the
-// GIL released; then, with it held again, a Ctrl-C raised as
-// KeyboardInterrupt or the first exception a range threw, rethrown. Each item
-// writes its own output, so the result doesn't depend on how the ranges fell
-template <typename Body>
-void in_parallel(std::size_t count, const Body& body) {
+// The pool from Python: `work(parallel)` with the GIL released, where
+// `parallel(count, body)` runs `body(begin, end)` over [0, count) on the
+// pool, Ctrl-C polled between ranges, and throws to stop `work` at the first
+// exception a range threw or at Ctrl-C, which comes back out of here as
+// KeyboardInterrupt. A header library that fans out on its own takes
+// `parallel` (src/contour.hpp); a batch query is one call of it
+template <typename Work>
+auto with_pool(const Work& work) {
+    struct PoolInterrupted {};
     Interrupt interrupt;
-    std::exception_ptr error;
-    {
+    const auto parallel = [&](std::size_t count, const auto& body) {
+        const std::exception_ptr error = on_pool(count, body, /*eager=*/false, &interrupt);
+        if (error) {
+            std::rethrow_exception(error);
+        }
+        if (interrupt.interrupted()) {
+            throw PoolInterrupted{};
+        }
+    };
+    try {
         const nb::gil_scoped_release release;
-        error = on_pool(count, body, /*eager=*/false, &interrupt);
-    }
-    if (interrupt.interrupted()) {
+        return work(parallel);
+    } catch (const PoolInterrupted&) {
         throw nb::python_error();
     }
-    if (error) {
-        std::rethrow_exception(error);
-    }
+}
+
+// The shape of every batch query: `body(begin, end)` over [0, count), each
+// item writing its own output, so the result doesn't depend on how the
+// ranges fell
+template <typename Body>
+void in_parallel(std::size_t count, const Body& body) {
+    with_pool([&](const auto& parallel) { parallel(count, body); });
 }
 
 // The pool's fork handler, installed once by the module's init
@@ -254,32 +269,6 @@ std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limi
         }
     });
     return beyond.load(std::memory_order_relaxed);
-}
-
-// `work(parallel)` with the GIL released, for a header library that fans out
-// on its own (src/contour.hpp): `parallel(count, body)` runs `body(begin,
-// end)` over [0, count) on the pool, Ctrl-C polled between ranges, and throws
-// to stop the library at the first exception a range threw, or at Ctrl-C,
-// which comes back out of here as KeyboardInterrupt
-template <typename Work>
-auto with_pool(const Work& work) {
-    struct PoolInterrupted {};
-    Interrupt interrupt;
-    const auto parallel = [&](std::size_t count, const auto& body) {
-        const std::exception_ptr error = on_pool(count, body, /*eager=*/false, &interrupt);
-        if (error) {
-            std::rethrow_exception(error);
-        }
-        if (interrupt.interrupted()) {
-            throw PoolInterrupted{};
-        }
-    };
-    try {
-        const nb::gil_scoped_release release;
-        return work(parallel);
-    } catch (const PoolInterrupted&) {
-        throw nb::python_error();
-    }
 }
 
 // One holder at a time of `word`, for what takes exactly one (a device's

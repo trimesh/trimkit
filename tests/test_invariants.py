@@ -57,7 +57,7 @@ def _big_mesh():
 
 def _big_rays():
     placed = np.tile(np.eye(4), (8, 1, 1))
-    placed[:, 0, 3] = np.arange(8) * 3.0
+    placed[:, 0, 3] = np.arange(8, dtype=np.int64) * 3.0
     return _big_mesh(), np.random.default_rng(0).normal(size=(2, 2_000_000, 3)), placed
 
 
@@ -495,13 +495,13 @@ def _array_arguments(big: bool = False) -> dict:
     segments = trimkit.exchange.svg_parse("M0 0 L1 1 L2 0" * (10_000 if big else 1))
     instance_count = 5_000 if big else 2
     placed = np.tile(np.eye(4), (instance_count, 1, 1))
-    placed[:, 0, 3] = np.arange(instance_count) * 3.0
+    placed[:, 0, 3] = np.arange(instance_count, dtype=np.int64) * 3.0
     origins_directions = {"origins": rays[0], "directions": rays[1]}
     ray_instances = {"instance_matrices": placed, "instance_index": np.zeros(instance_count, np.int64)}
     collision_scene = trimkit.CollisionScene([(vertices, faces)])
-    neighbors = np.column_stack([np.arange(instance_count - 1), np.arange(1, instance_count)]).astype(
-        np.int64
-    )
+    neighbors = np.column_stack(
+        [np.arange(instance_count - 1, dtype=np.int64), np.arange(1, instance_count, dtype=np.int64)]
+    ).astype(np.int64)
     instances = {
         "instance_matrices": placed,
         "instance_index": np.zeros(instance_count, np.int64),

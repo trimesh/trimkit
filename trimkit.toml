@@ -108,8 +108,8 @@ no_sanitize = { function = "OpenNL calls destructors through a mismatched functi
 [upstream.fast_float]
 repo = "fastfloat/fast_float"
 ref = "main"
-commit = "dbeabeeb3e6791cb96994c2a7a084c36e62ccfb2"
-tree_sha256 = "50f84a5645597c4d40baa578f83765c70fb624f50b5ca8bb7fa954f40a832054"
+commit = "8ec59686a1430867ba609c2777ca15143dd81003"
+tree_sha256 = "82d3e0ec8cbf8059ac67af39ea8a8da0380faf97673deab9b294cc6b96ae079a"
 spdx = "MIT OR Apache-2.0 OR BSL-1.0"
 keep = ["LICENSE-MIT"]
 include = ["vendor/fast_float/include"]
@@ -133,7 +133,7 @@ include = ["vendor/dragonbox/include/dragonbox"]
 [upstream.draco]
 repo = "google/draco"
 ref = "main"
-commit = "d429de84b52a860705507da0884764c5d8321423"
+commit = "80bd29bb2c2badfada765dfd4c6de571e5fe8273"
 tree_sha256 = "d4f4a3bdead5bbbfbc67196f6e080bc73a533c885dc9bfd294b8e05de91a31a1"
 spdx = "Apache-2.0"
 # its LICENSE is the bare Apache text: this is the notice its sources carry
@@ -170,7 +170,7 @@ NO_THREADED_BUILDS = "build on the calling thread: threaded builds gained 1-8% (
 [upstream.vulkan_headers]
 repo = "KhronosGroup/Vulkan-Headers"
 ref = "main"
-commit = "753d0fa284e803beabb4d5d1ab91a4f2d8a4a6a9"
+commit = "b26454f3ccd67e704117a39295fa13935fd3804c"
 tree_sha256 = "3763ccd8c20c9e64a898c1b213261509ce98e911473861ff2e0937a7d8e49b3e"
 spdx = "Apache-2.0 OR MIT"
 copyright = "Copyright 2015-2026 The Khronos Group Inc."
@@ -217,7 +217,10 @@ include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/t
 [upstream.eigen]
 host = "gitlab.com"
 repo = "libeigen/eigen"
-ref = "master"
+# pinned to a commit, so `update` leaves it: its master moves dozens of
+# headers between releases, and only coal reads them. We only really should
+# update this when eigen ships a major version, `ref` and `commit` together
+ref = "f6db5ea201198eb747bd9e34f7a3d8dfc4da308e"
 commit = "f6db5ea201198eb747bd9e34f7a3d8dfc4da308e"
 tree_sha256 = "32d85596bef0f51f6483911663f0eb8798c01289b1e9f94310f7cc2527140e13"
 spdx = "MPL-2.0"

@@ -3,13 +3,15 @@
 # `uv run scripts image` (and automatically by those commands) from the
 # repository root, see Dockerfile.dockerignore: every input is pinned by digest,
 # snapshot date or the hash-locked uv.lock.
-FROM debian:trixie@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
+FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 
 # clang (every build's compiler) with lld (its linker), its llvm tools,
 # sanitizer and libFuzzer runtimes, analyzers, the Vulkan loader with Mesa's
 # CPU device (lavapipe, which runs the GPU ray path in the gate) and glslang
 # (which `generate` compiles the shader with), git (every command reads the
-# files git tracks, never untracked ones), and what CPython needs to build,
+# files git tracks, never untracked ones), the 32-bit C and C++ libraries
+# (`fuzz` replays the header-only harnesses as 32-bit programs, where size_t
+# is 32 bits as on the x86 Windows wheel), and what CPython needs to build,
 # from the Debian archive as it was on the day the base image was built, read
 # from the snapshot date the image records: moving the image's digest moves
 # its packages with it. Plain http, as the base image has no CA certificates:
@@ -24,6 +26,7 @@ RUN snapshot="$(sed -n 's|^# http://snapshot.debian.org/archive/debian/\([0-9TZ]
     && apt-get install -y --no-install-recommends \
         ca-certificates curl git make pkg-config \
         clang clang-format clang-tidy lld llvm libclang-rt-dev cppcheck \
+        libc6-dev-i386 lib32gcc-14-dev lib32stdc++-14-dev \
         python3 zlib1g-dev libffi-dev liblzma-dev libbz2-dev \
         libvulkan1 mesa-vulkan-drivers glslang-tools \
     && rm -rf /var/lib/apt/lists/*

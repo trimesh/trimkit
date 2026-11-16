@@ -28,6 +28,7 @@ import sys
 import tarfile
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from builder import ROOT, TOML, Upstream, load, tracked_under
@@ -39,12 +40,12 @@ PATCHES = VENDOR / "patches"
 HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 
-def _get(url: str) -> bytes:
+def _get(url: str, headers: dict | None = None) -> bytes:
     # unauthenticated on purpose: nothing here reads the environment, and a
     # fetch makes one API call per pin, far below the anonymous rate limit
     if not url.startswith("https://"):
         raise ValueError(f"refusing a non-https url: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "trimkit-vendor"})  # noqa: S310
+    request = urllib.request.Request(url, headers={"User-Agent": "trimkit-vendor", **(headers or {})})  # noqa: S310
     with urllib.request.urlopen(request, timeout=60) as r:  # noqa: S310
         return r.read()
 
@@ -282,11 +283,29 @@ def tree_sha256(name: str, paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def _git(*arguments: str, check: bool) -> None:
+    # git in the repository, quietly: fetch keeps vendor/ as git has it
+    subprocess.run(
+        [shutil.which("git") or "git", "-C", str(ROOT), *arguments], check=check, capture_output=True
+    )
+
+
 def _fetch_one(pin: Upstream, latest: bool) -> None:
+    # all or nothing: whatever stops it partway (a patch that no longer
+    # applies, the network) leaves vendor/NAME and its pins as git has them
+    try:
+        _fetch_into(pin, latest)
+    except BaseException:
+        directory = f"vendor/{pin.name}"
+        _git("checkout", "--", directory, check=False)
+        # -x as well: an upstream's own .gitignore must not hide what it left
+        _git("clean", "-fdqx", "--", directory, check=False)
+        raise
+
+
+def _fetch_into(pin: Upstream, latest: bool) -> None:
     name = pin.name
     commit = _resolve(pin) if latest else pin.commit
-    # record the resolved commit so the manifest always names exact bytes
-    _record(f"upstream.{name}", "commit", commit)
 
     dest = VENDOR / name
     shutil.rmtree(dest, ignore_errors=True)
@@ -325,15 +344,27 @@ def _fetch_one(pin: Upstream, latest: bool) -> None:
     # patched first: a patch can change what is included
     _prune(pin)
 
-    # what was just written, tracked or not: check then wants it all `git add`ed
+    # its pins once it is whole: the commit, so the manifest always names exact
+    # bytes, and the tree of everything just written
+    _record(f"upstream.{name}", "commit", commit)
     _record(f"upstream.{name}", "tree_sha256", tree_sha256(name, [p for p in dest.rglob("*") if p.is_file()]))
+    # a file the upstream added is intended for the index, as every build
+    # reads only what git tracks
+    _git("add", "--intent-to-add", "--", f"vendor/{name}", check=True)
     print(f"{name}: {pin.ref} @ {commit[:12]}")
 
 
-def fetch(names: list[str], latest: bool = False) -> None:
+def fetch(names: list[str], latest: bool = False) -> list[str]:
+    # every named upstream (all of them by default); returns why any whose
+    # patch no longer applies stayed as it was, for the caller to report
     pins = load().upstreams
+    held = []
     for name in names or list(pins):
-        _fetch_one(pins[name], latest)
+        try:
+            _fetch_one(pins[name], latest)
+        except ValueError as error:
+            held.append(f"{name}: {error}")
+    return held
 
 
 def check() -> None:
@@ -396,3 +427,92 @@ def outdated() -> None:
             print(f"{name}: pinned {pin.commit[:12]}, {pin.ref} is at {latest[:12]}")
     if stale:
         sys.exit(f"{stale} upstreams moved")
+
+
+# The pins outside vendor/ that nothing else moves: the GitHub Actions the
+# workflows use, by commit with the release in a comment, and the image's
+# base, by digest. Each moves to its newest release a week old, the lock's
+# own cooldown (`exclude-newer`), so a hijacked release has time to be pulled
+COOLDOWN = timedelta(days=7)
+WORKFLOWS = ROOT / ".github" / "workflows"
+DOCKERFILE = ROOT / "docker" / "Dockerfile"
+USES = re.compile(r"(uses: )([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # (v[\w.-]+)")
+RELEASE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
+BASE = re.compile(r"^FROM ([\w.-]+):([\w.-]+)@(sha256:[0-9a-f]{64})$", re.MULTILINE)
+
+
+def _ripe(stamp: str) -> bool:
+    # an ISO 8601 time at least the cooldown ago
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")) <= datetime.now(UTC) - COOLDOWN
+
+
+def _newest_action(repo: str) -> tuple[str, str]:
+    # its highest vX.Y.Z release past the cooldown, by version rather than by
+    # date (a maintenance release of an old line often comes out last), and
+    # the commit that release's tag names
+    releases = json.loads(_get(f"https://api.github.com/repos/{repo}/releases?per_page=100"))
+    ripe = [
+        r["tag_name"]
+        for r in releases
+        if not (r["prerelease"] or r["draft"])
+        and RELEASE.fullmatch(r["tag_name"])
+        and _ripe(r["published_at"])
+    ]
+    tag = max(ripe, key=lambda t: tuple(int(n) for n in RELEASE.fullmatch(t).groups()))
+    target = json.loads(_get(f"https://api.github.com/repos/{repo}/git/ref/tags/{tag}"))["object"]
+    # an annotated tag names a tag object, which names the commit
+    while target["type"] == "tag":
+        target = json.loads(_get(target["url"]))["object"]
+    return tag, target["sha"]
+
+
+def _pinned_use(match: re.Match, newest: dict) -> str:
+    # one `uses:` line moved to its action's newest release: the commit, then
+    # the release in a comment
+    tag, commit = newest[match[2]]
+    return f"{match[1]}{match[2]}@{commit} # {tag}"
+
+
+def update_actions() -> None:
+    newest = {}
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = path.read_text()
+        for repo in sorted({m.group(2) for m in USES.finditer(text)} - set(newest)):
+            newest[repo] = _newest_action(repo)
+        moved = USES.sub(lambda m: _pinned_use(m, newest), text)
+        if moved != text:
+            path.write_text(moved)
+    for repo, (tag, commit) in newest.items():
+        print(f"{repo}: {tag} ({commit[:12]})")
+
+
+def update_base_image() -> None:
+    # the base's tag as Docker Hub serves it now, once its linux/amd64 image
+    # was built at least the cooldown ago: that digest, and with it the
+    # Debian snapshot the image records, which every package is installed from
+    text = DOCKERFILE.read_text()
+    match = BASE.search(text)
+    name, tag, pinned = match.groups()
+    repository = name if "/" in name else f"library/{name}"
+    token = json.loads(
+        _get(f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull")
+    )["token"]
+    registry = f"https://registry-1.docker.io/v2/{repository}"
+    accept = (
+        "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, "
+        "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+    )
+    headers = {"Authorization": f"Bearer {token}", "Accept": accept}
+    index_bytes = _get(f"{registry}/manifests/{tag}", headers)
+    digest = "sha256:" + hashlib.sha256(index_bytes).hexdigest()
+    index = json.loads(index_bytes)
+    amd64 = next(
+        m["digest"]
+        for m in index["manifests"]
+        if m.get("platform", {}).get("os") == "linux" and m.get("platform", {}).get("architecture") == "amd64"
+    )
+    config = json.loads(_get(f"{registry}/manifests/{amd64}", headers))["config"]["digest"]
+    created = json.loads(_get(f"{registry}/blobs/{config}", headers))["created"]
+    if digest != pinned and _ripe(created):
+        DOCKERFILE.write_text(text.replace(f"{name}:{tag}@{pinned}", f"{name}:{tag}@{digest}"))
+    print(f"{name}:{tag}: {digest if _ripe(created) else pinned} (newest built {created[:10]})")

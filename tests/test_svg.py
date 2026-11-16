@@ -246,8 +246,8 @@ def test_numbers_are_written_as_to_chars():
             patterns[np.abs(patterns) <= 1e30],
             np.round(rng.uniform(-1e4, 1e4, 4_000), 3),
             integers,
-            np.ldexp(1.0, np.arange(-1074, 100)),
-            10.0 ** np.arange(-300, 31),
+            np.ldexp(1.0, np.arange(-1074, 100, dtype=np.int32)),
+            10.0 ** np.arange(-300, 31, dtype=np.int64),
             [0.0, -0.0, 5e-324, 1e30, -1e30, 2.0**60, 1e22, 1e23],
         ]
     )
@@ -279,7 +279,7 @@ def test_string_hand_built():
         trimkit.exchange.svg_string(vertices, bad)
     with pytest.raises(ValueError, match="finite"):
         trimkit.exchange.svg_string(
-            np.where(np.arange(len(vertices))[:, None] == 3, np.nan, vertices), segments
+            np.where(np.arange(len(vertices), dtype=np.int64)[:, None] == 3, np.nan, vertices), segments
         )
     bad = segments.copy()
     bad["points"][1, 3] = len(vertices)

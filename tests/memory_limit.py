@@ -66,6 +66,18 @@ def main() -> None:
     with contextlib.suppress(MemoryError):
         trimkit.decompose(vertices, faces, resolution=64_000_000)
 
+    # outputs handed out first and written by later passes: contour's vertices,
+    # sources, faces and keys each fit, together they don't. The door counts
+    # what it has handed out but the system hasn't seen written, so the one
+    # that doesn't fit is a MemoryError, where each checked alone against
+    # what was free got the process killed once they were written. 1000
+    # columns apart, each a tall run: about 88 bytes of output per voxel side
+    columns = 1000
+    length = int(limit * 1.1 / 88 / 4 / columns)
+    runs = np.array([[2 * i, 0, 0, length] for i in range(columns)], dtype=np.int64)
+    assert refused(trimkit.contour, runs), f"{columns} columns of {length} voxels contoured within the limit"
+    del runs
+
     # what fits still works, at a quarter of the limit
     kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
     points = limit // 4 // (4 * 3 * 2 + 4)

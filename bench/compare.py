@@ -347,7 +347,7 @@ def draco_encode_new(context):
     values = [np.ascontiguousarray(arrays[attributes[n]]) for n in names]
     buffer = trimkit.exchange.draco_encode(indices, values, np.array([draco_kind(n) for n in names]))
     # keep trimesh's guard: a round trip must preserve every count
-    faces, (position,) = trimkit.exchange.draco_decode(buffer, np.array([0]))
+    faces, (position,) = trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64))
     if len(position) != len(values[0]) or len(faces) != len(indices):
         return None
     # draco attribute i is attributes[i], which is the extension's JSON
@@ -391,7 +391,7 @@ def svg_path_old(path_string, start):
     if len(raw) == 0:
         return [], np.zeros((0, 2))
     kinds_lookup = {"Line": 1, "Close": 1, "Arc": 2}
-    kinds = np.array([kinds_lookup.get(type(i).__name__, 0) for i in raw], dtype=int)
+    kinds = np.array([kinds_lookup.get(type(i).__name__, 0) for i in raw], dtype=np.int64)
     blocks = grouping.blocks(kinds, min_len=1, only_nonzero=False)
     parsed = []
     for b in blocks:
@@ -424,16 +424,16 @@ def svg_path_old(path_string, start):
         kind = item[0] if isinstance(item, tuple) else type(item).__name__
         if kind == "MultiLine":
             points = item[1]
-            entity = Line(points=np.arange(len(points)) + count)
+            entity = Line(points=np.arange(len(points), dtype=np.int64) + count)
         elif kind == "Arc":
             points = complex_to_float([item.start, item.point(0.5), item.end])
-            entity = Arc(points=np.arange(3) + count, closed=getattr(item, "closed", False))
+            entity = Arc(points=np.arange(3, dtype=np.int64) + count, closed=getattr(item, "closed", False))
         elif kind == "QuadraticBezier":
             points = complex_to_float([item.start, item.control, item.end])
-            entity = Bezier(points=np.arange(3) + count)
+            entity = Bezier(points=np.arange(3, dtype=np.int64) + count)
         elif kind == "CubicBezier":
             points = complex_to_float([item.start, item.control1, item.control2, item.end])
-            entity = Bezier(np.arange(4) + count)
+            entity = Bezier(np.arange(4, dtype=np.int64) + count)
         else:
             continue
         entities.append(entity)
@@ -496,7 +496,7 @@ def svg_path_new(path_string, start):
     heads = np.flatnonzero(first | ~(line | closed))
     bounds = np.zeros(len(heads) + 1, dtype=np.int64)
     np.cumsum(np.add.reduceat(mask.sum(axis=1), heads), out=bounds[1:])
-    index = np.arange(start, start + len(vertices))
+    index = np.arange(start, start + len(vertices), dtype=np.int64)
     entities = [
         Arc(points=index[a:b], closed=c)
         if k == trimkit.exchange.SvgKind.ARC

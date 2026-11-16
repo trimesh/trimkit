@@ -472,7 +472,7 @@ def test_all_hits_match_brute_force_and_first():
     assert len(rays) > 0
     # sorted by ray, then nearest first
     order = np.lexsort((distances, rays))
-    assert np.array_equal(order, np.arange(len(rays)))
+    assert np.array_equal(order, np.arange(len(rays), dtype=np.int64))
     # the first row of each ray is exactly its nearest hit, capped at one
     _, _, first_distances = first_hits(scene, origins, directions, transforms, index)
     heads = np.flatnonzero(np.r_[True, rays[1:] != rays[:-1]])
@@ -826,14 +826,14 @@ def test_maximum_hits_caps_each_ray():
     origins = np.column_stack([np.full(50, -5.0), rng.uniform(-0.5, 0.5, (50, 2))])
     directions = np.tile([1.0, 0.0, 0.0], (50, 1))
     full = scene.intersect(origins, directions)
-    assert np.array_equal(np.bincount(full[0]), np.full(50, 4))
+    assert np.array_equal(np.bincount(full[0]), np.full(50, 4, dtype=np.int64))
     for k in (1, 2, 3, 4, 10):
         keep = np.concatenate([np.flatnonzero(full[0] == ray)[:k] for ray in range(50)])
         for column, expected in zip(scene.intersect(origins, directions, maximum_hits=k), full, strict=True):
             assert np.array_equal(column, expected[keep])
     rays, instances, faces_hit, distances = scene.intersect(origins, directions, maximum_hits=1)
     first = first_hits(scene, origins, directions)
-    assert np.array_equal(rays, np.arange(50))
+    assert np.array_equal(rays, np.arange(50, dtype=np.int64))
     for mine, theirs in zip((instances, faces_hit, distances), first, strict=True):
         assert np.array_equal(mine, theirs)
     with pytest.raises(ValueError, match="maximum_hits"):

@@ -4,7 +4,8 @@
 # Each run starts from the seeds in the repository and keeps nothing between
 # runs, so a run is the commit and nothing else. A finding fails the run and
 # is uploaded as an artifact; nothing is published.
-# Actions are pinned to the commit of their release; Dependabot moves them.
+# Actions are pinned to the commit of their release; `uv run scripts update`
+# moves them.
 name: fuzz
 
 on:

@@ -108,7 +108,7 @@ def _degenerate(kind: str, n: int) -> np.ndarray:
         s = np.linspace(0, 1, n // 4, endpoint=False)
         z, o = np.zeros_like(s), np.ones_like(s)
         return np.vstack([np.column_stack(c) for c in ((s, z), (o, s), (1 - s, o), (z, 1 - s))])
-    radius = 1.0 + 0.1 * (np.arange(n) % 2) if kind == "gear" else np.ones(n)
+    radius = 1.0 + 0.1 * (np.arange(n, dtype=np.int64) % 2) if kind == "gear" else np.ones(n)
     return np.column_stack([radius * np.cos(angle), radius * np.sin(angle)])
 
 

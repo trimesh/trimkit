@@ -106,8 +106,10 @@ class PlannableScene:
         """
         count = len(poses)
         matrices = poses[:, : self.mesh_count].reshape(-1, 4, 4)
-        index = np.tile(np.arange(self.mesh_count), count)
-        pairs = (self.pairs + self.mesh_count * np.arange(count)[:, None, None]).reshape(-1, 2)
+        index = np.tile(np.arange(self.mesh_count, dtype=np.int64), count)
+        pairs = (self.pairs + self.mesh_count * np.arange(count, dtype=np.int64)[:, None, None]).reshape(
+            -1, 2
+        )
         return self.scene.distances(matrices, index, pairs=pairs, upper_bound=upper_bound)
 
     def plan(self, guess: np.ndarray, *, clearance: float, smoothing: float, waypoint_count: int) -> Plan:

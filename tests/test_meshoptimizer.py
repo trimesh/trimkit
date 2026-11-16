@@ -13,7 +13,7 @@ def test_simplifies_to_the_target_keeping_the_shape():
     assert len(kept_vertices) == 698
     # a subset of the input vertices, unmoved and each used
     assert len(np.unique(vertex_sources)) == len(vertex_sources)
-    assert np.array_equal(np.unique(new_faces), np.arange(len(vertex_sources)))
+    assert np.array_equal(np.unique(new_faces), np.arange(len(vertex_sources), dtype=np.int64))
     assert np.array_equal(kept_vertices, vertices[vertex_sources])
     # and the shape kept: the coarse sphere's volume is 0.9906 of the fine one's
     assert np.isclose(volume(kept_vertices, new_faces) / volume(vertices, faces), 0.99064273, rtol=1e-6)

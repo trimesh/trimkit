@@ -355,8 +355,8 @@ Every input that reaches a wheel, and what pins it:
   the TSan CPython by sha256. Every check runs from the image's own
   environment: nothing on the host can steer it.
 - CI: actions pinned by commit; cibuildwheel pins its Linux images by digest and
-  its macOS and Windows Pythons by sha256. Dependabot moves pins with the same
-  cooldown.
+  its macOS and Windows Pythons by sha256. `uv run scripts update` moves every
+  pin (upstreams, the lock, actions, base images) with the same cooldown.
 
 Pinned by version or signature only, as nothing finer exists for them: clang and
 lld from the manylinux and musllinux images' own package repositories (signed),

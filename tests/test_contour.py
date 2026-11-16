@@ -69,9 +69,9 @@ def test_random_grids_close_with_a_vertex_per_crossing():
 
 
 def test_one_voxel_is_an_octahedron():
-    vertices, faces, vertex_sources = trimkit.contour(np.array([[4, -2, 7]]))
+    vertices, faces, vertex_sources = trimkit.contour(np.array([[4, -2, 7]], dtype=np.int64))
     assert len(vertices) == 6 and len(faces) == 8
-    assert np.array_equal(ordered(vertices), ordered(np.array([4, -2, 7]) + BESIDE / 2.0))
+    assert np.array_equal(ordered(vertices), ordered(np.array([4, -2, 7], dtype=np.int64) + BESIDE / 2.0))
     assert np.isclose(volume(vertices, faces), 1.0 / 6.0)
     assert vertex_sources.tolist() == [0] * 6
 
@@ -79,11 +79,11 @@ def test_one_voxel_is_an_octahedron():
 def test_voxels_sharing_only_an_edge_or_corner_stay_apart():
     # one closed octahedron each: nothing joins them
     for other in ([1, 1, 0], [1, 1, 1]):
-        vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0], other]))
+        vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0], other], dtype=np.int64))
         assert len(vertices) == 12 and len(faces) == 16
         assert is_closed(faces)
     # sharing a face they are one surface
-    vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0], [1, 0, 0]]))
+    vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0], [1, 0, 0]], dtype=np.int64))
     assert len(vertices) == 10 and is_closed(faces)
 
 
@@ -132,7 +132,7 @@ def test_a_solid_costs_its_surface():
 
 
 def test_vertex_sources_name_the_inside_run():
-    runs = np.array([[0, 0, 0, 3], [1, 0, 1, 1], [5, 5, 5, 2]])
+    runs = np.array([[0, 0, 0, 3], [1, 0, 1, 1], [5, 5, 5, 2]], dtype=np.int64)
     vertices, _, vertex_sources = trimkit.contour(runs)
     assert set(vertex_sources.tolist()) == {0, 1, 2}
     for vertex, source in zip(vertices, vertex_sources, strict=True):
@@ -153,7 +153,7 @@ def test_weights_move_the_crossing_to_a_half():
     # between a voxel weighing `inside` and one weighing `outside` the vertex
     # sits where the line between them passes a half
     for inside, outside in ((1.0, 0.0), (0.75, 0.25), (1.0, 0.25), (0.625, 0.0), (1.0, 0.5)):
-        runs = np.array([[0, 0, 0], [1, 0, 0]])
+        runs = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.int64)
         vertices, faces, vertex_sources = trimkit.contour(runs, weights=np.array([inside, outside]))
         assert is_closed(faces)
         assert (vertex_sources == 0).all()
@@ -162,7 +162,9 @@ def test_weights_move_the_crossing_to_a_half():
         # toward empty space, which weighs nothing
         assert vertices[:, 0].min() == -1.0 + 0.5 / inside
     # a half or less is outside: nothing inside, no surface
-    for vertices_or_faces in trimkit.contour(np.array([[0, 0, 0]]), weights=np.array([0.5]))[:2]:
+    for vertices_or_faces in trimkit.contour(np.array([[0, 0, 0]], dtype=np.int64), weights=np.array([0.5]))[
+        :2
+    ]:
         assert len(vertices_or_faces) == 0
 
 
@@ -196,13 +198,13 @@ def test_overlapping_runs_are_refused():
         [[0, 0, 3, 1], [5, 5, 5, 1], [0, 0, 0, 4]],
         [[0, 0, 0, 4], [0, 0, 1, 2]],
     ):
-        runs = np.array(rows)
+        runs = np.array(rows, dtype=np.int64)
         for weights in (None, np.zeros(len(runs)), np.linspace(0.0, 1.0, len(runs))):
             with pytest.raises(ValueError, match="must not overlap"):
                 trimkit.contour(runs, weights=weights)
     # runs that only touch are apart
-    touching = trimkit.contour(np.array([[0, 0, 0, 4], [0, 0, 4, 2], [0, 1, 0, 6]]))
-    single = trimkit.contour(np.array([[0, y, z] for y in range(2) for z in range(6)]))
+    touching = trimkit.contour(np.array([[0, 0, 0, 4], [0, 0, 4, 2], [0, 1, 0, 6]], dtype=np.int64))
+    single = trimkit.contour(np.array([[0, y, z] for y in range(2) for z in range(6)], dtype=np.int64))
     assert np.array_equal(ordered(touching[0]), ordered(single[0])) and is_closed(touching[1])
 
 
@@ -211,7 +213,7 @@ def test_a_surface_too_large_is_refused_at_once():
     # refused before anything that size is made
     for runs in ([[0, 0, 0, 2**50]], [[x, 2 * x, -(2**51), 2**52] for x in range(400)]):
         with pytest.raises(MemoryError):
-            trimkit.contour(np.array(runs))
+            trimkit.contour(np.array(runs, dtype=np.int64))
 
 
 def test_every_vertex_is_ringed_by_one_fan():
@@ -239,28 +241,28 @@ def test_nothing_gives_nothing():
         assert vertices.shape == (0, 3) and faces.shape == (0, 3) and vertex_sources.shape == (0,)
         assert (vertices.dtype, faces.dtype, vertex_sources.dtype) == (np.float64, np.int64, np.int64)
     # rows weighing nothing are no rows
-    vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0]]), weights=np.zeros(1))
+    vertices, faces, _ = trimkit.contour(np.array([[0, 0, 0]], dtype=np.int64), weights=np.zeros(1))
     assert len(vertices) == 0 and len(faces) == 0
 
 
 def test_the_limit_is_exact():
     # the farthest voxels allowed still give exact half-integer vertices
     limit = 2**52
-    far = np.array([[limit - 1, -(limit - 1), limit - 3, 2]])
+    far = np.array([[limit - 1, -(limit - 1), limit - 3, 2]], dtype=np.int64)
     vertices, faces, _ = trimkit.contour(far)
     assert is_closed(faces) and len(vertices) == 10
     assert vertices[:, 0].max() == limit - 0.5 and vertices[:, 1].min() == -(limit - 0.5)
     assert vertices[:, 2].max() == limit - 1.5
     for bad in ([[limit, 0, 0, 1]], [[0, -limit, 0, 1]], [[0, 0, limit - 1, 2]], [[0, 0, 0, limit + 1]]):
         with pytest.raises(ValueError, match="within 2\\^52"):
-            trimkit.contour(np.array(bad))
+            trimkit.contour(np.array(bad, dtype=np.int64))
 
 
 def test_bad_input_is_refused():
-    runs = np.array([[0, 0, 0, 1], [1, 0, 0, 2]])
+    runs = np.array([[0, 0, 0, 1], [1, 0, 0, 2]], dtype=np.int64)
     for length in (0, -1):
         with pytest.raises(ValueError, match="length of at least 1"):
-            trimkit.contour(np.array([[0, 0, 0, length]]))
+            trimkit.contour(np.array([[0, 0, 0, length]], dtype=np.int64))
     for columns in (2, 5):
         with pytest.raises(ValueError, match=r"\(n, 3\) or \(n, 4\)"):
             trimkit.contour(np.zeros((1, columns), dtype=np.int64))
@@ -295,7 +297,7 @@ def test_a_volume_is_its_voxels():
         for fill in (0.2, 0.5, 0.9):
             dense = rng.random(shape) < fill
             got = trimkit.contour(dense)
-            want = trimkit.contour(np.argwhere(dense))
+            want = trimkit.contour(np.argwhere(dense).astype(np.int64))
             assert np.array_equal(got[0], want[0]) and np.array_equal(got[1], want[1])
             assert np.array_equal(got[2], np.flatnonzero(dense)[want[2]])
             assert is_closed(got[1])
@@ -323,7 +325,7 @@ def test_a_weight_volume_is_its_weighted_voxels():
             field = rng.choice([-3.0, 0.0, 0.25, 0.5, 1.0, 4.0], size=(6, 5, 7)) * rng.random((6, 5, 7))
             field[rng.random(field.shape) < 0.3] = 0.0
             got = trimkit.contour(field, threshold=threshold)
-            rows = np.argwhere(field != 0.0)
+            rows = np.argwhere(field != 0.0).astype(np.int64)
             want = trimkit.contour(rows, weights=field[field != 0.0], threshold=threshold)
             assert np.array_equal(got[0], want[0]) and np.array_equal(got[1], want[1])
             assert np.array_equal(got[2], np.flatnonzero(field)[want[2]])
@@ -338,7 +340,7 @@ def test_a_field_meshes_to_its_level_set():
     # a ball's signed distance, unclipped and in any units: the vertices sit
     # where the distance interpolated along each edge is the threshold
     radius = 10.3
-    axis = np.arange(-13, 14)
+    axis = np.arange(-13, 14, dtype=np.int64)
     distance = np.sqrt(axis[:, None, None] ** 2 + axis[None, :, None] ** 2 + axis[None, None, :] ** 2)
     for scale in (1.0, 1000.0):
         field = scale * (radius - distance) + 2.0 * scale
@@ -352,7 +354,7 @@ def test_a_field_meshes_to_its_level_set():
 def test_threshold_moves_the_crossing():
     # between a voxel weighing `inside` and one weighing `outside` the
     # vertex sits where the line between them passes the threshold
-    runs = np.array([[0, 0, 0], [1, 0, 0]])
+    runs = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.int64)
     for inside, outside, threshold in ((4.0, -2.0, 1.0), (1.0, 0.0, 0.0), (0.75, 0.5, 0.6), (3.0, 1.0, 2.5)):
         vertices, faces, vertex_sources = trimkit.contour(
             runs, weights=np.array([inside, outside]), threshold=threshold

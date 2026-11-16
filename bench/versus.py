@@ -149,7 +149,7 @@ row(
 bunny = trimesh.creation.torus(major_radius=1.0, minor_radius=0.3)
 tv, tf = np.ascontiguousarray(bunny.vertices), np.ascontiguousarray(bunny.faces, dtype=np.int64)
 # vhacdx takes VTK-style faces, a count before each triangle, as trimesh passes them
-vtk = np.column_stack([np.full(len(tf), 3), tf]).ravel().astype(np.uint32)
+vtk = np.column_stack([np.full(len(tf), 3, dtype=np.int64), tf]).ravel().astype(np.uint32)
 row(
     "trimkit.decompose",
     "vhacdx",
@@ -267,7 +267,7 @@ row(
 from skimage import measure  # noqa: E402
 
 radius = 150
-axis = np.arange(-radius, radius + 1)
+axis = np.arange(-radius, radius + 1, dtype=np.int64)
 distance = np.sqrt(axis[:, None, None] ** 2 + axis[None, :, None] ** 2 + axis[None, None, :] ** 2)
 ball_dense = distance <= radius
 ball_padded = np.pad(~ball_dense, 1, constant_values=True)

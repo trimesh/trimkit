@@ -38,6 +38,8 @@ in-image command from the image's own environment, never the host's.
 """
 
 import argparse
+import ast
+import doctest
 import functools
 import hashlib
 import io
@@ -350,10 +352,43 @@ def cmd_fuzz(args) -> None:
         # last job ran out of memory, even with those ignored: a crash is 77
         ignored_oom = name == "draco" and report.endswith(f"{name}: exit 71")
         failed |= "exit " in report and not ignored_oom
+    # the header-only harnesses again as 32-bit programs, over that corpus
+    failed |= not replay_32bit(args.root, corpus, findings)
     # then the bindings, whatever the harnesses found
     atheris(args)
     if failed:
         sys.exit(f"fuzzing found something: see {findings}")
+
+
+def replay_32bit(root: Path, corpus: Path, findings: Path) -> bool:
+    """
+    The harnesses of every part that compiles no vendored sources (its
+    upstreams are headers alone), built again as 32-bit programs with ASan and
+    UBSan and run over every input the 64-bit run kept: size_t is 32 bits
+    there, as on the x86 Windows wheel, where a cast that cuts a 64-bit value
+    shows. Returns whether every input passed.
+    """
+    directory = root / "fuzz-32"
+    directory.mkdir(parents=True, exist_ok=True)
+    passed = True
+    for part in MANIFEST.parts.values():
+        if any(upstream.sources for upstream in part.upstreams):
+            continue
+        includes = [word for u in part.upstreams for d in u.include for word in ("-isystem", str(ROOT / d))]
+        defines = [f"-D{name}" for u in part.upstreams for name in u.defines]
+        for name in part.fuzz:
+            run(
+                # SSE2 floating point, as the x86 Windows wheel has: x87's
+                # 80-bit registers round twice, which no shipped build does
+                tool("clang++"), "-m32", "-msse2", "-mfpmath=sse",
+                "-std=c++17", "-O1", "-g", "-D_GLIBCXX_ASSERTIONS",
+                "-fsanitize=fuzzer,address,undefined", "-fno-sanitize-recover=all",
+                *includes, *defines, ROOT / "fuzz" / f"{name}.cpp", "-o", directory / f"fuzz_{name}",
+            )  # fmt: skip
+            report = harness(directory, corpus, findings, name, ["-runs=0"])
+            print(report.replace(f"{name}:", f"{name} (32-bit):"), flush=True)
+            passed = passed and "exit " not in report
+    return passed
 
 
 def atheris(args) -> None:
@@ -520,6 +555,100 @@ POOLS_COMPILED_OUT = {"vhacd": "VHACD_DISABLE_THREADING", "tinybvh": "NO_THREADE
 DOOR_ONLY = re.compile(r"nb::ndarray|try_cast|check_values|trimkit::detail::|\b(malloc|calloc|realloc)\(")
 
 
+# numpy's array makers whose dtype, left out, comes from the values: integers
+# become the platform's default, int32 on 32-bit machines and int64 elsewhere
+INT_MAKERS = {"array", "asarray", "ascontiguousarray", "fromiter", "arange", "full"}
+
+
+def _constants(node: ast.AST) -> set[str]:
+    # the kinds of number a literal holds, through lists, tuples, signs and a
+    # comprehension's element
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return set()
+        return {type(node.value).__name__} if isinstance(node.value, (int, float, complex)) else set()
+    if isinstance(node, ast.UnaryOp):
+        return _constants(node.operand)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return set().union(*(_constants(e) for e in node.elts))
+    if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+        return _constants(node.elt)
+    # a name may hold anything; a call or arithmetic, a float as easily
+    return {"name"} if isinstance(node, ast.Name) else {"unknown"}
+
+
+def _int_literal(node: ast.AST) -> bool:
+    # a literal numpy gives its default integer dtype: integers in it, and
+    # nothing that is or may be floating
+    kinds = _constants(node)
+    return "int" in kinds and kinds <= {"int", "name"}
+
+
+def _default_ints(tree: ast.AST) -> list[int]:
+    # the lines of `tree` that make an array of the platform's default integer
+    lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        keywords = {k.arg: k.value for k in node.keywords}
+        # dtype=int, astype(int) and their spellings are the platform's int too
+        given = keywords.get("dtype")
+        if isinstance(function, ast.Attribute) and function.attr == "astype" and node.args:
+            given = node.args[0]
+        if (isinstance(given, ast.Name) and given.id == "int") or (
+            isinstance(given, ast.Constant) and given.value in ("int", "int_", "intp")
+        ):
+            lines.append(node.lineno)
+            continue
+        named = isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name)
+        if not (named and function.value.id in ("np", "numpy") and function.attr in INT_MAKERS):
+            continue
+        if "dtype" in keywords:
+            continue
+        if function.attr == "arange":
+            # integers unless a float is given
+            floats = any(isinstance(a, ast.Constant) and isinstance(a.value, float) for a in node.args)
+            if not floats:
+                lines.append(node.lineno)
+        elif function.attr == "full":
+            if len(node.args) > 1 and _int_literal(node.args[1]):
+                lines.append(node.lineno)
+        elif node.args and _int_literal(node.args[0]):
+            lines.append(node.lineno)
+    return lines
+
+
+def check_default_ints() -> None:
+    # Every integer array names its dtype: numpy's default integer is int32 on
+    # 32-bit machines, so an array that is int64 here is converted, with a
+    # warning, or refused on the x86 Windows wheel. In tracked Python, and in
+    # the examples of every docstring in it (the stubs carry the bindings')
+    found = []
+    for path in sorted(p for p in builder.tracked() if p.suffix in (".py", ".pyi")):
+        text = path.read_text()
+        tree = ast.parse(text)
+        found += [f"{path.relative_to(ROOT)}:{line}" for line in _default_ints(tree)]
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            docstring = ast.get_docstring(node, clean=False)
+            for example in doctest.DocTestParser().get_examples(docstring or ""):
+                try:
+                    lines = _default_ints(ast.parse(example.source))
+                except SyntaxError:
+                    continue
+                name = getattr(node, "name", "module")
+                found += [
+                    f"{path.relative_to(ROOT)}: {name} example `{example.source.strip()}`" for _ in lines
+                ]
+    if found:
+        sys.exit(
+            "integer arrays must name their dtype (numpy's default is int32 on 32-bit):\n  "
+            + "\n  ".join(found)
+        )
+
+
 def check_door() -> None:
     # every C++ file of ours but the door itself
     sources = [
@@ -586,6 +715,7 @@ def cmd_lint(args) -> None:
     vendor.check()
     builder.check()
     check_door()
+    check_default_ints()
     # the lock matches pyproject.toml
     run(tool("uv"), "lock", "--check")
     for command in (cmd_clang_format, cmd_ruff, cmd_actions, cmd_licenses, cmd_shader, cmd_cppcheck):
@@ -663,7 +793,9 @@ def cmd_distro(args) -> None:
 
 def cmd_fetch(args) -> None:
     # re-derive the named upstreams (default all) from their pins, or --latest
-    vendor.fetch(args.names, args.latest)
+    held = vendor.fetch(args.names, args.latest)
+    if held:
+        sys.exit("patches that no longer apply, their upstreams left as they were:\n  " + "\n  ".join(held))
 
 
 def cmd_outdated(args) -> None:
@@ -676,14 +808,20 @@ def cmd_lock(args) -> None:
 
 
 def cmd_update(args) -> None:
-    # every upstream to its ref's newest commit and every dependency to its
-    # newest release, the stubs that quote those commits, then what moved: run
-    # `check` on it. A patch that no longer applies stops here, naming it, and
-    # `git restore vendor` undoes it
-    vendor.fetch([], latest=True)
+    # every upstream to its ref's newest commit, every dependency, action and
+    # the image's base to its newest release a week old, the stubs that quote
+    # those commits, then what moved, for `check` to run on. An upstream whose
+    # patch no longer applies is left exactly as it was, and named at the end
+    held = vendor.fetch([], latest=True)
+    vendor.update_actions()
+    vendor.update_base_image()
     cmd_lock(args)
     stubs(args.root, write=True)
-    run(tool("git"), "-C", ROOT, "diff", "--stat", "--", "trimkit.toml", "uv.lock")
+    run(tool("git"), "-C", ROOT, "diff", "--stat", "--", "trimkit.toml", "uv.lock", ".github", "docker")
+    # an upstream whose patch no longer applies stays at its pin, for a person
+    # to rebase the patch or drop it: everything else has moved
+    for reason in held:
+        print(f"held: {reason}", flush=True)
 
 
 SHADERS = ROOT / "src" / "vulkan"

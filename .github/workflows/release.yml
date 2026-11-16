@@ -13,7 +13,8 @@
 # publisher" until the first upload creates the project): PyPI project
 # `trimkit`, owner `trimesh`, repository `trimkit`, workflow `release.yml`,
 # environment `pypi`. In GitHub, limit the `pypi` environment to `main`.
-# Actions are pinned to the commit of their release; Dependabot moves them.
+# Actions are pinned to the commit of their release; `uv run scripts update`
+# moves them.
 name: release
 
 on:

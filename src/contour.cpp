@@ -113,7 +113,7 @@ Examples
 --------
 >>> import numpy as np
 >>> import trimkit
->>> runs = np.array([[0, 0, 0, 1]])
+>>> runs = np.array([[0, 0, 0, 1]], dtype=np.int64)
 >>> vertices, faces, vertex_sources = trimkit.contour(runs)
 >>> len(vertices), len(faces), vertex_sources.tolist()
 (6, 8, [0, 0, 0, 0, 0, 0])

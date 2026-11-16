@@ -173,7 +173,7 @@ def test_device_answers_many_crossings_per_ray(device_required):
             gpu.intersect(origins, directions, matrices, index, maximum_hits=maximum_hits),
         )
     hits, _, _, _ = gpu.intersect(origins, directions, matrices, index)
-    assert np.array_equal(np.bincount(hits, minlength=3000), np.full(3000, 40))
+    assert np.array_equal(np.bincount(hits, minlength=3000), np.full(3000, 40, dtype=np.int64))
 
 
 def sheets(spans):
@@ -223,7 +223,7 @@ def test_device_orders_mixed_crossing_counts_across_chunks(device_required):
     # rays crossing 0, 1, 5, 16, 17, 33 and 44 sheets, mixed through chunks:
     # the device logs crossings in whatever order its lanes run, and each
     # ray's come back together, nearest first, capped or not
-    crossings = np.array([0, 1, 5, 16, 17, 33, 44])
+    crossings = np.array([0, 1, 5, 16, 17, 33, 44], dtype=np.int64)
     mesh = sheets([(k, 44) for k in range(44)])
     rng = np.random.default_rng(23)
     count = 300_003
@@ -418,7 +418,7 @@ def test_device_agrees_on_axis_aligned_rays_through_instances(device_required):
     matrices[8:10, :3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     angle = 0.3
     matrices[10:, :2, :2] = [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
-    index = np.arange(12) % 2
+    index = np.arange(12, dtype=np.int64) % 2
     cpu = trimkit.RayScene(meshes)
     gpu = device_scene(meshes, device_required)
     origins, directions = axis_rays([-4, -4, -4], [5, 5, 5], 37)

@@ -68,8 +68,8 @@ def batches(bounds: np.ndarray, side: int) -> list[tuple[np.ndarray, np.ndarray]
     The (origin, directions) of pinhole cameras around the middle of `bounds`, looking at it.
     """
     middle, radius = bounds.mean(axis=0), np.linalg.norm(np.ptp(bounds, axis=0)) / 2
-    angles = 2 * np.pi * np.arange(CAMERAS) / CAMERAS
-    heights = 0.45 + 0.1 * (np.arange(CAMERAS) % 3)
+    angles = 2 * np.pi * np.arange(CAMERAS, dtype=np.int64) / CAMERAS
+    heights = 0.45 + 0.1 * (np.arange(CAMERAS, dtype=np.int64) % 3)
     positions = middle + 2.6 * radius * np.column_stack([np.cos(angles), np.sin(angles), heights])
     return [(position, camera(position, middle, side)) for position in positions]
 
