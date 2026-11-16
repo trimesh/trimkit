@@ -1,0 +1,55 @@
+kind: fix
+Two leaks in the array-backed broadphase tree, which CollisionScene.collides
+builds once per call to find its candidate pairs, so a long-running caller
+grew without bound (tests/test_invariants.py::test_calls_hold_no_memory):
+- HierarchyTree::init_0 through init_3 each call clear(), which frees
+  `nodes` and allocates a fresh array of 16, then assign `nodes` a new
+  array of 2n without freeing those 16: about 1.6 KB a tree. Free them first.
+- DynamicAABBTreeArrayCollisionManager::registerObjects allocates its
+  leaves with new[] and never frees them, though dtree.init copies them into
+  the tree's own nodes: a node per object. Free them once copied.
+Not yet reported upstream; the same lines are in coal devel as pinned.
+--- a/include/coal/broadphase/detail/hierarchy_tree_array-inl.h
++++ b/include/coal/broadphase/detail/hierarchy_tree_array-inl.h
+@@ -100,6 +100,7 @@
+ 
+   n_leaves = (size_t)n_leaves_;
+   root_node = NULL_NODE;
++  delete[] nodes;  // the 16 nodes clear() just allocated
+   nodes = new Node[n_leaves * 2];
+   std::copy(leaves, leaves + n_leaves, nodes);
+   freelist = n_leaves;
+@@ -125,6 +126,7 @@
+ 
+   n_leaves = (size_t)n_leaves_;
+   root_node = NULL_NODE;
++  delete[] nodes;  // the 16 nodes clear() just allocated
+   nodes = new Node[n_leaves * 2];
+   std::copy(leaves, leaves + n_leaves, nodes);
+   freelist = n_leaves;
+@@ -163,6 +165,7 @@
+ 
+   n_leaves = (size_t)n_leaves_;
+   root_node = NULL_NODE;
++  delete[] nodes;  // the 16 nodes clear() just allocated
+   nodes = new Node[n_leaves * 2];
+   std::copy(leaves, leaves + n_leaves, nodes);
+   freelist = n_leaves;
+@@ -201,6 +204,7 @@
+ 
+   n_leaves = (size_t)n_leaves_;
+   root_node = NULL_NODE;
++  delete[] nodes;  // the 16 nodes clear() just allocated
+   nodes = new Node[n_leaves * 2];
+   std::copy(leaves, leaves + n_leaves, nodes);
+   freelist = n_leaves;
+--- a/src/broadphase/broadphase_dynamic_AABB_tree_array.cpp
++++ b/src/broadphase/broadphase_dynamic_AABB_tree_array.cpp
+@@ -514,6 +514,7 @@
+     int n_leaves = (int)other_objs.size();
+ 
+     dtree.init(leaves, n_leaves, tree_init_level);
++    delete[] leaves;  // copied into the tree's own nodes
+ 
+     setup_ = true;
+   }

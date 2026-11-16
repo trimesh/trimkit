@@ -8,8 +8,10 @@ API, and the GIL is released while computing.
 """
 
 import _thread
+import contextlib
 import copy
 import functools
+import gc
 import importlib.metadata
 import os
 import pathlib
@@ -27,10 +29,12 @@ import numpy as np
 import pytest
 from helpers import (
     LITTLE_ENDIAN,
+    ball_runs,
     box,
     circle,
     collision_fields,
     first_hits,
+    heap_in_use,
     leaves,
     longest_gil_stall,
     public_api,
@@ -171,6 +175,7 @@ _SLOW_CALLS = {
     "decompose": (_big_mesh, lambda mesh: trimkit.decompose(*mesh, resolution=50_000)),
     "parametrize": (_big_mesh, lambda mesh: trimkit.parametrize(*mesh)),
     "simplify": (lambda: sphere(400, 800), lambda mesh: trimkit.simplify(*mesh, 1000)),
+    "contour": (lambda: ball_runs(700), trimkit.contour),
     "exchange.draco_encode": (_big_draco, lambda i: trimkit.exchange.draco_encode(*i)),
     "exchange.draco_decode": (
         _big_buffer,
@@ -218,6 +223,7 @@ def empty_calls():
         "decompose": lambda: trimkit.decompose(no_vertices, no_faces),
         "parametrize": lambda: trimkit.parametrize(no_vertices, no_faces),
         "simplify": lambda: trimkit.simplify(no_vertices, no_faces, 0),
+        "contour": lambda: trimkit.contour(np.zeros((0, 4), dtype=np.int64)),
         # draco has no empty primitive: it refuses one without vertices
         "exchange.draco_encode": None,
         "exchange.draco_decode": None,
@@ -415,6 +421,50 @@ def test_values_must_be_bounded(name):
                     function(**{**arguments, argument: _replace(value, path, broken)})
 
 
+@pytest.mark.parametrize("name", API)
+def test_calls_hold_no_memory(name):
+    # What a call allocates it frees, whether it answers or refuses: many
+    # rounds leave the heap where it was. Counted by glibc, so every
+    # allocation is in it, ours, numpy's and the vendored libraries' alike
+    runs_here(name)
+    if heap_in_use() is None:
+        pytest.skip("the heap is counted by glibc's mallinfo2")
+    function, arguments = _array_arguments()[name]
+    calls = [small_calls()[name]]
+    # and refused: its first float input NaN, as test_values_must_be_bounded
+    # makes it
+    floats = [
+        (argument, path, array)
+        for argument, value in arguments.items()
+        for path, array, _ in _paths(value)
+        if array.dtype.kind == "f" and array.size
+    ]
+    if floats:
+        argument, path, array = floats[0]
+        broken = array.copy()
+        broken.flat[0] = np.nan
+        given = {**arguments, argument: _replace(arguments[argument], path, broken)}
+        calls.append(lambda: function(**given))
+
+    def every_call():
+        for call in calls:
+            with contextlib.suppress(ValueError):
+                call()
+
+    # warmed by as many rounds as are measured: a cache each pool worker
+    # fills once (xatlas keeps one) is full before the count starts, while
+    # what each call leaks keeps growing
+    for _ in range(50):
+        every_call()
+    gc.collect()
+    before = heap_in_use()
+    for _ in range(50):
+        every_call()
+    gc.collect()
+    grown = heap_in_use() - before
+    assert grown < 16 * 1024, f"{grown} bytes held after 50 more rounds"
+
+
 def test_the_bound_itself_is_accepted():
     # exactly 1e30 is in range, and works: a mesh at that scale is hit by rays
     # and simplifies like the unit one
@@ -457,6 +507,7 @@ def _array_arguments(big: bool = False) -> dict:
         "instance_index": np.zeros(instance_count, np.int64),
         "pairs": neighbors,
     }
+    runs = ball_runs(60 if big else 3)
     calls = [
         (
             "RayScene",
@@ -500,6 +551,7 @@ def _array_arguments(big: bool = False) -> dict:
             trimkit.simplify,
             {"vertices": vertices, "faces": faces, "face_count": 4},
         ),
+        ("contour", trimkit.contour, {"voxels": runs, "weights": np.full(len(runs), 0.75)}),
         (
             "exchange.draco_encode",
             trimkit.exchange.draco_encode,

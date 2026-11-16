@@ -628,6 +628,15 @@ WARNINGS = Flags(
         "-Wold-style-cast", "-Wcast-align", "-Wnull-dereference", "-Wdouble-promotion",
         "-Wformat=2", "-Wimplicit-fallthrough", "-Wundef", "-Wnon-virtual-dtor",
         "-Woverloaded-virtual", "-Wmissing-declarations",
+        # clang's that catch logic slips rather than style: code that can't
+        # run, a loop whose variable never changes, a comma that discards a
+        # value, a read that may come before any write, a 64-bit value
+        # narrowed silently, a lock taken without its annotation
+        "-Wunreachable-code-aggressive", "-Wloop-analysis", "-Wcomma", "-Wshadow-all",
+        "-Wconditional-uninitialized", "-Wthread-safety", "-Wshorten-64-to-32",
+        "-Wimplicit-int-float-conversion", "-Wstring-conversion", "-Wtautological-compare",
+        "-Wunused-exception-parameter", "-Wduplicate-enum", "-Wmissing-variable-declarations",
+        "-Wextra-semi-stmt", "-Wundefined-func-template",
     )
 )  # fmt: skip
 STRICT = Flags(("-Werror",))

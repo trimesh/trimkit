@@ -198,7 +198,7 @@ include = ["vendor/meshoptimizer/src"]
 repo = "coal-library/coal"
 ref = "devel"
 commit = "83cdaa6addd580c11dadd2299476e6f08aece2f4"
-tree_sha256 = "c07397b6a43a369b730aa4c85b2bf044e3b9a525e19d9abca15cbdcd978c0ade"
+tree_sha256 = "3c1b0b1613e66d0169c58d4f7074602399cec8e82738fab2fd4310b197839659"
 spdx = "BSD-3-Clause"
 # src/distance/triangle_triangle.cpp defines a ShapeShapeDistancer specialization no header is named after
 keep = ["LICENSE", "src/distance/triangle_triangle.cpp"]
@@ -209,6 +209,7 @@ include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/t
 
 [upstream.coal.patches]
 "coal-bvh-bvh-performance.patch" = "8bebc611a67029abe2fd8d2493cadd0cb54510a0ca3438bb34e65fad13d292ba"
+"coal-hierarchy-tree-array-leak.patch" = "46192b814a6463091e05698aef9e3752af84aacbe654aa165441435fda2a8c47"
 
 # coal's linear algebra, header only: only the headers coal and our binding
 # reach on some wheel target. MPL-2.0, which binds only its own files, kept
@@ -292,6 +293,11 @@ fuzz = ["meshoptimizer"]
 [part.collision]
 upstreams = ["coal", "eigen"]
 fuzz = ["collision"]
+
+# src/contour.hpp is ours, as src/svgpath.hpp is
+[part.contour]
+upstreams = []
+fuzz = ["contour"]
 
 # debian:trixie
 [distribution.debian]

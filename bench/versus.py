@@ -1,8 +1,19 @@
 """
 trimkit against the package trimesh uses today, on the same numpy inputs:
-best of N wall-clock runs each. Prints one markdown row per comparison.
+best of N wall-clock runs each, and the most memory one run adds at its
+height. Prints one markdown row per comparison.
+
+Memory is measured in a fresh process per call: this script run again with
+`--peak ROW SIDE`, which builds the inputs up to that row and makes only
+that call. In the process that timed it, memory freed by earlier runs is
+reused without being counted, which reported fast-simplification's 30 MiB
+as nothing.
 """
 
+import ctypes
+import os
+import subprocess
+import sys
 import time
 
 import DracoPy
@@ -28,17 +39,73 @@ def best(call, repeat=5):
     return min(times)
 
 
+def _status_bytes(field: str) -> int:
+    # a size line of /proc/self/status, such as "VmHWM:  1234 kB"
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith(field + ":"):
+                return int(line.split()[1]) * 1024
+    raise OSError(f"no {field} in /proc/self/status")
+
+
+def peak_mib(call):
+    """
+    The most resident memory one run of `call` adds, in MiB, its output
+    included, in this process: what was freed before is handed back to the
+    system first and the peak reset. None where Linux's /proc and glibc
+    can't say.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        with open("/proc/self/clear_refs", "w") as clear:
+            clear.write("5")
+        before = _status_bytes("VmRSS")
+        call()
+        return (_status_bytes("VmHWM") - before) / 2**20
+    except (OSError, AttributeError):
+        return None
+
+
+# `--peak ROW SIDE`: measure only that row's old or new call, then exit
+PEAK = (int(sys.argv[2]), sys.argv[3]) if sys.argv[1:2] == ["--peak"] else None
+ROWS_SEEN = [0]
+
+
+def fresh_peak(index, side) -> str:
+    # one call's peak, measured by this script run again in a fresh process
+    result = subprocess.run(
+        [sys.executable, __file__, "--peak", str(index), side], capture_output=True, text=True, check=False
+    )
+    lines = result.stdout.split()
+    return lines[-1] if result.returncode == 0 and lines else "n/a"
+
+
 def row(name, old_name, old, new, *, repeat=5, note=""):
+    index = ROWS_SEEN[0]
+    ROWS_SEEN[0] += 1
+    if PEAK is not None:
+        if PEAK[0] == index:
+            peak = peak_mib(old if PEAK[1] == "old" else new)
+            print("n/a" if peak is None else f"{peak:.0f}", flush=True)
+            os._exit(0)
+        return
     t_old, t_new = best(old, repeat), best(new, repeat)
     times = f"{t_old * 1e3:.1f} | {t_new * 1e3:.1f} | {t_old / t_new:.1f}x"
-    print(f"| `{name}` | `{old_name}` | {times} | {note} |", flush=True)
+    memory = f"{fresh_peak(index, 'old')} | {fresh_peak(index, 'new')}"
+    print(f"| `{name}` | `{old_name}` | {times} | {memory} | {note} |", flush=True)
+
+
+def table(line: str) -> None:
+    # the table's own lines, which a `--peak` run doesn't print
+    if PEAK is None:
+        print(line, flush=True)
 
 
 rng = np.random.default_rng(0)
 sphere = trimesh.creation.icosphere(subdivisions=6)  # 81,920 faces
 v, f = np.ascontiguousarray(sphere.vertices), np.ascontiguousarray(sphere.faces, dtype=np.int64)
-print("| trimkit | replaces | old (ms) | trimkit (ms) | speedup | input |")
-print("|---|---|---|---|---|---|")
+table("| trimkit | replaces | old (ms) | trimkit (ms) | speedup | old MiB | trimkit MiB | input |")
+table("|---|---|---|---|---|---|---|---|")
 
 # polygon triangulation
 
@@ -191,4 +258,48 @@ row(
     lambda: manager.in_collision_internal(return_names=True),
     lambda: cscene.collides(matrices, index),
     note=f"{k} spheres, {len(found)} touching pairs",
+)
+
+# voxel surface: a ball of voxels as the dense array scikit-image takes, the
+# way trimesh calls it (inverted and padded), against the same dense array
+# and against the runs along Z of the same; then a float field at a level
+
+from skimage import measure  # noqa: E402
+
+radius = 150
+axis = np.arange(-radius, radius + 1)
+distance = np.sqrt(axis[:, None, None] ** 2 + axis[None, :, None] ** 2 + axis[None, None, :] ** 2)
+ball_dense = distance <= radius
+ball_padded = np.pad(~ball_dense, 1, constant_values=True)
+squared = radius**2 - axis[:, None] ** 2 - axis[None, :] ** 2
+column = np.argwhere(squared >= 0)
+reach = np.sqrt(squared[squared >= 0]).astype(np.int64)
+ball_runs = np.column_stack([column - radius, -reach, 2 * reach + 1]).astype(np.int64)
+assert ball_runs[:, 3].sum() == ball_dense.sum()
+row(
+    "trimkit.contour",
+    "scikit-image",
+    lambda: measure.marching_cubes(ball_padded, level=0.5),
+    lambda: trimkit.contour(ball_dense),
+    repeat=3,
+    note=f"bool volume, ball of {ball_dense.sum() / 1e6:.0f}M voxels",
+)
+row(
+    "trimkit.contour",
+    "scikit-image",
+    lambda: measure.marching_cubes(ball_padded, level=0.5),
+    lambda: trimkit.contour(ball_runs),
+    repeat=3,
+    note=f"the same ball as {len(ball_runs) // 1000}k runs",
+)
+field = np.pad(radius - 3.0 - distance, 1, constant_values=-10.0)
+# the same field shifted so the space around it weighs 0, as trimkit takes it
+shifted = field + 10.0
+row(
+    "trimkit.contour",
+    "scikit-image",
+    lambda: measure.marching_cubes(field, level=0.0),
+    lambda: trimkit.contour(shifted, threshold=10.0),
+    repeat=3,
+    note=f"float64 distance field, {field.size / 1e6:.0f}M voxels",
 )

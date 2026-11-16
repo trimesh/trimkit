@@ -100,6 +100,7 @@ void HierarchyTree<BV>::init_0(Node* leaves, int n_leaves_) {
 
   n_leaves = (size_t)n_leaves_;
   root_node = NULL_NODE;
+  delete[] nodes;  // the 16 nodes clear() just allocated
   nodes = new Node[n_leaves * 2];
   std::copy(leaves, leaves + n_leaves, nodes);
   freelist = n_leaves;
@@ -125,6 +126,7 @@ void HierarchyTree<BV>::init_1(Node* leaves, int n_leaves_) {
 
   n_leaves = (size_t)n_leaves_;
   root_node = NULL_NODE;
+  delete[] nodes;  // the 16 nodes clear() just allocated
   nodes = new Node[n_leaves * 2];
   std::copy(leaves, leaves + n_leaves, nodes);
   freelist = n_leaves;
@@ -163,6 +165,7 @@ void HierarchyTree<BV>::init_2(Node* leaves, int n_leaves_) {
 
   n_leaves = (size_t)n_leaves_;
   root_node = NULL_NODE;
+  delete[] nodes;  // the 16 nodes clear() just allocated
   nodes = new Node[n_leaves * 2];
   std::copy(leaves, leaves + n_leaves, nodes);
   freelist = n_leaves;
@@ -201,6 +204,7 @@ void HierarchyTree<BV>::init_3(Node* leaves, int n_leaves_) {
 
   n_leaves = (size_t)n_leaves_;
   root_node = NULL_NODE;
+  delete[] nodes;  // the 16 nodes clear() just allocated
   nodes = new Node[n_leaves * 2];
   std::copy(leaves, leaves + n_leaves, nodes);
   freelist = n_leaves;

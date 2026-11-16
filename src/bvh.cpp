@@ -78,10 +78,20 @@ void* allocate_aligned(std::size_t size, void* /*unused*/) { return ::operator n
 
 void free_aligned(void* block, void* /*unused*/) { ::operator delete(block, std::align_val_t{64}); }
 
-std::unique_ptr<MeshBvh> new_bvh() {
+// The one way a BVH is made: tinybvh's allocation through the extension's
+// door, `build(bvh)` run on it, then the build's scratch tinybvh keeps after
+// it given back. That is `fragment`, a box per primitive (64 bytes each, a
+// third of what a box query's tree holds): nothing here reads it again, as
+// no BVH is rebuilt or refit, and tinybvh allocates it afresh for a rebuild,
+// as it does after Load(), which keeps none
+template <typename Build>
+std::unique_ptr<MeshBvh> built_bvh(const Build& build) {
     std::unique_ptr<MeshBvh> bvh = std::make_unique<MeshBvh>();
     bvh->context.malloc = allocate_aligned;
     bvh->context.free = free_aligned;
+    build(*bvh);
+    bvh->context.free(bvh->fragment, bvh->context.userdata);
+    bvh->fragment = nullptr;
     return bvh;
 }
 
@@ -201,15 +211,16 @@ public:
             extent = std::max({extent, std::abs(bounds.lowest[axis]), std::abs(bounds.highest[axis])});
         }
         if (!faces_.empty()) {
-            bvh_ = new_bvh();
             // spatial splits trace 20-27% faster from about 300k triangles, for
             // 40% more build time, but gain nothing below 50k at 4x the build
             const std::size_t count = faces_.size() / 3;
-            if (count >= 100000) {
-                bvh_->BuildHQ(vertices_.data(), faces_.data(), count);
-            } else {
-                bvh_->Build(vertices_.data(), faces_.data(), count);
-            }
+            bvh_ = built_bvh([&](MeshBvh& bvh) {
+                if (count >= 100000) {
+                    bvh.BuildHQ(vertices_.data(), faces_.data(), count);
+                } else {
+                    bvh.Build(vertices_.data(), faces_.data(), count);
+                }
+            });
             pad(*bvh_, extent);
         }
     }
@@ -453,11 +464,11 @@ private:
             top->direct = meshes_[static_cast<std::size_t>(top->instances[0].blasIdx)].get();
         } else if (!top->instances.empty()) {
             const nb::gil_scoped_release release;
-            top->tlas = new_bvh();
             // tinybvh takes the meshes' array non-const, though it only reads it
             tinybvh::BVH_Double** meshes =
                 const_cast<tinybvh::BVH_Double**>(blas_.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
-            top->tlas->Build(top->instances.data(), top->instances.size(), meshes, blas_.size());
+            top->tlas = built_bvh(
+                [&](MeshBvh& bvh) { bvh.Build(top->instances.data(), top->instances.size(), meshes, blas_.size()); });
             pad(*top->tlas, top->extent);
         }
         if (device_meshes_ && top->tlas) {
@@ -884,8 +895,7 @@ private:
         }
         // an empty build is an error to tinybvh: no boxes, no BVH
         if (!boxes_.empty()) {
-            bvh_ = new_bvh();
-            bvh_->BuildAABB(boxes_.data(), boxes_.size() / 2);
+            bvh_ = built_bvh([&](MeshBvh& bvh) { bvh.BuildAABB(boxes_.data(), boxes_.size() / 2); });
         }
     }
 

@@ -22,6 +22,7 @@ import re
 import sys
 
 from builder import ROOT, load
+from licenses import OWN
 
 STUBS = ROOT / "src" / "trimkit"
 README = ROOT / "README.md"
@@ -154,11 +155,12 @@ def inside() -> str:
     # what each part compiles in, with its license, from trimkit.toml
     manifest = load()
 
+    # a part with no upstreams is this package's own code, under its license
     def links(upstreams) -> str:
-        return ", ".join(f"[{u.repo}](https://{u.host}/{u.repo})" for u in upstreams)
+        return ", ".join(f"[{u.repo}](https://{u.host}/{u.repo})" for u in upstreams) or "none: ours"
 
     def spdx(upstreams) -> str:
-        return ", ".join(u.spdx for u in upstreams)
+        return ", ".join(u.spdx for u in upstreams) or OWN
 
     lines = ["| part | upstream | license |", "|---|---|---|"]
     lines += [f"| `{p.name}` | {links(p.upstreams)} | {spdx(p.upstreams)} |" for p in manifest.parts.values()]

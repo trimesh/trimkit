@@ -95,6 +95,24 @@ struct BoxQueriesArgument {
     nb::handle object;
 };
 
+// Voxels for `contour` as an argument: (n, 3) or (n, 4) int64 rows, or an
+// (X, Y, Z) bool or float64 volume, told apart by their dimensions. The
+// binding reads it, and the signature shows each form
+struct VoxelsArgument {
+    nb::handle object;
+};
+
+// What `read_voxels` read: int64 `rows` of 3 or 4 columns, or a volume,
+// `occupancy` when it is bool and `weights` otherwise. Valid while it is:
+// each view holds the argument, or its one copy
+struct Voxels {
+    In<std::int64_t, -1, -1> rows;
+    In<bool, -1, -1, -1> occupancy;
+    In<double, -1, -1, -1> weights;
+    bool is_volume = false;
+    bool is_occupancy = false;
+};
+
 // What `read_box_queries` read: `count` queries of a minimum and a maximum
 // corner at `data`, each `dimension` float64, and whether it was given as
 // `one` query rather than a batch. Valid while it is: it holds the argument,
@@ -234,15 +252,15 @@ std::size_t count_beyond(const T* values, std::size_t count, double limit, T* co
     return beyond;
 }
 
-// refuse values not within `limit`, scanned without the GIL, naming the argument
+// how many of `values` are not within `limit`, counted on the pool without
+// the GIL: defined in common.hpp, the one door to threads
+template <typename T>
+std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limit);
+
+// refuse values not within `limit`, naming the argument
 template <typename T>
 void check_values(const T* values, std::size_t count, double limit, const std::string& name) {
-    std::size_t beyond = 0;
-    {
-        const nb::gil_scoped_release release;
-        beyond = count_beyond<T>(values, count, limit, nullptr);
-    }
-    if (beyond != 0) {
+    if (count_beyond_on_pool<T>(values, count, limit) != 0) {
         value_error(name + " must be finite" +
                     (limit == COORDINATE_LIMIT ? std::string(" and within ") + COORDINATE_LIMIT_TEXT : std::string()));
     }
@@ -440,6 +458,31 @@ inline void check_rays(const Rays& rays, const std::string& name) {
     } else {
         check_values(static_cast<const double*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
     }
+}
+
+// A voxels argument, told apart by its dimensions as numpy sees them: two
+// are int64 rows, three a volume, read as bool when it is bool and as
+// float64 otherwise, each as `read` reads it. Any other is the wrong type.
+// The columns of rows are the caller's to check
+inline Voxels read_voxels(const VoxelsArgument& argument, const std::string& name) {
+    const nb::object seen = detail::seen_as_array(argument.object);
+    const std::size_t dimensions = seen.is_valid() ? nb::len(nb::borrow<nb::tuple>(seen.attr("shape"))) : 0;
+    Voxels voxels;
+    if (dimensions == 3) {
+        voxels.is_volume = true;
+        voxels.is_occupancy = seen.attr("dtype").equal(detail::numpy.dtype("bool"));
+        if (voxels.is_occupancy) {
+            voxels.occupancy = read<bool, -1, -1, -1>(argument.object, name);
+        } else {
+            voxels.weights = read<double, -1, -1, -1>(argument.object, name);
+        }
+    } else if (dimensions == 2) {
+        voxels.rows = read<std::int64_t, -1, -1>(argument.object, name);
+    } else {
+        type_error(name + " must be int64 rows of shape (n, 3) or (n, 4), or a bool or float64 volume of shape " +
+                   "(X, Y, Z), not " + describe(argument.object));
+    }
+    return voxels;
 }
 
 // A box queries argument for boxes of `dimension`: one query, (2d,) flat as
@@ -787,6 +830,16 @@ struct box_queries_shown {
 };
 template <>
 struct type_caster<trimkit::BoxQueriesArgument> : passed_through<trimkit::BoxQueriesArgument, box_queries_shown> {};
+
+// `VoxelsArgument` shows up as each form it reads
+struct voxels_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = make_caster<trimkit::In<std::int64_t, -1, -1>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<bool, -1, -1, -1>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<double, -1, -1, -1>>::Name;
+};
+template <>
+struct type_caster<trimkit::VoxelsArgument> : passed_through<trimkit::VoxelsArgument, voxels_shown> {};
 
 // `MeshArgument` shows up as the `Mesh` alias
 struct mesh_shown {

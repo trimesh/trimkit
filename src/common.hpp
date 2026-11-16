@@ -36,6 +36,7 @@ void bind_draco(nb::module_& m);
 void bind_svg(nb::module_& m);
 void bind_meshoptimizer(nb::module_& m);
 void bind_collision(nb::module_& m);
+void bind_contour(nb::module_& m);
 
 namespace trimkit {
 
@@ -237,6 +238,47 @@ void in_blocks_without_gil(std::size_t count, const Body& body) {
                 /*eager=*/false, nullptr);
     if (error) {
         std::rethrow_exception(error);
+    }
+}
+
+// numpy.hpp's count for every float input it checks: the values scanned a
+// block at a time on the pool, with the GIL released
+template <typename T>
+std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limit) {
+    std::atomic<std::size_t> beyond{0};
+    const nb::gil_scoped_release release;
+    in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
+        const std::size_t found = count_beyond<T>(values + from, to - from, limit, nullptr);
+        if (found != 0) {
+            beyond.fetch_add(found, std::memory_order_relaxed);
+        }
+    });
+    return beyond.load(std::memory_order_relaxed);
+}
+
+// `work(parallel)` with the GIL released, for a header library that fans out
+// on its own (src/contour.hpp): `parallel(count, body)` runs `body(begin,
+// end)` over [0, count) on the pool, Ctrl-C polled between ranges, and throws
+// to stop the library at the first exception a range threw, or at Ctrl-C,
+// which comes back out of here as KeyboardInterrupt
+template <typename Work>
+auto with_pool(const Work& work) {
+    struct PoolInterrupted {};
+    Interrupt interrupt;
+    const auto parallel = [&](std::size_t count, const auto& body) {
+        const std::exception_ptr error = on_pool(count, body, /*eager=*/false, &interrupt);
+        if (error) {
+            std::rethrow_exception(error);
+        }
+        if (interrupt.interrupted()) {
+            throw PoolInterrupted{};
+        }
+    };
+    try {
+        const nb::gil_scoped_release release;
+        return work(parallel);
+    } catch (const PoolInterrupted&) {
+        throw nb::python_error();
     }
 }
 

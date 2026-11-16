@@ -52,7 +52,7 @@ def main() -> None:
     # the caller, as a MemoryError, never a killed or aborted process
     corners = np.zeros((20_000, 3))
     boxes = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
-    assert refused(boxes.intersect, np.stack([corners, corners + 1.0], axis=1)), "20k x 20k box pairs fit"
+    assert refused(boxes.intersection, np.stack([corners, corners + 1.0], axis=1)), "20k x 20k box pairs fit"
     del boxes
 
     # a decomposition at the finest voxel grid V-HACD takes, whose fan-outs run

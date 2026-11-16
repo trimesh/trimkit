@@ -849,3 +849,55 @@ class CollisionScene:
         >>> result.distances.tolist(), result.normals.tolist()
         ([1.0], [[1.0, 0.0, 0.0]])
         """
+
+def contour(voxels: Annotated[NDArray[numpy.int64], dict(shape=(None, None), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.bool_], dict(shape=(None, None, None), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, None, None), order='C', device='cpu', writable=False)], *, weights: Annotated[NDArray[numpy.float64], dict(shape=(None,), order='C', device='cpu', writable=False)] | None = None, threshold: float | numpy.floating = 0.5) -> tuple[NDArray[numpy.float64], NDArray[numpy.int64], NDArray[numpy.int64]]:
+    """
+    The closed surface of a set of voxels, as rows or as a volume.
+
+    A voxel is an integer index and is centered on it. It is inside when it
+    weighs more than `threshold`, and space no voxel covers weighs 0, so the
+    surface is closed whatever the input: every edge is in exactly two faces.
+    The surface passes between each inside voxel and each outside voxel beside
+    it, where the weight interpolated between them is `threshold`. Inside
+    voxels that share only an edge or a corner are kept apart.
+
+    Parameters
+    ----------
+    voxels : (n, 3) or (n, 4) int64, or (X, Y, Z) bool or float64
+      Rows of a voxel index `x, y, z`, with four columns followed by a length
+      of at least 1: that many voxels extending along +Z. Rows can be in any
+      order, and no two may hold the same voxel. Or a volume, whose element
+      `[x, y, z]` is voxel `x, y, z`: a bool volume weighs 1 where it is true,
+      and a float64 volume holds each voxel's weight.
+    weights : (n,) float64, optional
+      For rows only: the weight of every voxel in each row. The default is 1,
+      which with the default `threshold` puts each crossing halfway.
+    threshold : float
+      A voxel is inside when it weighs more than this, at least 0 so that
+      empty space is outside.
+
+    Returns
+    -------
+    vertices : (k, 3) float64
+      One vertex per crossing, in index space.
+    faces : (m, 3) int64
+      Triangles indexing `vertices`, wound counter-clockwise seen from outside.
+    vertex_sources : (k,) int64
+      The input element holding the inside voxel of each vertex's crossing:
+      its row, or its index into the flattened volume, so per-voxel attributes
+      carry over by index.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import trimkit
+    >>> runs = np.array([[0, 0, 0, 1]])
+    >>> vertices, faces, vertex_sources = trimkit.contour(runs)
+    >>> len(vertices), len(faces), vertex_sources.tolist()
+    (6, 8, [0, 0, 0, 0, 0, 0])
+    >>> volume = np.zeros((3, 3, 3), dtype=bool)
+    >>> volume[1, 1, 1] = True
+    >>> vertices, faces, vertex_sources = trimkit.contour(volume)
+    >>> len(faces), set(vertex_sources.tolist())
+    (8, {13})
+    """

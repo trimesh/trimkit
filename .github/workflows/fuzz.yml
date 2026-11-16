@@ -1,0 +1,70 @@
+# Fuzz once a week, and only when main has moved since the last fuzz: every
+# native harness and the Atheris bindings fuzzer, exactly as `uv run scripts
+# fuzz` runs them in the gate, but for ten minutes each instead of seconds.
+# Each run starts from the seeds in the repository and keeps nothing between
+# runs, so a run is the commit and nothing else. A finding fails the run and
+# is uploaded as an artifact; nothing is published.
+# Actions are pinned to the commit of their release; Dependabot moves them.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch: # by hand: always fuzzes
+
+permissions: {}
+
+# one fuzz at a time, never cancelled partway
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  changed:
+    name: anything new to fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # this workflow's last successful run
+    outputs:
+      fuzz: ${{ steps.last.outputs.fuzz }}
+    steps:
+      # main's head against the commit the last successful run fuzzed (or
+      # found nothing new at): the same commit is never fuzzed twice
+      - id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          last=$(gh run list --repo "$REPOSITORY" --workflow fuzz.yml --branch main --status success \
+            --limit 1 --json headSha --jq '.[0].headSha // ""')
+          if [ "$EVENT" = workflow_dispatch ] || [ "$last" != "$HEAD" ]; then
+            echo "fuzz=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fuzz=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  fuzz:
+    name: fuzz
+    needs: changed
+    if: needs.changed.outputs.fuzz == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read # check out the repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      # every native harness, then the Atheris bindings fuzzer
+      - run: uv run scripts fuzz --seconds 600
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-findings
+          path: build/docker/fuzz/findings

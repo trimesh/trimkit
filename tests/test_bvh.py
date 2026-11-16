@@ -1,3 +1,4 @@
+import gc
 import subprocess
 import sys
 import textwrap
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import box, check_boxes, first_hits, flatten, ray_scene, same, sphere, transform
+from helpers import box, check_boxes, first_hits, flatten, heap_in_use, ray_scene, same, sphere, transform
 
 import trimkit
 
@@ -837,3 +838,35 @@ def test_maximum_hits_caps_each_ray():
         assert np.array_equal(mine, theirs)
     with pytest.raises(ValueError, match="maximum_hits"):
         scene.intersect(origins, directions, maximum_hits=0)
+
+
+def test_trees_keep_no_build_scratch():
+    # What a built tree holds for as long as it lives, per primitive: tinybvh's
+    # nodes (64 bytes, two per primitive, three with spatial splits) and index,
+    # and our own copy of the input. tinybvh also keeps a 64-byte box per
+    # primitive from the build (1.5 per triangle with spatial splits), which
+    # nothing reads again: every tree is made by src/bvh.cpp's built_bvh, which
+    # gives it back. Kept, it adds 64 to 96 bytes and fails each bound here
+    if heap_in_use() is None:
+        pytest.skip("the heap is counted by glibc's mallinfo2")
+
+    def held_per(count, build):
+        gc.collect()
+        before = heap_in_use()
+        kept = build()
+        gc.collect()
+        held = heap_in_use() - before
+        del kept
+        return held / count
+
+    rng = np.random.default_rng(0)
+    corners = rng.random((200_000, 3)) * 100
+    boxes = np.stack([corners, corners + 0.5], axis=1)
+    # 128 of nodes, 8 of index, 48 of boxes: 184
+    assert held_per(len(boxes), lambda: trimkit.Boxes(boxes)) < 200
+    # below 100k triangles: 128 of nodes, 8 of index, ours: 172
+    vertices, faces = sphere(60, 120)
+    assert held_per(len(faces), lambda: trimkit.RayScene([(vertices, faces)])) < 200
+    # from 100k, spatial splits: 192 of nodes, 12 of index, ours: 225
+    vertices, faces = sphere(200, 400)
+    assert held_per(len(faces), lambda: trimkit.RayScene([(vertices, faces)])) < 260

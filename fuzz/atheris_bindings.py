@@ -220,22 +220,40 @@ def case_collision(data: atheris.FuzzedDataProvider):
     count = len(index) if index is not None else len(meshes)
     matrices = rigid(data, count) if data.ConsumeBool() else array(data, 16).reshape((-1, 4, 4))
     pairs = array(data, 2, np.int64) if data.ConsumeBool() else None
-    hits = scene.collides(matrices, index, pairs=pairs, margin=data.ConsumeFloat())
-    distances, points, normals = scene.distances(
-        matrices, index, pairs=pairs, upper_bound=data.ConsumeFloat()
+    hits = scene.collides(
+        matrices,
+        index,
+        pairs=pairs,
+        margin=data.ConsumeFloat(),
+        return_distance=data.ConsumeBool(),
+        maximum_contacts=data.ConsumeIntInRange(1, 4),
     )
-    assert hits.shape[1:] == (2,) and hits.min(initial=0) >= 0 and hits.max(initial=-1) < max(count, 1)
-    assert points.shape == (len(distances), 2, 3) and normals.shape == (len(distances), 3)
+    near = scene.distances(matrices, index, pairs=pairs, upper_bound=data.ConsumeFloat())
+    out = []
+    for result in (hits, near):
+        found = result.pairs
+        assert found.shape == (len(result), 2)
+        assert found.min(initial=0) >= 0 and found.max(initial=-1) < max(count, 1)
+        if result.distances is not None:
+            assert result.faces.shape == (len(result), 2)
+            assert result.distances.shape == (len(result),)
+            assert result.points.shape == (len(result), 2, 3)
+            assert result.normals.shape == (len(result), 3)
+        # built again from its own fields it is the same result
+        again = trimkit.CollisionResult(found, result.faces, result.distances, result.points, result.normals)
+        assert len(again) == len(result)
+        fields = (found, result.distances, result.points, result.normals)
+        out.extend(value for value in fields if value is not None)
     boxes = scene.boxes(matrices, index).boxes()
     assert boxes.shape == (count, 2, 3) and (boxes[:, 0] <= boxes[:, 1]).all()
-    return distances, points, normals, boxes
+    return (*out, boxes)
 
 
 def case_boxes(data: atheris.FuzzedDataProvider):
     d = data.ConsumeIntInRange(1, 4)
     bounds = array(data, 2 * d).reshape((-1, 2, d)) if data.ConsumeBool() else array(data, None)
     tree = trimkit.Boxes(bounds)
-    result = tree.intersect(array(data, 2 * d).reshape((-1, 2, d)))
+    result = tree.intersection(array(data, 2 * d).reshape((-1, 2, d)))
     assert result.shape[1:] == (2,) and result[:, 1].max(initial=-1) < len(tree)
     # every box back exactly (as the float64 a safely cast input became), and
     # the union of them
@@ -244,6 +262,32 @@ def case_boxes(data: atheris.FuzzedDataProvider):
     if len(copy):
         assert np.array_equal(tree.bounds, [copy[:, 0].min(axis=0), copy[:, 1].max(axis=0)])
     return result, copy, tree.bounds
+
+
+def case_contour(data: atheris.FuzzedDataProvider):
+    threshold = data.ConsumeFloat() if data.ConsumeBool() else 0.5
+    if data.ConsumeBool():
+        # a volume of any dtype, or a bool one, in any layout
+        values = array(data, None)
+        x, y = data.ConsumeIntInRange(1, 3), data.ConsumeIntInRange(1, 3)
+        voxels = values[: len(values) // (x * y) * (x * y)].reshape((x, y, -1))
+        if data.ConsumeBool():
+            voxels = voxels != 0
+    else:
+        voxels = array(data, 4 if data.ConsumeBool() else 3, np.int64)
+        if voxels.ndim == 2 and voxels.shape[1] >= 3 and data.ConsumeBool():
+            # rows that don't overlap, so they are meshed: each in a column of its own
+            voxels = voxels.copy()
+            voxels[:, :3] %= 9
+            voxels[:, 0] = np.arange(len(voxels))
+            voxels[:, 3:] = voxels[:, 3:] % 9
+    weights = array(data, None) if data.ConsumeBool() else None
+    vertices, faces, vertex_sources = trimkit.contour(voxels, weights=weights, threshold=threshold)
+    sources = voxels.size if voxels.ndim == 3 else len(voxels)
+    assert vertices.shape == (len(vertex_sources), 3) and faces.shape[1:] == (3,)
+    assert faces.min(initial=0) >= 0 and faces.max(initial=-1) < max(len(vertices), 1)
+    assert vertex_sources.min(initial=0) >= 0 and vertex_sources.max(initial=-1) < max(sources, 1)
+    return vertices, faces, vertex_sources
 
 
 # every public name, the case that fuzzes it: checked against the compiled
@@ -261,14 +305,21 @@ CASES = {
     "RayScene.intersect": case_rays,
     "RayScene.intersect_any": case_rays,
     "simplify": case_meshoptimizer,
+    "contour": case_contour,
     "Boxes": case_boxes,
     "Boxes.bounds": case_boxes,
     "Boxes.boxes": case_boxes,
-    "Boxes.intersect": case_boxes,
+    "Boxes.intersection": case_boxes,
     "CollisionScene": case_collision,
     "CollisionScene.boxes": case_collision,
     "CollisionScene.collides": case_collision,
     "CollisionScene.distances": case_collision,
+    "CollisionResult": case_collision,
+    "CollisionResult.distances": case_collision,
+    "CollisionResult.faces": case_collision,
+    "CollisionResult.normals": case_collision,
+    "CollisionResult.pairs": case_collision,
+    "CollisionResult.points": case_collision,
 }
 NAMES = sorted(CASES)
 if public_api() != NAMES:

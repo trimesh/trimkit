@@ -267,4 +267,5 @@ True)");
     bind_svg(exchange);
     bind_meshoptimizer(m);
     bind_collision(m);
+    bind_contour(m);
 }

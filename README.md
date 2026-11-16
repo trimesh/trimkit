@@ -1,14 +1,17 @@
 # trimkit
 
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, that have mature iterative solutions. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask, that have mature iterative solutions and are very slow in Python. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
 
 ```
 pip install trimkit
 ```
 
-It's small (~1MB wheels!), fast, and has simple and strict numpy-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as numpy arrays of `(n, 3) float64` vertices and `(m, 3) int64` faces.
+It's small (~1MB wheels!), fast, and has simple and strict `numpy`-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as numpy arrays of `(n, 3) float64` vertices and `(m, 3) int64` faces.
 
-Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`, and the geometry implementations used here are also mostly stable. `trimkit` offers lowest common denominator interfaces to [coal](https://github.com/coal-library/coal) for collision detection, [tinybvh](https://github.com/jbikker/tinybvh) for ray checks and AABB queries, [earcut.hpp](https://github.com/mapbox/earcut.hpp) for polygon tessellation, [VHACD](https://github.com/kmammou/v-hacd) for convex decomposition, [meshoptimizer](https://github.com/zeux/meshoptimizer) for mesh simplification, [xatlas](https://github.com/jpcy/xatlas) for UV atlases, [draco](https://github.com/google/draco) for buffer compression, and a hand rolled SVG path string to buffer parser.
+
+### Motivation
+
+Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`. The geometry implementations used here are also mostly stable, and `trimesh` currently calls one or more package options that bind them to Python. `trimkit` offers lowest common denominator interfaces to [coal](https://github.com/coal-library/coal) for collision detection, [tinybvh](https://github.com/jbikker/tinybvh) for ray checks and AABB queries, [earcut.hpp](https://github.com/mapbox/earcut.hpp) for polygon tessellation, [VHACD](https://github.com/kmammou/v-hacd) for convex decomposition, [meshoptimizer](https://github.com/zeux/meshoptimizer) for mesh simplification, [xatlas](https://github.com/jpcy/xatlas) for UV atlases, [draco](https://github.com/google/draco) for buffer compression, and a hand rolled SVG path string to buffer parser.
 
 There's been many bindings to mostly the same underlying implementations of polygon tessellation ([a](https://pypi.org/project/triangle/) [b](https://pypi.org/project/mapbox-earcut/) [c](https://pypi.org/project/earcutx/)), embree ([a](https://github.com/scopatz/pyembree) [b](https://pypi.org/project/pyembree/) [c](https://pypi.org/project/embreex/) [d](https://pypi.org/project/embree/) [e](https://pypi.org/project/raybender/)), FCL ([a](https://pypi.org/project/python-fcl) [b](https://pypi.org/project/fclx/) [c](https://github.com/jf---/python-fcl) [d](https://github.com/benureau/python-fcl)), quadric edge collapse ([a](https://pypi.org/project/open3d/) [b](https://pypi.org/project/fast-simplification/)), VHACD ([a](https://pypi.org/project/pyVHACD/) [b](https://pypi.org/project/vhacdx/)), and draco ([a](https://pypi.org/project/pydracogltf/) [b](https://pypi.org/project/DracoPy/) [c](https://pypi.org/project/dracox/)) over the years. It would be nice to stop having to rotate when a binding stops releasing and there's a new Python to support.
 
@@ -16,7 +19,7 @@ Most of the underlying geometry implementations in this package are mature and c
 
 The weekly GitHub Actions compromise and overall threat environment has made the zoo less attractive to maintain. With half a dozen packages there's half-a-dozen places we might have not pinned something; this is an attempt to lint, fuzz, and lock down in one place.
 
-## Example
+### Example
 
 
 ```python
@@ -58,7 +61,7 @@ measured = solids.distances(matrices, index)
 distances, points, normals = measured.distances, measured.points, measured.normals
 ```
 
-## Packaging
+### Packaging
 
 This uses a Python script to construct a `ninja` build file from a declarative `TOML` file, and then builds with `clang` and `lld`. Ninja is awesome, and this lets us retire `cmake`. It runs `clang` with profile-guided-optimization, and tries to get everything it can out of performance.
 
@@ -67,20 +70,23 @@ This builds `abi3` wheels on `python >= 312`, for Windows, Mac, and Linux. Linux
 This releases an `sdist` that is tested on free-threaded builds, and will release `abi3t` wheels when `nanobind` supports it cleanly. As a policy there will never be per-Python releases; this is an `abi3` packaging effort.
 
 
-## API Choices
+### API Choices
 
 This does not and will never load meshes, parse XML, or support anything that isn't a pure data operation. For example it parses SVG path strings into numpy arrays fast; it does not parse the XML holding the path strings. It sits below `trimesh` or similar libraries in the Python ecosystem.
 
 - Functions take numpy arrays, don't play precision games, and are biased toward uniformity: everything comes in and goes out as `float64` or `int64`.
-- Generic names: functions (outside `trimkit.exchange`) are intended to be doors to the question class, not implementation specific. For example VHACD is the convex decomposition algorithm, but the function is called `decompose`. And if someone vibes the perfect header-only convex decomposition algorithm, we would add an `engine: None | EngineKind = None` argument.
-- Honest about work in constructors: why not merge `CollisionScene` and `RayScene`? Well they both have potentially expensive acceleration structures, are different under the hood, and are different classes of question.
-- Scene instancing is per-query, NOT saved in scene state. Rather than the usual stateful "scene.set_instances", queries are  `CollisionScene.distances(instance_matrices, instance_index)`. The caller passes instances on every query; the scene holds only the per-mesh acceleration structures.
+- Generic names: functions (outside `trimkit.exchange`) are intended to be doors to the question class, not implementation specific. For example VHACD is the convex decomposition algorithm, but the function is called `decompose`. And if someone vibes the perfect header-only convex decomposition algorithm, we would add an `engine: None | DecomposeAlgorithm = None` argument.
+- Honest about work in constructors: why not merge `CollisionScene` and `RayScene`? Well they both have expensive acceleration structures, are different under the hood, and are different classes of question.
+- Scene instancing is per-query, NOT saved in scene state. Rather than the usual stateful "scene.set_instances", queries are `CollisionScene.distances(instance_matrices, instance_index)`. The caller passes instances on every query; the scene holds only the per-mesh acceleration structures.
 
 ## AI Preferences
 
 - The build system, lints, packaging, hardening, optimizing: AI go wild. Generally try to make it faster, smaller, more tested, cleaner.
 - API: never expand without permission.
 - Geometry: these algorithms were mostly written by domain experts and have been run by millions of users. The standard of proof is extremely high for any change. Start with multiple failing tests, an absolutely solid root causea THIN fix that doesn't require new subsystems, and is justified from multiple angles and multiple cases, including performance data. And present the case coherently to a user: do not make changes to this without an explicit go-ahead, with success criteria established before implementing including failing tests; and a plan on how the change is going to be 50 lines or less to hot geometry code. 
+
+Basically: `nanobind` and the underlying geometry header should be doing 99% of the work. The main exceptions to this are three vibed out core files: `parallel.hpp` (because I couldn't find a thin "multiplatform rayon but for C++"), `svgpath.hpp` (because it's a very easy pass through a string that is very slow in Python), and `contour.hpp` (because marching cubes is a simple algorithm, `scikit-image` is great but it's quite heavy and was used ONLY for marching cubes, and this way we can support sparse+run+dense with one function signature, reducing call complexity).
+
 
 ## // Claude Slop
 
@@ -113,6 +119,7 @@ Everything below this line is LLM output.
 | `CollisionScene.boxes` | The box each instance is culled by, as a query with these instances places it: what the scene thinks it holds.<br>`boxes = scene.boxes()` |
 | `CollisionScene.collides` | The pairs of instances that touch, and optionally where.<br>`result = scene.collides(placed, np.zeros(2, dtype=np.int64))` |
 | `CollisionScene.distances` | The distance between each pair of instances, and where it is.<br>`result = scene.distances(placed, np.zeros(2, dtype=np.int64))` |
+| `contour` | The closed surface of a set of voxels, as rows or as a volume.<br>`vertices, faces, vertex_sources = trimkit.contour(runs)` |
 | `__version__` | This package's version.<br>`isinstance(trimkit.__version__, str)` |
 | `Mesh` | A triangle mesh as the scenes take it and `decompose` returns it: a (vertices, faces) pair of (n, 3) float64 vertices and (m, 3) int64 triangle indices into them, given as a tuple, list or any sequence of two.<br>`mesh: trimkit.Mesh = (np.zeros((3, 3)), np.array([[0, 1, 2]], dtype=np.int64))` |
 | `exchange.DracoKind` | What a draco attribute holds, as `draco_encode` takes it.<br>`POSITION, NORMAL, TEXCOORD, COLOR, GENERIC` |
@@ -133,6 +140,7 @@ Everything below this line is LLM output.
 | `svg` | [fastfloat/fast_float](https://github.com/fastfloat/fast_float), [jk-jeon/dragonbox](https://github.com/jk-jeon/dragonbox) | MIT OR Apache-2.0 OR BSL-1.0, Apache-2.0 WITH LLVM-exception OR BSL-1.0 |
 | `meshoptimizer` | [zeux/meshoptimizer](https://github.com/zeux/meshoptimizer) | MIT |
 | `collision` | [coal-library/coal](https://github.com/coal-library/coal), [libeigen/eigen](https://gitlab.com/libeigen/eigen) | BSD-3-Clause, MPL-2.0 |
+| `contour` | none: ours | MIT |
 | every part | [wjakob/nanobind](https://github.com/wjakob/nanobind), [Tessil/robin-map](https://github.com/Tessil/robin-map) | BSD-3-Clause, MIT |
 <!-- api:end -->
 
@@ -249,20 +257,23 @@ least clearance over 2001 waypoints: 18.4 mm
 
 ### Against what trimesh used before
 
-| `trimkit.` | replaces | measured against it |
-|---|---|---|
-| `exchange.svg_parse`, `exchange.svg_string` | `svg.path` | 56x faster parsing 60k commands |
-| `Boxes` | `rtree` | 8-10x faster: build 100k boxes, query 20k |
-| `CollisionScene` | `python-fcl` | 6x faster: every touching pair of 200 spheres, through trimesh's `CollisionManager`; convex distances more accurate |
-| `exchange.draco_encode`, `exchange.draco_decode` | `DracoPy` | 3.6x faster encoding, 1.7x decoding |
-| `RayScene` | `embreex` | 3-3.6x faster on 1M rays, in float64 and watertight |
-| `simplify` | `fast-simplification` | 2.9x faster, and thread safe |
-| `parametrize` | `xatlas` | 1.3x faster |
-| `decompose` | `vhacdx` | the same speed: the same library |
-| `triangulate` | `mapbox-earcut` | the same speed: the same library |
+| `trimkit.` | replaces | measured against it | peak memory (MiB), old / trimkit |
+|---|---|---|---|
+| `contour` | `scikit-image` | 44x faster on a 14M-voxel bool volume, 17x on a 28M-voxel float64 field | 159 / 49, 160 / 74 |
+| `exchange.svg_parse`, `exchange.svg_string` | `svg.path` | 56x faster parsing 60k commands | 19 / 11 |
+| `Boxes` | `rtree` | 8-10x faster: build 100k boxes, query 20k | 19 / 21 |
+| `CollisionScene` | `python-fcl` | 6x faster: every touching pair of 200 spheres, through trimesh's `CollisionManager`; convex distances more accurate | under 1 / under 1 |
+| `exchange.draco_encode`, `exchange.draco_decode` | `DracoPy` | 3.6x faster encoding, 1.7x decoding | 9 / 6, 5 / 5 |
+| `RayScene` | `embreex` | 3-3.6x faster on 1M rays, in float64 and watertight | 105 / 59 |
+| `simplify` | `fast-simplification` | 2.9x faster, and thread safe | 30 / 10 |
+| `parametrize` | `xatlas` | 1.3x faster | 6 / 6 |
+| `decompose` | `vhacdx` | the same speed: the same library | 379 / 466: V-HACD's work runs on every core at once, each with its own working set (381 / 365 on one core) |
+| `triangulate` | `mapbox-earcut` | the same speed: the same library | 19 / 22 |
 
 Measured 2026-11-06 with `bench/versus.py` on the same numpy inputs: best of several
 runs on 8 cores of a busy machine, release build without PGO. A range is two runs.
+`contour` and peak memory measured 2026-11-15 on 32 cores: peak memory is the most
+resident memory one call adds, its output included, each call in a fresh process.
 
 ### Wheels
 
@@ -282,7 +293,9 @@ spec a distribution's maintainer commits, into `build/distro/`.
 ## Development
 
 ```
-uv run scripts check       # the gate: build, tests, static checks, sanitizers, fuzzers
+uv run scripts check       # the gate: lint, build, tests, static checks, sanitizers, fuzzers
+uv run scripts lint        # the fast deterministic checks, nothing compiled
+uv run scripts fuzz        # every fuzzer, native then Atheris (--seconds each)
 uv run scripts update      # every upstream and dependency to its newest
 uv run scripts format      # our C++, as scripts/clang-format.yaml says
 uv run scripts generate    # regenerate the shaders' SPIR-V, the stubs, this README's generated block and tests/golden.json
@@ -290,11 +303,13 @@ uv run scripts wheel       # this platform's release wheels
 uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
 ```
 
-`check` runs before pushing, and prints each stage's minutes. CI only releases:
-every push to main runs `.github/workflows/release.yml`, which lints, builds and
+`check` runs before pushing, and prints each stage's minutes. CI runs the same
+commands: every push to main runs `.github/workflows/release.yml`, which lints, builds and
 tests the sdist and every wheel with these same commands, then publishes the
 version `pyproject.toml` names (one PyPI already has is left as it is). A push to
-`release/*` does all of it but the upload. Everything but `lock` and `wheel` runs
+`release/*` does all of it but the upload. Once a week, when main has moved,
+`.github/workflows/fuzz.yml` runs `fuzz` for ten minutes a fuzzer, from the
+seeds in the repository and nothing kept between runs, and fails on a finding. Everything but `lock` and `wheel` runs
 inside a pinned Debian trixie image (`docker/Dockerfile`), with the sources mounted
 read-only unless the command writes them, so the host needs only Docker and uv.
 

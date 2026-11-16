@@ -2,6 +2,7 @@
 Small numpy-only fixtures and predicates shared by the tests.
 """
 
+import ctypes
 import functools
 import math
 import struct
@@ -18,6 +19,32 @@ import pytest
 # it copies raw bytes): test_invariants asserts that, and everything else
 # skips draco there, saying so
 LITTLE_ENDIAN = sys.byteorder == "little"
+
+
+def heap_in_use() -> int | None:
+    """
+    Bytes the process has allocated and not freed, every allocator call
+    counted (numpy's buffers, ours, the vendored libraries'), as glibc's
+    mallinfo2 counts them: None where there is no glibc to ask.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        query = libc.mallinfo2
+    except (OSError, AttributeError):
+        return None
+
+    class Mallinfo2(ctypes.Structure):
+        _fields_ = [
+            (field, ctypes.c_size_t)
+            for field in (
+                *("arena", "ordblks", "smblks", "hblks", "hblkhd"),
+                *("usmblks", "fsmblks", "uordblks", "fordblks", "keepcost"),
+            )
+        ]
+
+    query.restype = Mallinfo2
+    info = query()
+    return info.uordblks + info.hblkhd
 
 
 def runs_here(name: str) -> None:
@@ -303,6 +330,17 @@ def collision_boxes(scene, meshes, matrices=None, index=None) -> None:
     check_boxes(scene.boxes(matrices, index), meshes, matrices, index)
 
 
+def ball_runs(radius: int) -> np.ndarray:
+    """
+    The voxels within `radius` of the origin as (n, 4) runs along +Z.
+    """
+    x, y = (g.ravel() for g in np.mgrid[-radius : radius + 1, -radius : radius + 1])
+    inside = radius**2 - x**2 - y**2
+    keep = inside >= 0
+    half = np.sqrt(inside[keep]).astype(np.int64)
+    return np.column_stack([x[keep], y[keep], -half, 2 * half + 1]).astype(np.int64)
+
+
 def circle(n: int) -> np.ndarray:
     """
     `n` points evenly around the unit circle, counter-clockwise.
@@ -448,6 +486,7 @@ def small_calls() -> dict:
         "decompose": lambda: trimkit.decompose(*box(), resolution=20_000),
         "parametrize": lambda: trimkit.parametrize(*mesh),
         "simplify": lambda: trimkit.simplify(*mesh, len(faces) // 4),
+        "contour": lambda: trimkit.contour(ball_runs(12)),
         "exchange.draco_encode": lambda: trimkit.exchange.draco_encode(
             faces, position, np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
         ),

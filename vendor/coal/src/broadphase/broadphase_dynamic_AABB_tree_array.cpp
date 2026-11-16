@@ -514,6 +514,7 @@ void DynamicAABBTreeArrayCollisionManager::registerObjects(
     int n_leaves = (int)other_objs.size();
 
     dtree.init(leaves, n_leaves, tree_init_level);
+    delete[] leaves;  // copied into the tree's own nodes
 
     setup_ = true;
   }

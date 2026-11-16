@@ -1,8 +1,14 @@
 """
 The one way to build, test and check this package, locally and in CI alike:
 
-  uv run scripts check       the gate: the strict build and tests, every
-                             static check, ASan, TSan, and every fuzzer
+  uv run scripts check       the gate: every stage below, then ASan, TSan
+  uv run scripts lint        the fast deterministic checks, nothing compiled:
+                             vendor, doors, lock, formatting, ruff, zizmor,
+                             licenses, shaders and cppcheck
+  uv run scripts test        the strict build and the tests, in 2 GB
+  uv run scripts static      the checks that need a build: clang-tidy, the
+                             sdist, stubs and the wheel audit
+  uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
   uv run scripts distro      Debian and Fedora packaging (--run: build,
                              test and lint them), when packaging changes
   uv run scripts generate    regenerate the shaders' SPIR-V, the stubs, the
@@ -17,9 +23,10 @@ is a command: the stages and their parts exist for debugging one failure,
 and `fetch` and `outdated` re-vendor and audit trimkit.toml's upstreams;
 none of these are otherwise documented.
 
-CI only releases: a push to main runs `static`, `sdist` and `wheel` exactly
-as they run here, then publishes, the one CI-only step, as it needs GitHub's
-token for PyPI. `check` is the gate, run before pushing. Everything but `lock` and `wheel` re-runs
+CI runs these same commands. A push to main runs `lint`, `static`, `sdist` and
+`wheel` exactly as they run here, then publishes, the one CI-only step, as it
+needs GitHub's token for PyPI; once a week, when main has moved, CI runs
+`fuzz` for longer. `check` is the gate, run before pushing. Everything but `lock` and `wheel` re-runs
 itself inside the image built from docker/Dockerfile, with the repository
 mounted read-only at /src (writable for `generate`) and builds under
 `build/docker/`, so it behaves the same on every machine and needs only
@@ -224,14 +231,18 @@ def cmd_test(args) -> None:
 def cmd_asan(args) -> None:
     # CFI too: it needs ThinLTO and hidden visibility, which every build has
     build = Build(args.root, "asan").install(PYTHON, sanitize="address,undefined,cfi")
-    # wall-clock bounds measure the sanitizer, not the code
+    # wall-clock bounds measure the sanitizer, not the code. Every allocation
+    # is filled with ASan's pattern, all of it rather than its first 4 KiB:
+    # outputs are left unwritten when allocated (`Unset`, contour's
+    # `UnwrittenValue`), each element written once, so one left unwritten
+    # holds the pattern and the tests comparing answers see it
     build.pytest(
         "-m",
         "not timing",
         *test_files(),
         env={
             "LD_PRELOAD": asan_runtime(),
-            "ASAN_OPTIONS": "detect_leaks=0",
+            "ASAN_OPTIONS": "detect_leaks=0:max_malloc_fill_size=2147483647",
             "PYTHONMALLOC": "malloc",
         },
     )
@@ -339,11 +350,13 @@ def cmd_fuzz(args) -> None:
         # last job ran out of memory, even with those ignored: a crash is 77
         ignored_oom = name == "draco" and report.endswith(f"{name}: exit 71")
         failed |= "exit " in report and not ignored_oom
+    # then the bindings, whatever the harnesses found
+    atheris(args)
     if failed:
         sys.exit(f"fuzzing found something: see {findings}")
 
 
-def cmd_atheris(args) -> None:
+def atheris(args) -> None:
     # the extension with ASan and libFuzzer's coverage hooks, driven by Atheris
     # through Python: exercises our argument conversion and validation. Address
     # only: Atheris ships ASan and libFuzzer, not the UBSan runtime
@@ -384,7 +397,7 @@ def cmd_cppcheck(args) -> None:
     run(
         tool("cppcheck"),
         "--quiet",
-        "--enable=warning,performance,portability",
+        "--enable=warning,style,performance,portability",
         "--inline-suppr",
         "--std=c++17",
         "--error-exitcode=1",
@@ -568,25 +581,26 @@ def cmd_audit(args) -> None:
     run(dev(args.root).python, ROOT / "scripts" / "check_wheel.py", dev(args.root).wheel)
 
 
-def cmd_static(args) -> None:
+def cmd_lint(args) -> None:
+    # fast and deterministic, nothing compiled: what every file must already be
     vendor.check()
     builder.check()
     check_door()
     # the lock matches pyproject.toml
     run(tool("uv"), "lock", "--check")
+    for command in (cmd_clang_format, cmd_ruff, cmd_actions, cmd_licenses, cmd_shader, cmd_cppcheck):
+        command(args)
+
+
+def cmd_static(args) -> None:
+    # the checks that need a build: lint's are `lint`
     for command in (
-        cmd_clang_format,
-        cmd_ruff,
-        cmd_actions,
-        cmd_licenses,
-        cmd_shader,
         # the sdist builds; building and testing from it alone is `sdist`,
         # which release CI runs, as it's a whole build and suite again
         lambda args: sdist(args.root),
         cmd_stubs,
         cmd_audit,
         cmd_tidy,
-        cmd_cppcheck,
     ):
         command(args)
 
@@ -741,14 +755,14 @@ def cmd_generate(args) -> None:
 # the gate, which should take minutes after a small change: the distribution
 # packages (`distro --run`, two more builds and suites) are checked when the
 # packaging changes, and the sdist's own build (`sdist`) in release CI
-STAGES = ["test", "static", "asan", "tsan", "fuzz", "atheris"]
+STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz"]
 
 
 def cmd_check(args) -> None:
     results = []
     for stage in STAGES:
         command = [sys.executable, str(ROOT / "scripts"), "--root", str(args.root), stage]
-        if stage in ("fuzz", "atheris"):
+        if stage == "fuzz":
             command += ["--seconds", str(args.fuzz_seconds)]
         print(f"\n==== {stage} ====", flush=True)
         tic = time.monotonic()
@@ -781,7 +795,7 @@ def docker_cores() -> list[str]:
 # needs only uv, `wheel` and `distro` run their own containers, `image`
 # builds it, and `outdated` only asks the upstreams
 ON_HOST = {"check", "lock", "wheel", "image", "outdated", "distro"}
-SANITIZED = {"asan", "tsan", "fuzz", "atheris"}
+SANITIZED = {"asan", "tsan", "fuzz"}
 WRITES_SOURCES = {"generate", "fetch", "update", "format"}
 
 
@@ -851,7 +865,9 @@ def main() -> None:
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     # only the documented commands show in the usage and help
     documented = {
-        "check": "the gate: build, tests, static checks, sanitizers and fuzzers",
+        "check": "the gate: lint, tests, static checks, sanitizers and fuzzers",
+        "lint": "the fast deterministic checks, nothing compiled",
+        "fuzz": "every fuzzer, native then Atheris, --seconds each",
         "generate": "regenerate the shaders' SPIR-V, the stubs, the README API summary and tests/golden.json",
         "update": "move every upstream and dependency to its newest",
         "format": "format our C++ with the pinned clang-format",
@@ -864,7 +880,7 @@ def main() -> None:
                 name[4:], **({"help": documented[name[4:]]} if name[4:] in documented else {})
             )
             command.set_defaults(function=function)
-            if name in ("cmd_fuzz", "cmd_atheris"):
+            if name == "cmd_fuzz":
                 command.add_argument("--seconds", type=int, default=60)
             if name == "cmd_fetch":
                 command.add_argument("names", nargs="*")
