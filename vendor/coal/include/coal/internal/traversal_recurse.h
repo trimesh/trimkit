@@ -47,6 +47,7 @@
 
 namespace coal {
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 /// @brief Bounding volume test structure
 struct COAL_LOCAL BVT {
   /// @brief distance between bvs
@@ -356,6 +357,7 @@ void distanceQueueRecurse(Node* node, unsigned int b1, unsigned int b2,
     }
   }
 }
+//// TRIMKIT END PATCH
 
 }  // namespace coal
 

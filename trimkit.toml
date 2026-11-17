@@ -15,7 +15,10 @@
 #   patches            { "NAME.patch" = sha256 } our changes, applied in order:
 #                      unified diffs in vendor/patches/, each starting
 #                      `kind: fix` (a bug or UB upstream) or `kind: perf` and
-#                      why, every hunk matching exactly; `fetch` writes the hashes
+#                      why, every hunk matching exactly. Edited in vendor/NAME/
+#                      between `//// TRIMKIT PATCH: fix.name` and
+#                      `//// TRIMKIT END PATCH`; `uv run scripts patch` writes
+#                      the diffs and this table from those blocks
 # and how it is built, all of it quietly (vendored warnings aren't ours to fix):
 #   include            header directories, as system headers
 #   system             a header of it as the sources include it (`Eigen/Core`):
@@ -64,20 +67,20 @@ apple_clang = [16, 17]
 repo = "mapbox/earcut.hpp"
 ref = "master"
 commit = "2fbafada15dbe5350c606426e17111b91a964e55"
-tree_sha256 = "a529ed6018a5e667cf3c460ff98bd9c342aa7df9133b21888fc2e53f23c32753"
+tree_sha256 = "4150a53bdfb8038970ca131eab9d3121c67d31e70182767f45280bb505e9228b"
 spdx = "ISC"
 keep = ["LICENSE"]
 include = ["vendor/earcut/include/mapbox"]
 
 [upstream.earcut.patches]
-"earcut-convex-ring.patch" = "af23660024500d344abc69ab6f30a6be86c2f67805e06ef92397de604b8bcae7"
-"earcut-hole-bridge-blocks.patch" = "87b185b8480af4bfad2d317153c7a9dfb58f323bfabd6dd5b4d6941809acb8a8"
+"earcut-convex-ring.patch" = "9b58d68009f53f58ea750819d82d4f3fe1745b9d98bc890f96e1851c88821e6f"
+"earcut-hole-bridge-blocks.patch" = "1b3551484374905f2659a23b51498c66715307742235ffa1560a947b11fd64a4"
 
 [upstream.vhacd]
 repo = "kmammou/v-hacd"
 ref = "master"
 commit = "f900e42361491f525262d4825e758845e4969897"
-tree_sha256 = "6977317884238579db3f5ec7ffedd97f4ee1392de10b2940a78641c1e1fdf7e1"
+tree_sha256 = "00e62bf5f7aa48807645956641299451c941d4ed2cd5784ff5c2a869dbe7081e"
 spdx = "BSD-3-Clause"
 keep = ["LICENSE"]
 include = ["vendor/vhacd/include"]
@@ -86,24 +89,25 @@ include = ["vendor/vhacd/include"]
 VHACD_DISABLE_THREADING = "its fan-outs run on the extension's one pool through vendor/patches/vhacd-parallel-for.patch: no thread pool of its own, no futures, no asynchronous implementation"
 
 [upstream.vhacd.patches]
-"vhacd-atomic-hull-counter.patch" = "67ed17f039adedaef0a000edc896e8dafc41cf4953cc1c7ed86a63b1bb92c300"
-"vhacd-empty-volume.patch" = "8db53c1a9d074b9eae4ed91ed526ff0360e09373dd4cd8bfd9ca2526fd60a587"
-"vhacd-parallel-for.patch" = "52252b0af7e8d008ed8d151db202c275da672f6b022bb78a8c9feaaa9fd30e90"
+"vhacd-atomic-hull-counter.patch" = "71903c62b41004468d59ca933ec04d61994a261b0a947371438e500077a8debb"
+"vhacd-empty-volume.patch" = "a08755c85bf4cf930d9a18744667ff8a71a16980b1a21fb97479eb898400c18b"
+"vhacd-parallel-for.patch" = "d0caa0ecad64b94195023f2436df9d9e6c2f2c6772b6ff52b4464d973d752188"
 
 [upstream.xatlas]
 repo = "jpcy/xatlas"
 ref = "master"
 commit = "f700c7790aaa030e794b52ba7791a05c085faf0c"
-tree_sha256 = "f635e4b7c8047db322a495a1dfcd721df95eb9647c03f6f9f67b4fd06f6bc4ca"
+tree_sha256 = "d92732a2e190b6cb77c0ec8ebf39cc7d0b63a2e432b76b4a9de351b33d420b42"
 spdx = "MIT"
 # upstream ships no LICENSE file: the MIT text is the leading comment of the source
 license_from = "source/xatlas/xatlas.cpp"
 sources = ["vendor/xatlas/source/xatlas/xatlas.cpp"]
 include = ["vendor/xatlas/source/xatlas"]
+defines = { "XA_MULTITHREADED=0" = "no threads of its own: its task groups run on the extension's one pool through vendor/patches/xatlas-one-pool.patch" }
 no_sanitize = { function = "OpenNL calls destructors through a mismatched function pointer type (nlDeleteMatrix): undefined, benign on every ABI" }
 
 [upstream.xatlas.patches]
-"xatlas-lost-wakeup.patch" = "8eb34e5bed571d67468f9475c70a01645e111e325370a317ae337f29c3c3d4fe"
+"xatlas-one-pool.patch" = "95a682902c0d2edad3c710a78656fc610ab67145438548a7946283a9a63052d8"
 
 [upstream.fast_float]
 repo = "fastfloat/fast_float"
@@ -134,7 +138,7 @@ include = ["vendor/dragonbox/include/dragonbox"]
 repo = "google/draco"
 ref = "main"
 commit = "80bd29bb2c2badfada765dfd4c6de571e5fe8273"
-tree_sha256 = "d4f4a3bdead5bbbfbc67196f6e080bc73a533c885dc9bfd294b8e05de91a31a1"
+tree_sha256 = "2e13c81da506788877569ecc250e15d6b82aadcebfbe957e083321ff96623693"
 spdx = "Apache-2.0"
 # its LICENSE is the bare Apache text: this is the notice its sources carry
 copyright = "Copyright 2016 The Draco Authors"
@@ -143,13 +147,13 @@ sources = ["vendor/draco/src/draco/**/*.cc"]
 include = ["vendor/draco/src", "src/config"]
 
 [upstream.draco.patches]
-"draco-symbol-encoding.patch" = "9692ab64c89e8611ae66f7190cad92d4f6cb0a5fb898c68cf906c2de74c6ebad"
+"draco-symbol-encoding.patch" = "7d3c5269e41ecbf423711171411be8d71407b1344e5f843e9f91e2c7b8f6489a"
 
 [upstream.tinybvh]
 repo = "jbikker/tinybvh"
 ref = "main"
 commit = "c9be3103cc9693b456b0a0353927c11cac7d710f"
-tree_sha256 = "2371ee6ac9f3d5baae897b7986e72c7e5d7c7eb90491cc7fa81c3c780c4c54ac"
+tree_sha256 = "43c7b72063b8dc99cbeeeaba3258556bd5bf582c0cb1d5f3fbd12d466d785522"
 spdx = "MIT"
 keep = ["LICENSE"]
 # the implementation unit is a two-line file of ours that defines
@@ -165,7 +169,7 @@ NO_CUSTOM_GEOMETRY = "a feature we don't use"
 NO_THREADED_BUILDS = "build on the calling thread: threaded builds gained 1-8% (1M faces 205 vs 207 ms, 2026-11-01) and overflowed musl's 128 KB thread stacks in BuildHQ (SIGSEGV), which no dlopen'ed module can raise"
 
 [upstream.tinybvh.patches]
-"tinybvh-flat-node-bins.patch" = "fede891c586822c339923c731d913c12500a76ae7a6d11d9c21b48c3ae999469"
+"tinybvh-flat-node-bins.patch" = "2f612b89a89c8b5d163f17d0ed6e22d9b89d129857b87ab5de4e40aed48455ba"
 
 [upstream.vulkan_headers]
 repo = "KhronosGroup/Vulkan-Headers"
@@ -198,7 +202,7 @@ include = ["vendor/meshoptimizer/src"]
 repo = "coal-library/coal"
 ref = "devel"
 commit = "83cdaa6addd580c11dadd2299476e6f08aece2f4"
-tree_sha256 = "3c1b0b1613e66d0169c58d4f7074602399cec8e82738fab2fd4310b197839659"
+tree_sha256 = "177a68706ab247cc3c0e0d30e39683071183a118841f84fdb966dcb55b1a24ff"
 spdx = "BSD-3-Clause"
 # src/distance/triangle_triangle.cpp defines a ShapeShapeDistancer specialization no header is named after
 keep = ["LICENSE", "src/distance/triangle_triangle.cpp"]
@@ -208,8 +212,8 @@ no_sanitize = { vptr = "convex support dispatches by casting a ConvexBase to emp
 include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/third_party", "src/config/coal"]
 
 [upstream.coal.patches]
-"coal-bvh-bvh-performance.patch" = "8bebc611a67029abe2fd8d2493cadd0cb54510a0ca3438bb34e65fad13d292ba"
-"coal-hierarchy-tree-array-leak.patch" = "46192b814a6463091e05698aef9e3752af84aacbe654aa165441435fda2a8c47"
+"coal-bvh-bvh-performance.patch" = "0f53292b95269a8f7e128a393c1ed8deae2003d62d6eae7424f38d795f9aa025"
+"coal-hierarchy-tree-array-leak.patch" = "4ec9a982489343d9661e765091b9f973ba462d6eac7b034fede4cd295bd98780"
 
 # coal's linear algebra, header only: only the headers coal and our binding
 # reach on some wheel target. MPL-2.0, which binds only its own files, kept

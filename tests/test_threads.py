@@ -5,6 +5,7 @@ inputs must give bit-identical answers on 8 threads as they do serially.
 
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -170,3 +171,217 @@ def _forked_answer(query, expected, seconds: float = 30.0) -> bytes:
     finally:
         os.close(read)
         os.waitpid(pid, 0)
+
+
+def test_exit_while_a_daemon_thread_queries():
+    # the interpreter exits while a daemon thread is inside a query big enough
+    # to be on the pool: the module's atexit handler stops it at its next
+    # poll, before CPython finalizes and ends a thread that takes the GIL
+    # (3.12 and 3.13 unwind it on glibc, and end it without unwinding on musl
+    # and Windows), so no worker is left inside a job on a vanished stack.
+    # Each run must exit cleanly, never crash or hang
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import sys, threading, time
+        import numpy as np
+        sys.path.insert(0, sys.argv[1])
+        from helpers import sphere
+        import trimkit
+
+        scene = trimkit.RayScene([sphere(60, 120)])
+        origins, directions = np.random.default_rng(0).normal(size=(2, 400_000, 3))
+        started = threading.Event()
+
+        def query():
+            while True:
+                started.set()
+                scene.intersect(origins, directions)
+
+        threading.Thread(target=query, daemon=True).start()
+        started.wait()
+        print(time.monotonic(), flush=True)
+        """
+    )
+    import time
+
+    for _ in range(8):
+        done = subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).parent)],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        exited = time.monotonic()
+        assert done.returncode == 0, done.stderr.decode()[-2000:]
+        # from the script's last line to the process gone, finalization included:
+        # well under the 5 s limit the drain once waited out, with room for a
+        # sanitizer's slower finalization (1.6 s under ThreadSanitizer)
+        assert exited - float(done.stdout.split()[-1]) < 3.0, "the exit waited on the daemon's query"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork")
+def test_fork_from_inside_a_query():
+    # a signal handler runs while a query polls for Ctrl-C, inside the pool
+    # with its workers mid-range, and forks: in the child those workers are
+    # gone with the items they held. The child's query must raise, never
+    # return an answer missing them, and the child's pool must still answer
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import os, signal, sys, time
+        import numpy as np
+        sys.path.insert(0, sys.argv[1])
+        from helpers import sphere
+        import trimkit
+
+        scene = trimkit.RayScene([sphere(60, 120)])
+        origins, directions = np.random.default_rng(0).normal(size=(2, 2_000_000, 3))
+        query = lambda: scene.intersect(origins, directions)
+        same = lambda answer: all(a.tobytes() == b.tobytes() for a, b in zip(answer, expected, strict=True))
+        tic = time.perf_counter()
+        expected = query()
+        took = time.perf_counter() - tic
+        child = []
+
+        def fork(signum, frame):
+            if os.fork() == 0:
+                child.append(True)
+
+        signal.signal(signal.SIGALRM, fork)
+        # within the query, past its first poll
+        signal.setitimer(signal.ITIMER_REAL, float(sys.argv[2]) * took)
+        try:
+            outcome = "same" if same(query()) else "different"
+        except RuntimeError:
+            outcome = "raised"
+        if not child:
+            # the parent: its answer is the answer, and the child exited cleanly
+            assert outcome == "same", outcome
+            _, status = os.wait()
+            sys.exit(0 if status == 0 else 3)
+        os.write(1, f"{outcome} {same(query())}".encode())
+        os._exit(0)
+        """
+    )
+    outcomes = []
+    for fraction in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6):
+        done = subprocess.run(
+            [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent), str(fraction)],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr.decode()[-2000:]
+        outcome, again = done.stdout.decode().split()
+        assert outcome in ("same", "raised"), "the child's query returned an answer missing items"
+        assert again == "True", "the child's pool answered differently afterwards"
+        outcomes.append(outcome)
+    # at least one fork landed inside a published job, or nothing here was tested
+    if (__import__("os").cpu_count() or 1) > 1:
+        assert "raised" in outcomes, f"no fork landed inside a published job: {outcomes}"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork")
+def test_forked_child_exits_promptly():
+    # a parent thread is inside a query when the main thread forks: the
+    # child has none of the parent's calls, so its exit waits for none of
+    # them (it once waited out the whole drain limit for a call that
+    # existed only in the parent)
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import os, sys, threading, time
+        import numpy as np
+        sys.path.insert(0, sys.argv[1])
+        from helpers import sphere
+        import trimkit
+
+        scene = trimkit.RayScene([sphere(60, 120)])
+        origins, directions = np.random.default_rng(0).normal(size=(2, 400_000, 3))
+        busy = threading.Event()
+        stop = threading.Event()
+
+        def query():
+            while not stop.is_set():
+                busy.set()
+                scene.intersect(origins, directions)
+
+        thread = threading.Thread(target=query)
+        thread.start()
+        busy.wait()
+        time.sleep(0.05)
+        slowest = 0.0
+        for _ in range(3):
+            tic = time.monotonic()
+            pid = os.fork()
+            if pid == 0:
+                sys.exit(0)
+            _, status = os.waitpid(pid, 0)
+            slowest = max(slowest, time.monotonic() - tic)
+            assert status == 0, status
+        stop.set()
+        thread.join()
+        print(f"{slowest:.3f}")
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert float(done.stdout.split()[-1]) < 2.0, f"a forked child took {done.stdout.split()[-1]} s to exit"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "sched_setaffinity"), reason="needs CPU affinity")
+def test_workers_follow_affinity_as_it_widens():
+    # the first call runs on one CPU, so it has no workers; once the process
+    # may use more CPUs, the next big call after the pool reads them again
+    # starts workers for them (the worker count was once fixed at whatever the
+    # first call saw)
+    import subprocess
+    import textwrap
+
+    if len(__import__("os").sched_getaffinity(0)) < 2:
+        pytest.skip("needs two CPUs")
+    script = textwrap.dedent(
+        """
+        import os, sys, time
+        import numpy as np
+        sys.path.insert(0, sys.argv[1])
+        from helpers import sphere
+        import trimkit
+
+        every = os.sched_getaffinity(0)
+        # one CPU before anything uses the pool, so no worker has ever started
+        os.sched_setaffinity(0, {min(every)})
+        scene = trimkit.RayScene([sphere(60, 120)])
+        origins, directions = np.random.default_rng(0).normal(size=(2, 400_000, 3))
+        scene.intersect(origins, directions)
+        alone = len(os.listdir("/proc/self/task"))
+        os.sched_setaffinity(0, every)
+        # the CPUs allowed are read at most every 100 ms (CAP_REFRESH_NS)
+        time.sleep(0.15)
+        scene.intersect(origins, directions)
+        print(alone, len(os.listdir("/proc/self/task")))
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    alone, widened = map(int, done.stdout.split())
+    assert widened > alone, f"{widened} threads after widening, {alone} on one CPU"

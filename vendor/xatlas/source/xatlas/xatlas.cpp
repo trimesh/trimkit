@@ -3270,9 +3270,7 @@ private:
 		m_threadIndex = threadIndex;
 		std::unique_lock<std::mutex> lock(worker->mutex);
 		for (;;) {
-			// trimkit (vendor/patches/xatlas-lost-wakeup.patch): the flag is set and notified without
-			// this mutex, so a wakeup can be lost; re-checking every millisecond bounds the wait
-			worker->cv.wait_for(lock, std::chrono::milliseconds(1), [=]{ return worker->wakeup.load(); });
+			worker->cv.wait(lock, [=]{ return worker->wakeup.load(); });
 			worker->wakeup = false;
 			for (;;) {
 				if (scheduler->m_shutdown)
@@ -3306,15 +3304,33 @@ thread_local uint32_t TaskScheduler::m_threadIndex;
 class TaskScheduler
 {
 public:
+	//// TRIMKIT PATCH: perf.one-pool
+	// Groups are created by tasks on any thread, so the table of them is a fixed array of slots claimed
+	// by compare-and-swap: no lock and no growth. Each scheduler is one atlas's, with one caller; at most
+	// TrimkitThreadSlots() threads run its tasks at once, each inside at most 3 nested groups (meshes,
+	// chart groups, charts), so 4 a thread and 4 more can't run out
+	TaskScheduler() : m_capacity(4 * TrimkitThreadSlots() + 4)
+	{
+		m_groups = XA_ALLOC_ARRAY(MemTag::Default, std::atomic<TaskGroup *>, m_capacity);
+		for (uint32_t i = 0; i < m_capacity; i++)
+			new (&m_groups[i]) std::atomic<TaskGroup *>(nullptr);
+	}
+
+	//// TRIMKIT END PATCH
 	~TaskScheduler()
 	{
-		for (uint32_t i = 0; i < m_groups.size(); i++)
+		//// TRIMKIT PATCH: perf.one-pool
+		for (uint32_t i = 0; i < m_capacity; i++)
 			destroyGroup({ i });
+		XA_FREE(m_groups);
+		//// TRIMKIT END PATCH
 	}
 
 	uint32_t threadCount() const
 	{
-		return 1;
+		//// TRIMKIT PATCH: perf.one-pool
+		return TrimkitThreadSlots();
+		//// TRIMKIT END PATCH
 	}
 
 	TaskGroupHandle createTaskGroup(void *userData = nullptr, uint32_t reserveSize = 0)
@@ -3322,15 +3338,24 @@ public:
 		TaskGroup *group = XA_NEW(MemTag::Default, TaskGroup);
 		group->queue.reserve(reserveSize);
 		group->userData = userData;
-		m_groups.push_back(group);
+		//// TRIMKIT PATCH: perf.one-pool
 		TaskGroupHandle handle;
-		handle.value = m_groups.size() - 1;
+		for (handle.value = 0; handle.value < m_capacity; handle.value++) {
+			TaskGroup *expected = nullptr;
+			if (m_groups[handle.value].compare_exchange_strong(expected, group, std::memory_order_acquire))
+				return handle;
+		}
+		XA_PRINT("xatlas: more task groups at once than any atlas makes\n");
+		abort();
+		//// TRIMKIT END PATCH
 		return handle;
 	}
 
 	void run(TaskGroupHandle handle, Task task)
 	{
-		m_groups[handle.value]->queue.push_back(task);
+		//// TRIMKIT PATCH: perf.one-pool
+		m_groups[handle.value].load(std::memory_order_relaxed)->queue.push_back(task);
+		//// TRIMKIT END PATCH
 	}
 
 	void wait(TaskGroupHandle *handle)
@@ -3339,24 +3364,37 @@ public:
 			XA_DEBUG_ASSERT(false);
 			return;
 		}
-		TaskGroup *group = m_groups[handle->value];
-		for (uint32_t i = 0; i < group->queue.size(); i++)
-			group->queue[i].func(group->userData, group->queue[i].userData);
+		//// TRIMKIT PATCH: perf.one-pool
+		// every task on the extension's one pool (TrimkitRunTasks, xatlas.h)
+		TaskGroup *group = m_groups[handle->value].load(std::memory_order_relaxed);
+		TrimkitRunTasks(group->queue.size(), [](void *context, uint32_t begin, uint32_t end) {
+			const TaskGroup &tasks = *static_cast<const TaskGroup *>(context);
+			for (uint32_t i = begin; i < end; i++)
+				tasks.queue[i].func(tasks.userData, tasks.queue[i].userData);
+		}, group);
+		//// TRIMKIT END PATCH
 		group->queue.clear();
 		destroyGroup(*handle);
 		handle->value = UINT32_MAX;
 	}
 
-	static uint32_t currentThreadIndex() { return 0; }
+	//// TRIMKIT PATCH: perf.one-pool
+	static uint32_t currentThreadIndex() { return TrimkitThreadIndex(); }
+	//// TRIMKIT END PATCH
 
 private:
 	void destroyGroup(TaskGroupHandle handle)
 	{
-		TaskGroup *group = m_groups[handle.value];
+		//// TRIMKIT PATCH: perf.one-pool
+		// only the group's own thread frees it; the release hands the slot on
+		TaskGroup *group = m_groups[handle.value].load(std::memory_order_relaxed);
+		//// TRIMKIT END PATCH
 		if (group) {
 			group->~TaskGroup();
 			XA_FREE(group);
-			m_groups[handle.value] = nullptr;
+			//// TRIMKIT PATCH: perf.one-pool
+			m_groups[handle.value].store(nullptr, std::memory_order_release);
+			//// TRIMKIT END PATCH
 		}
 	}
 
@@ -3366,7 +3404,10 @@ private:
 		void *userData;
 	};
 
-	Array<TaskGroup *> m_groups;
+	//// TRIMKIT PATCH: perf.one-pool
+	uint32_t m_capacity;
+	std::atomic<TaskGroup *> *m_groups;
+	//// TRIMKIT END PATCH
 };
 #endif
 
@@ -3428,7 +3469,9 @@ public:
 #if XA_MULTITHREADED
 		const uint32_t n = std::thread::hardware_concurrency();
 #else
-		const uint32_t n = 1;
+		//// TRIMKIT PATCH: perf.one-pool
+		const uint32_t n = TrimkitThreadSlots();
+		//// TRIMKIT END PATCH
 #endif
 		m_array = XA_ALLOC_ARRAY(MemTag::Default, T, n);
 		for (uint32_t i = 0; i < n; i++)
@@ -3440,7 +3483,9 @@ public:
 #if XA_MULTITHREADED
 		const uint32_t n = std::thread::hardware_concurrency();
 #else
-		const uint32_t n = 1;
+		//// TRIMKIT PATCH: perf.one-pool
+		const uint32_t n = TrimkitThreadSlots();
+		//// TRIMKIT END PATCH
 #endif
 		for (uint32_t i = 0; i < n; i++)
 			m_array[i].~T();

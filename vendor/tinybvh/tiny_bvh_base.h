@@ -3212,6 +3212,7 @@ TEMPLATED void BVH<Float, Index>::BuildHQTask( Index nodeIdx, uint32_t depth, In
 				// find optimal object split
 				BinBox binBox[3][MAXHQBINS];
 				Index count[3][MAXHQBINS];
+				//// TRIMKIT PATCH: fix.flat-node-bins
 				// trimkit (vendor/patches/tinybvh-flat-node-bins.patch): no bins on an axis the node
 				// is flat on, as the plain builder does; otherwise 0 * inf = NaN is cast to int
 				const Vec3 extent3 = node.aabbMax - node.aabbMin;
@@ -3219,6 +3220,7 @@ TEMPLATED void BVH<Float, Index>::BuildHQTask( Index nodeIdx, uint32_t depth, In
 					extent3.x > minDim.x ? ((Float)binCount / extent3.x) : 0,
 					extent3.y > minDim.y ? ((Float)binCount / extent3.y) : 0,
 					extent3.z > minDim.z ? ((Float)binCount / extent3.z) : 0 ), nmin3 = node.aabbMin;
+				//// TRIMKIT END PATCH
 				// horizontal binning for large nodes: one slice of the fragment range per task.
 				const uint32_t slices = TaskCount( threadedBuild && node.triCount >= (Index)MT_HQ_BIN_THRESHOLD, node.triCount, MT_HQ_SLICE_PRIMS, MT_HQ_MAX_SLICES );
 				if (slices > 1 && !sliceBox)

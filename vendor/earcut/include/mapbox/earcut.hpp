@@ -107,7 +107,9 @@ private:
     void earcutLinked(Node* ear);
     bool isEar(Node* ear);
     bool isEarHashed(Node* ear);
+    //// TRIMKIT PATCH: perf.convex-ring
     bool isConvex(Node* start);
+    //// TRIMKIT END PATCH
     Node* cureLocalIntersections(Node* start);
     void splitEarcut(Node* start);
     template <typename Polygon>
@@ -117,6 +119,8 @@ private:
     void buildBlockIndex(std::size_t maxNodes, std::size_t numHoles);
     void indexSegment(Node* head, Node* stop);
     void growBlock(Node* head, Node* tail);
+    //// TRIMKIT PATCH: perf.hole-bridge-blocks
+    //// TRIMKIT END PATCH
     bool sectorContainsSector(const Node* m, const Node* p);
     void indexCurve(Node* start);
     Node* sortLinked(Node* list);
@@ -233,9 +237,11 @@ private:
     // chosen bridge can differ from the un-indexed code — a different but equally valid result.
     static constexpr int32_t K = 16; // edges per block
     std::vector<double> blockBBox;   // [minX,minY,maxX,maxY] per block
+    //// TRIMKIT PATCH: perf.hole-bridge-blocks
     // trimkit (vendor/patches/earcut-hole-bridge-blocks.patch): each block's own nodes, so its
     // walk never runs on through holes spliced in later (quadratic in the number of holes)
     std::vector<Node*> blockNodes;   // the K nodes whose edges each block owns, null-padded
+    //// TRIMKIT END PATCH
     std::size_t numBlocks = 0;
     // true only while eliminateHoles merges holes, so removeNode keeps the block index live (growBlock)
     bool indexActive = false;
@@ -380,10 +386,12 @@ void Earcut<N>::earcutLinked(Node* ear) {
     Node* prev;
     Node* next;
     bool cured = false;
+    //// TRIMKIT PATCH: perf.convex-ring
     // trimkit (vendor/patches/earcut-convex-ring.patch, a port of earcut.js PR #212):
     // a strictly convex ring has no vertex that could block an ear, so skip the point checks until a candidate fails;
     // without this, a big convex ring is cut as one fan of long triangles and each hashed check scans O(n) points
     bool convex = hashing ? isConvex(ear) : false;
+    //// TRIMKIT END PATCH
 
     // iterate through ears, slicing them one by one
     while (ear->prev != ear->next) {
@@ -391,7 +399,9 @@ void Earcut<N>::earcutLinked(Node* ear) {
         next = ear->next;
 
         // reflex check is hoisted here to avoid constructing the Triangle for reflex corners
+        //// TRIMKIT PATCH: perf.convex-ring
         if (area(prev, ear, next) < 0 && (convex || (hashing ? isEarHashed(ear) : isEar(ear)))) {
+        //// TRIMKIT END PATCH
             // cut off the triangle
             indices.emplace_back(prev->i);
             indices.emplace_back(ear->i);
@@ -405,7 +415,9 @@ void Earcut<N>::earcutLinked(Node* ear) {
             continue;
         }
 
+        //// TRIMKIT PATCH: perf.convex-ring
         convex = false;
+        //// TRIMKIT END PATCH
         ear = next;
 
         // if we looped through the whole remaining polygon and can't find any more ears
@@ -434,6 +446,7 @@ void Earcut<N>::earcutLinked(Node* ear) {
     }
 }
 
+//// TRIMKIT PATCH: perf.convex-ring
 // check whether every vertex of a ring is strictly convex (trimkit: earcut.js PR #212)
 template <typename N>
 bool Earcut<N>::isConvex(Node* start) {
@@ -445,6 +458,7 @@ bool Earcut<N>::isConvex(Node* start) {
     return true;
 }
 
+//// TRIMKIT END PATCH
 // check whether a polygon node forms a valid ear with adjacent nodes
 template <typename N>
 bool Earcut<N>::isEar(Node* ear) {
@@ -644,12 +658,14 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
     for (std::size_t b = 0, g = 0; b < numBlocks; b++, g += 4) {
         if (hy < blockBBox[g + 1] || hy > blockBBox[g + 3] || blockBBox[g] > hx || blockBBox[g + 2] <= qx) continue;
 
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         // trimkit (vendor/patches/earcut-hole-bridge-blocks.patch):
         // only the block's own K nodes: holes spliced into its run later are
         // indexed as blocks of their own, so walking on into them is wasted
         for (int32_t k = 0; k < K; k++) {
             p = blockNodes[b * K + k];
             if (!p) break;
+        //// TRIMKIT END PATCH
             if (p->prev->next == p) { // skip nodes removed by filterPoints (stale in the index)
                 if (equals(hole, p->next))
                     return p->next;
@@ -662,7 +678,9 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
                     }
                 }
             }
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         }
+        //// TRIMKIT END PATCH
     }
 
     if (!m) return 0;
@@ -682,9 +700,11 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
         if (blockBBox[g + 2] < mx || blockBBox[g] > hx || blockBBox[g + 3] < tminY || blockBBox[g + 1] > tmaxY)
             continue;
 
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         for (int32_t k = 0; k < K; k++) {
             p = blockNodes[b * K + k];
             if (!p) break;
+        //// TRIMKIT END PATCH
             if (p->prev->next == p && hx >= p->x && p->x >= mx && hx != p->x && // skip dead nodes
                 pointInTriangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, p->x, p->y)) {
                 const double tanCur = std::abs(hy - p->y) / (hx - p->x); // tangential
@@ -698,7 +718,9 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
                     tanMin = tanCur;
                 }
             }
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         }
+        //// TRIMKIT END PATCH
     }
 
     return m;
@@ -711,7 +733,9 @@ void Earcut<N>::buildBlockIndex(std::size_t maxNodes, std::size_t numHoles) {
     // trailing block per appended segment (outer ring + one per hole)
     const std::size_t maxBlocks = (maxNodes + 2 * numHoles + K - 1) / K + numHoles + 2;
     if (blockBBox.size() < maxBlocks * 4) blockBBox.resize(maxBlocks * 4);
+    //// TRIMKIT PATCH: perf.hole-bridge-blocks
     if (blockNodes.size() < maxBlocks * K) blockNodes.resize(maxBlocks * K);
+    //// TRIMKIT END PATCH
     numBlocks = 0;
 }
 
@@ -722,10 +746,12 @@ void Earcut<N>::indexSegment(Node* head, Node* stop) {
     Node* p = head;
     do {
         const std::size_t b = numBlocks++;
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         double bMinX = p->x, bMinY = p->y, bMaxX = p->x, bMaxY = p->y;
         int32_t k = 0;
         do {
             blockNodes[b * K + k] = p;      // the node owning edge p->c
+        //// TRIMKIT END PATCH
             Node* c = p->next;              // edge p->c; bbox must bound both endpoints
             p->z = static_cast<int32_t>(b); // reuse z as the owning block during eliminateHoles (see growBlock)
             if (c->x < bMinX) bMinX = c->x;
@@ -734,7 +760,9 @@ void Earcut<N>::indexSegment(Node* head, Node* stop) {
             if (c->y > bMaxY) bMaxY = c->y;
             p = c;
         } while (++k < K && p != stop);
+        //// TRIMKIT PATCH: perf.hole-bridge-blocks
         for (int32_t rest = k; rest < K; rest++) blockNodes[b * K + rest] = nullptr;
+        //// TRIMKIT END PATCH
         const std::size_t g = b * 4;
         blockBBox[g] = bMinX;
         blockBBox[g + 1] = bMinY;
@@ -755,6 +783,8 @@ void Earcut<N>::growBlock(Node* head, Node* tail) {
     if (tail->y > blockBBox[g + 3]) blockBBox[g + 3] = tail->y;
 }
 
+//// TRIMKIT PATCH: perf.hole-bridge-blocks
+//// TRIMKIT END PATCH
 // whether sector in vertex m contains sector in vertex p in the same coordinates
 template <typename N>
 bool Earcut<N>::sectorContainsSector(const Node* m, const Node* p) {

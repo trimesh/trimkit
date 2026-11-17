@@ -264,6 +264,16 @@ void SetPrint(PrintFunc print, bool verbose);
 const char *StringForEnum(AddMeshError error);
 const char *StringForEnum(ProgressCategory category);
 
+//// TRIMKIT PATCH: perf.one-pool
+// trimkit (vendor/patches/xatlas-one-pool.patch): how xatlas, built without threads of its own
+// (XA_MULTITHREADED 0), runs its task groups, defined by whatever links it (src/xatlas.cpp,
+// fuzz/xatlas.cpp): every task in [0, count) by run(context, begin, end), on any threads, returning once
+// all have run (or rethrowing an exception one threw), each thread running tasks with its own index below
+// TrimkitThreadSlots()
+uint32_t TrimkitThreadSlots();
+uint32_t TrimkitThreadIndex();
+void TrimkitRunTasks(uint32_t count, void (*run)(void *context, uint32_t begin, uint32_t end), void *context);
+//// TRIMKIT END PATCH
 } // namespace xatlas
 
 #endif // XATLAS_H

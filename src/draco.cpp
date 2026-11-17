@@ -184,7 +184,7 @@ nb::bytes draco_encode(const trimkit::Array<std::int64_t, -1, 3>& faces_argument
     draco::EncoderBuffer encoded;
     draco::Status status;
     {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         draco::Mesh mesh;
         mesh.set_num_points(static_cast<std::uint32_t>(count));
         mesh.SetNumFaces(face_count);
@@ -257,7 +257,7 @@ std::tuple<trimkit::Out<std::int64_t>, trimkit::AnyOuts> draco_decode(
     std::vector<std::vector<std::uint8_t>> values(wanted.size());
     std::vector<const draco::PointAttribute*> found(wanted.size(), nullptr);
     {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         draco::DecoderBuffer input;
         input.Init(reinterpret_cast<const char*>(buffer.data()), buffer.size());
         draco::Decoder decoder;

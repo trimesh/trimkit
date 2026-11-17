@@ -36,7 +36,9 @@
 
 #include "coal/shape/geometric_shapes.h"
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 #include "coal/internal/intersect.h"
+//// TRIMKIT END PATCH
 #include "coal/internal/shape_shape_func.h"
 #include "../narrowphase/details.h"
 
@@ -49,10 +51,12 @@ template <>
 Scalar ShapeShapeDistance<TriangleP, TriangleP>(
     const CollisionGeometry* o1, const Transform3s& tf1,
     const CollisionGeometry* o2, const Transform3s& tf2,
+    //// TRIMKIT PATCH: perf.bvh-bvh-performance
     const GJKSolver* /*solver*/, const bool /*compute_signed_distance*/,
     Vec3s& p1, Vec3s& p2, Vec3s& normal) {
   COAL_TRACY_ZONE_SCOPED_N(
       "coal::internal::ShapeShapeDistance<TriangleP, TriangleP>");
+    //// TRIMKIT END PATCH
   const TriangleP& s1 = static_cast<const TriangleP&>(*o1);
   const TriangleP t1(tf1.transform(s1.a), tf1.transform(s1.b),
                      tf1.transform(s1.c));
@@ -61,6 +65,7 @@ Scalar ShapeShapeDistance<TriangleP, TriangleP>(
   const TriangleP t2(tf2.transform(s2.a), tf2.transform(s2.b),
                      tf2.transform(s2.c));
 
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   const Scalar d2 = TriangleDistance::sqrTriDistance(t1.a, t1.b, t1.c, t2.a,
                                                      t2.b, t2.c, p1, p2);
 
@@ -74,6 +79,7 @@ Scalar ShapeShapeDistance<TriangleP, TriangleP>(
   internal::computeTriangleTriangleContact(t1.a, t1.b, t1.c, t2.a, t2.b, t2.c,
                                            signed_distance, p1, p2, normal);
   return signed_distance;
+  //// TRIMKIT END PATCH
 }
 }  // namespace internal
 

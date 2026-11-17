@@ -72,7 +72,7 @@ std::tuple<trimkit::Out<double>, trimkit::Out<std::int64_t>> triangulate(const R
     std::vector<double> vertices;
     std::vector<std::uint64_t> faces;
     {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         // the first ring is the shell and the rest are holes, indexed as stacked
         Polygon polygon;
         polygon.rings.resize(1 + holes.size());

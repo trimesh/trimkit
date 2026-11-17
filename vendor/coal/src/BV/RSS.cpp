@@ -757,6 +757,7 @@ bool overlap(const Matrix3s& R0, const Vec3s& T0, const RSS& b1, const RSS& b2,
   return false;
 }
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                   const Vec3s& inv_T0, const RSS& b1,
                                   const RSS& b2,
@@ -773,6 +774,7 @@ bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
   return false;
 }
 
+//// TRIMKIT END PATCH
 bool RSS::contain(const Vec3s& p) const {
   Vec3s local_p = p - Tr;
   // FIXME: Vec3s proj (axes.transpose() * local_p);

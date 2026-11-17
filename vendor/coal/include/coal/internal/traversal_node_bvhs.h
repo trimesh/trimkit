@@ -156,9 +156,11 @@ class MeshCollisionTraversalNode : public BVHCollisionTraversalNode<BV> {
       disjoint = !this->model1->getBV(b1).overlap(
           this->model2->getBV(b2), this->request, sqrDistLowerBound);
     else {
+      //// TRIMKIT PATCH: perf.bvh-bvh-performance
       disjoint = !overlapPrecomputedRTranspose(
           RT._RTranspose(), RT._InvT(), this->model2->getBV(b2).bv,
           this->model1->getBV(b1).bv, this->request, sqrDistLowerBound);
+      //// TRIMKIT END PATCH
     }
     if (disjoint)
       internal::updateDistanceLowerBoundFromBV(this->request, *this->result,
@@ -200,6 +202,7 @@ class MeshCollisionTraversalNode : public BVHCollisionTraversalNode<BV> {
     const Vec3s& Q2 = vertices2[tri_id2[1]];
     const Vec3s& Q3 = vertices2[tri_id2[2]];
 
+    //// TRIMKIT PATCH: perf.bvh-bvh-performance
     // the closed-form test misses no overlap of two triangles with area, but
     // reports any two zero-area ones as overlapping, however far apart: those
     // go through GJK below
@@ -304,6 +307,7 @@ class MeshCollisionTraversalNode : public BVHCollisionTraversalNode<BV> {
         p1 = p2 = normal = Vec3s::Constant(std::numeric_limits<Scalar>::max());
       }
     }
+    //// TRIMKIT END PATCH
 
     const Scalar distToCollision = distance - this->request.security_margin;
 

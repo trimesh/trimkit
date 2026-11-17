@@ -151,6 +151,7 @@ inline bool overlap(const Matrix3s& R0, const Vec3s& T0, const OBBRSS& b1,
   return overlap(R0, T0, b1.obb, b2.obb, request, sqrDistLowerBound);
 }
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 /// Check collision between two OBBRSS, reusing precomputed R0.transpose() and
 /// -R0.transpose() * T0 for the configuration of b1.
 inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
@@ -162,6 +163,7 @@ inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                       request, sqrDistLowerBound);
 }
 
+//// TRIMKIT END PATCH
 /// @brief Computate distance between two OBBRSS, b1 is in configuation (R0, T0)
 /// and b2 is in indentity; P and Q, is not NULL, returns the nearest points
 inline Scalar distance(const Matrix3s& R0, const Vec3s& T0, const OBBRSS& b1,

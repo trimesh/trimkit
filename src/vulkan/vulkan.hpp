@@ -23,6 +23,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
+#include "../platform.hpp"
 #include "spirv.hpp"
 
 #if defined(_WIN32)
@@ -342,16 +343,13 @@ struct Device {
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     Chunk chunks[IN_FLIGHT];
-    int pid = 0;
+    // the fork generation it was opened in (platform.hpp): a child holds its
+    // parent's device, which isn't the child's to use or free
+    std::uint32_t generation = 0;
 };
 
-inline int process_id() {
-#if defined(_WIN32)
-    return _getpid();
-#else
-    return static_cast<int>(getpid());
-#endif
-}
+// whether this process opened `device`, not a parent it was forked from
+inline bool opened_in_this_process(const Device& device) { return device.generation == platform::fork_generation(); }
 
 // whether a Vulkan call succeeded: if not, the reason names it and its result
 inline bool ok(VkResult result, const char* what, std::string* reason) {
@@ -833,7 +831,7 @@ inline bool open(Device* device, std::string* reason) {
             return false;
         }
     }
-    device->pid = process_id();
+    device->generation = platform::fork_generation();
     return true;
 }
 
@@ -856,7 +854,7 @@ inline Device* shared_device(std::string* reason) {
         *reason = opened.reason;
         return nullptr;
     }
-    if (opened.device.pid != process_id()) {
+    if (!opened_in_this_process(opened.device)) {
         *reason = "the Vulkan device was opened before this process was forked";
         return nullptr;
     }

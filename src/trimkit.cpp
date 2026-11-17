@@ -310,6 +310,9 @@ void operator delete[](void* block, std::size_t /*unused*/, std::align_val_t ali
 NB_MODULE(trimkit, m) {  // NOLINT(performance-unnecessary-value-param): the macro passes it by value
     trimkit::init_numpy();
     trimkit::install_fork_handler();
+    // before the interpreter finalizes, every call that released the GIL has
+    // taken it back, so none loses its thread mid-computation (gil.hpp)
+    nb::module_::import_("atexit").attr("register")(nb::cpp_function(&trimkit::exit_at_interpreter_exit));
     // the last paragraph names what this build compiled in, each upstream's
     // repository and commit, or `(system)` for a distribution's copy
     m.doc() = R"(Thin, stable-ABI numpy bindings to pinned C and C++ geometry libraries.

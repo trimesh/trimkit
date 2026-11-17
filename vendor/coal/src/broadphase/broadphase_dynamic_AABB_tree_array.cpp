@@ -514,7 +514,9 @@ void DynamicAABBTreeArrayCollisionManager::registerObjects(
     int n_leaves = (int)other_objs.size();
 
     dtree.init(leaves, n_leaves, tree_init_level);
+    //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
     delete[] leaves;  // copied into the tree's own nodes
+    //// TRIMKIT END PATCH
 
     setup_ = true;
   }

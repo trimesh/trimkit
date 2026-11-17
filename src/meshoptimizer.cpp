@@ -61,7 +61,7 @@ static Simplified simplify(const trimkit::Array<double, -1, 3>& vertices_argumen
     std::vector<double> output_vertices;
     {
         // converting reads every value, so it runs without the GIL too
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         double scale = 1.0;
         const std::vector<float> positions = trimkit::float32_positions(vertices.data(), vertex_count, &scale);
         // never more than the input, clamped before multiplying so it can't overflow

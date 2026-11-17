@@ -25,6 +25,8 @@
 // fresh, writable array that owns its memory and shares none with an input.
 #pragma once
 
+#include "gil.hpp"
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
@@ -559,7 +561,7 @@ std::vector<Index> read_indices(const Array<std::int64_t, -1, 3>& argument, cons
     // out of range (a negative index wraps to a huge unsigned one)
     std::size_t violations = 0;
     {
-        const nb::gil_scoped_release release;
+        const GilReleased release;
         for (std::size_t i = 0; i < indices.size(); i++) {
             // read once: what is checked is what is kept
             const std::int64_t index = values[i];

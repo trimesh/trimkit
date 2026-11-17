@@ -83,7 +83,7 @@ public:
             trimkit::value_error(name + " is convex, so it needs faces");
         }
         if (face_count_ > 0) {
-            const nb::gil_scoped_release release;
+            const trimkit::GilReleased release;
             build(mesh.vertices.data(), mesh.vertices.shape(0), mesh.faces, convex);
         } else {
             // no model holds them, so a pickle can still give them back
@@ -550,7 +550,7 @@ public:
         // the pairs to test: the given rows, or the boxes' candidates
         std::vector<std::int64_t> pairs;
         if (pairs_argument.is_none()) {
-            const nb::gil_scoped_release release;
+            const trimkit::GilReleased release;
             pairs = overlapping(placed, margin);
         } else {
             pairs = read_pairs(pairs_argument, placed.size());
@@ -692,7 +692,7 @@ private:
         const trimkit::Instances instances = trimkit::read_instances(
             trimkit::view_instances(index_argument, matrices_argument), meshes_.size(), /*rigid=*/true);
         std::vector<Placed> placed(instances.count);
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         for (std::size_t i = 0; i < instances.count; i++) {
             const double* m = instances.matrix(i);
             const CollisionMesh* mesh = meshes_[instances.mesh(i)].get();

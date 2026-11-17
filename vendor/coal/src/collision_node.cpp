@@ -35,5 +35,7 @@
 
 /** \author Jia Pan */
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 // collide() and distance() are now inline templates in collision_node.h.
 // This file is intentionally empty.
+//// TRIMKIT END PATCH

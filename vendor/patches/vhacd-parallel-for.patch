@@ -43,27 +43,31 @@ fuzz/vhacd.cpp.
 
 --- a/include/VHACD.h
 +++ b/include/VHACD.h
-@@ -393,6 +393,11 @@
+@@ -393,6 +393,13 @@
          bool                m_asyncACD{ true };             // Whether or not to run asynchronously, taking advantage of additional cores
          uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
          bool                m_findBestPlane{ false };       // Whether or not to attempt to split planes along the best location. Experimental feature. False by default.
++        //// TRIMKIT PATCH: perf.parallel-for
 +        // trimkit (vendor/patches/vhacd-parallel-for.patch): the caller's own fan-out, if it has one: runs
 +        // body(bodyContext, begin, end) over [0, count) on whatever threads it likes and returns once every item
 +        // ran, in place of the thread pool Compute would otherwise start. Null runs every fan-out in order here.
 +        void              (*m_parallelFor)(void* context, size_t count, void (*body)(void* bodyContext, size_t begin, size_t end), void* bodyContext){ nullptr };
 +        void*               m_parallelForContext{ nullptr };
++        //// TRIMKIT END PATCH
      };
  
      /**
-@@ -6742,7 +6747,6 @@
+@@ -6746,7 +6753,8 @@
      IVHACD::ConvexHull* m_hullA{ nullptr };
      IVHACD::ConvexHull* m_hullB{ nullptr };
      double              m_concavity{ 0 }; // concavity of the two combined
 -    std::future<void>   m_future;
++//// TRIMKIT PATCH: perf.parallel-for
++//// TRIMKIT END PATCH
  };
  
  class HullPair
-@@ -7127,12 +7131,6 @@
+@@ -7131,12 +7139,8 @@
      m_canceled = false;
  
      Clean(); // release any previous results
@@ -73,26 +77,30 @@ fuzz/vhacd.cpp.
 -        m_threadPool = std::unique_ptr<ThreadPool>(new ThreadPool(8));
 -    }
 -#endif
++    //// TRIMKIT PATCH: perf.parallel-for
++    //// TRIMKIT END PATCH
      CopyInputMesh(points,
                    triangles);
      if ( !m_canceled )
-@@ -7328,14 +7326,30 @@
+@@ -7332,14 +7336,32 @@
      }
  }
  
 -void jobCallback(std::unique_ptr<VoxelHull>& userPtr)
-+// trimkit (vendor/patches/vhacd-parallel-for.patch): body(i) for every i in [0, count), through the caller's
-+// m_parallelFor when it gave one (an exception a body throws there comes back out of it, so the fan-out
-+// unwinds like a loop), else here in order
-+template <typename Body>
-+void RunParallel(const IVHACD::Parameters& params, size_t count, const Body& body)
- {
+-{
 -    userPtr->PerformPlaneSplit();
 -}
 -
 -void computeMergeCostTask(CostTask& ptr)
 -{
 -    ptr.m_this->PerformMergeCostTask(ptr);
++//// TRIMKIT PATCH: perf.parallel-for
++// trimkit (vendor/patches/vhacd-parallel-for.patch): body(i) for every i in [0, count), through the caller's
++// m_parallelFor when it gave one (an exception a body throws there comes back out of it, so the fan-out
++// unwinds like a loop), else here in order
++template <typename Body>
++void RunParallel(const IVHACD::Parameters& params, size_t count, const Body& body)
++{
 +    if ( params.m_parallelFor && count > 1 )
 +    {
 +        params.m_parallelFor(params.m_parallelForContext, count, [](void* context, size_t begin, size_t end)
@@ -111,10 +119,11 @@ fuzz/vhacd.cpp.
 +            body(i);
 +        }
 +    }
++//// TRIMKIT END PATCH
  }
  
  void VHACDImpl::PerformConvexDecomposition()
-@@ -7362,42 +7376,20 @@
+@@ -7366,42 +7388,22 @@
              }
              // First we make a copy of the hulls we are processing
              std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
@@ -123,17 +132,13 @@ fuzz/vhacd.cpp.
 -            // a job to be performed in a background thread
 -            std::vector<std::future<void>> futures(oldList.size());
 -            uint32_t futureCount = 0;
-+            // Every hull we want to split, split at once through the caller's fan-out
-+            std::vector<VoxelHull*> splitting;
-+            splitting.reserve(oldList.size());
-             for (auto& i : oldList)
-             {
+-            for (auto& i : oldList)
+-            {
 -                if ( i->IsComplete() || count > MaxConvexHullFragments )
 -                {
 -                }
 -                else
-+                if ( !(i->IsComplete() || count > MaxConvexHullFragments) )
-                 {
+-                {
 -#if !VHACD_DISABLE_THREADING
 -                    if ( m_threadPool )
 -                    {
@@ -148,24 +153,36 @@ fuzz/vhacd.cpp.
 -                    {
 -                        i->PerformPlaneSplit();
 -                    }
-+                    splitting.push_back(i.get());
-                 }
-             }
+-                }
+-            }
 -            // Wait for any outstanding jobs to complete in the background threads
 -            if ( futureCount )
-+            RunParallel(m_params, splitting.size(), [&splitting](size_t i)
-             {
+-            {
 -                for (uint32_t i = 0; i < futureCount; i++)
 -                {
 -                    futures[i].get();
 -                }
 -            }
++            //// TRIMKIT PATCH: perf.parallel-for
++            // Every hull we want to split, split at once through the caller's fan-out
++            std::vector<VoxelHull*> splitting;
++            splitting.reserve(oldList.size());
++            for (auto& i : oldList)
++            {
++                if ( !(i->IsComplete() || count > MaxConvexHullFragments) )
++                {
++                    splitting.push_back(i.get());
++                }
++            }
++            RunParallel(m_params, splitting.size(), [&splitting](size_t i)
++            {
 +                splitting[i]->PerformPlaneSplit();
 +            });
++            //// TRIMKIT END PATCH
              // Now, we rebuild the pending convex hulls list by
              // adding the two children to the output list if
              // we need to recurse them further
-@@ -7503,43 +7495,19 @@
+@@ -7507,43 +7509,21 @@
                      else
                      {
                          tasks.push_back(std::move(ct));
@@ -179,16 +196,15 @@ fuzz/vhacd.cpp.
 -                            });
 -                        }
 -#endif
-                     }
-                 }
-             }
- 
-             if ( !m_canceled )
-             {
+-                    }
+-                }
+-            }
+-
+-            if ( !m_canceled )
+-            {
 -#if !VHACD_DISABLE_THREADING
 -                if ( m_threadPool )
-+                RunParallel(m_params, tasks.size(), [&tasks](size_t i)
-                 {
+-                {
 -                    for (CostTask& task : tasks)
 -                    {
 -                        task.m_future.get();
@@ -201,20 +217,31 @@ fuzz/vhacd.cpp.
 -                }
 -                else
 -#endif
-+                    tasks[i].m_this->PerformMergeCostTask(tasks[i]);
-+                });
-+                for (CostTask& task : tasks)
-                 {
+-                {
 -                    for (CostTask& task : tasks)
 -                    {
 -                        PerformMergeCostTask(task);
 -                        AddCostToPriorityQueue(task);
 -                    }
++                    //// TRIMKIT PATCH: perf.parallel-for
++                    }
++                }
++            }
++
++            if ( !m_canceled )
++            {
++                RunParallel(m_params, tasks.size(), [&tasks](size_t i)
++                {
++                    tasks[i].m_this->PerformMergeCostTask(tasks[i]);
++                });
++                for (CostTask& task : tasks)
++                {
 +                    AddCostToPriorityQueue(task);
++                    //// TRIMKIT END PATCH
                  }
                  ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
                                 100,
-@@ -7627,32 +7595,10 @@
+@@ -7631,32 +7611,12 @@
                              }
                          }
                          m_hulls[combinedHull->m_meshId] = combinedHull;
@@ -222,8 +249,7 @@ fuzz/vhacd.cpp.
 -                        // If there are 8 or more and we are running asynchronously, then do them that way.
 -#if !VHACD_DISABLE_THREADING
 -                        if ( m_threadPool && tasks.size() >= 2)
-+                        RunParallel(m_params, tasks.size(), [&tasks](size_t i)
-                         {
+-                        {
 -                            for (CostTask& task : tasks)
 -                            {
 -                                task.m_future = m_threadPool->enqueue([&task]
@@ -245,8 +271,12 @@ fuzz/vhacd.cpp.
 -                                PerformMergeCostTask(task);
 -                            }
 -                        }
++                        //// TRIMKIT PATCH: perf.parallel-for
++                        RunParallel(m_params, tasks.size(), [&tasks](size_t i)
++                        {
 +                            tasks[i].m_this->PerformMergeCostTask(tasks[i]);
 +                        });
++                        //// TRIMKIT END PATCH
  
                          for (CostTask& task : tasks)
                          {

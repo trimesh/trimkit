@@ -97,16 +97,18 @@ trimkit::MeshOuts decompose(const trimkit::Array<double, -1, 3>& vertices_argume
 
     std::vector<Hull> hulls;
     bool interrupted = false;
+    bool exiting = false;
     // a decomposition needs a volume: skip input V-HACD can't handle
     if (!triangles.empty() && vertex_count > 3) {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         const std::unique_ptr<VHACD::IVHACD, Release> vhacd(VHACD::CreateVHACD());
         Progress progress(vhacd.get());
         parameters.m_callback = &progress;
         vhacd->Compute(vertices.data(), static_cast<std::uint32_t>(vertex_count), triangles.data(),
                        static_cast<std::uint32_t>(triangles.size() / 3), parameters);
         interrupted = progress.interrupt.interrupted();
-        hulls.resize(interrupted ? 0 : vhacd->GetNConvexHulls());
+        exiting = progress.interrupt.stopped() && !interrupted;
+        hulls.resize(interrupted || exiting ? 0 : vhacd->GetNConvexHulls());
         VHACD::IVHACD::ConvexHull computed;
         for (std::uint32_t h = 0; h < hulls.size(); h++) {
             vhacd->GetConvexHull(h, computed);
@@ -123,6 +125,9 @@ trimkit::MeshOuts decompose(const trimkit::Array<double, -1, 3>& vertices_argume
                 hulls[h].faces[(3 * i) + 2] = computed.m_triangles[i].mI2;
             }
         }
+    }
+    if (exiting) {
+        trimkit::raise_exiting();
     }
     if (interrupted) {
         throw nb::python_error();

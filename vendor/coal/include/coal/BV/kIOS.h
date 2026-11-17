@@ -185,6 +185,7 @@ COAL_DLLAPI bool overlap(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,
                          const kIOS& b2, const CollisionRequest& request,
                          Scalar& sqrDistLowerBound);
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 /// @brief Check collision between two kIOSs, reusing precomputed
 /// R0.transpose() and -R0.transpose() * T0 for the configuration of b1.
 COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
@@ -193,6 +194,7 @@ COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                               const CollisionRequest& request,
                                               Scalar& sqrDistLowerBound);
 
+//// TRIMKIT END PATCH
 /// @brief Approximate distance between two kIOS bounding volumes
 /// @todo P and Q is not returned, need implementation
 COAL_DLLAPI Scalar distance(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,

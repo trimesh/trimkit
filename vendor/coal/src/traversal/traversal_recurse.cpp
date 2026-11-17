@@ -35,6 +35,8 @@
 
 /** \author Jia Pan */
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 // All traversal recurse functions are now inline templates in
 // include/coal/internal/traversal_recurse-inl.h.
 // This file is intentionally empty.
+//// TRIMKIT END PATCH

@@ -177,6 +177,7 @@ bool overlap(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,
   return b1.overlap(b2_temp, request, sqrDistLowerBound);
 }
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                   const Vec3s& inv_T0, const kIOS& b1,
                                   const kIOS& b2,
@@ -194,6 +195,7 @@ bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
   return b1.overlap(b2_temp, request, sqrDistLowerBound);
 }
 
+//// TRIMKIT END PATCH
 Scalar distance(const Matrix3s& R0, const Vec3s& T0, const kIOS& b1,
                 const kIOS& b2, Vec3s* P, Vec3s* Q) {
   kIOS b2_temp = b2;

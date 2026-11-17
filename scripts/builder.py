@@ -650,6 +650,9 @@ QUIET = Flags(("-w",))
 # be clean. Each upstream's [no_sanitize] table turns checks off for it instead
 OURS_CHECKS = ("integer", "nullability", "implicit-conversion", "local-bounds", "float-divide-by-zero")
 OURS_SANITIZED = Flags((f"-fsanitize={','.join(OURS_CHECKS)}",))
+# every sanitized build also checks, in our sources, what the pool and its
+# callers promise each other at every step (src/parallel.hpp, `checked`)
+CHECKED = Flags(("-DTRIMKIT_CHECKED",))
 # what clang's -fsanitize-ignorelist= reads, written beside build.ninja
 IGNORELIST = "sanitize_ignorelist.txt"
 
@@ -826,6 +829,8 @@ def plan(manifest: Manifest, target: Target) -> str:
     ours = WARNINGS + (STRICT if config.strict and config.pgo != "use" else NONE)
     if "undefined" in config.sanitizers:
         ours += OURS_SANITIZED
+    if config.sanitizers:
+        ours += CHECKED
     edges: list[str] = []
 
     def edge(rule: str, output: str, inputs, flags=None) -> str:

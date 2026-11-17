@@ -560,8 +560,10 @@ bool initialize(MeshCollisionTraversalNode<BV, 0>& node,
   node.RT.R.noalias() = tf1.getRotation().transpose() * tf2.getRotation();
   node.RT.T.noalias() = tf1.getRotation().transpose() *
                         (tf2.getTranslation() - tf1.getTranslation());
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   node.RT.R_transpose.noalias() = node.RT.R.transpose();
   node.RT.inv_T.noalias() = -(node.RT.R_transpose * node.RT.T);
+  //// TRIMKIT END PATCH
 
   return true;
 }
@@ -688,8 +690,10 @@ bool initialize(MeshDistanceTraversalNode<BV, 0>& node,
 
   relativeTransform(tf1.getRotation(), tf1.getTranslation(), tf2.getRotation(),
                     tf2.getTranslation(), node.RT.R, node.RT.T);
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   node.RT.R_transpose.noalias() = node.RT.R.transpose();
   node.RT.inv_T.noalias() = -(node.RT.R_transpose * node.RT.T);
+  //// TRIMKIT END PATCH
 
   COAL_COMPILER_DIAGNOSTIC_POP
 

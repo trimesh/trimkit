@@ -40,6 +40,7 @@
 
 /// @cond INTERNAL
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 #include <cmath>
 
 #include "coal/BVH/BVH_front.h"
@@ -69,6 +70,7 @@ inline void checkResultLowerBound(const CollisionResult& result,
                 std::logic_error);
   }
 }
+//// TRIMKIT END PATCH
 
 /// collision on collision traversal node
 ///
@@ -78,6 +80,7 @@ inline void checkResultLowerBound(const CollisionResult& result,
 /// @param front_list list of nodes visited by the query, can be used to
 ///        accelerate computation
 /// \todo should be COAL_LOCAL but used in unit test.
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 template <typename Node>
 inline void collide(Node* node, const CollisionRequest& request,
                     CollisionResult& result, BVHFrontList* front_list = nullptr,
@@ -108,6 +111,7 @@ inline void distance(Node* node, BVHFrontList* front_list = nullptr,
   node->postprocess();
 }
 
+//// TRIMKIT END PATCH
 }  // namespace coal
 
 /// @endcond

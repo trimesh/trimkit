@@ -1,11 +1,30 @@
 // Property: any small mesh parameterizes, within libFuzzer's timeout, into an
 // atlas whose vertices map back to real input vertices and whose texture
 // coordinates fall inside the atlas.
+#include "../src/parallel.hpp"
+
 #include <fuzzer/FuzzedDataProvider.h>
 #include <xatlas.h>
 
 #include <cstdint>
 #include <vector>
+
+// xatlas's task groups on the real pool, Python-free (src/xatlas.cpp does the
+// same through common.hpp): so this fuzzes xatlas on the threads it ships on
+std::uint32_t xatlas::TrimkitThreadSlots() { return trimkit::parallel::thread_slots(); }
+std::uint32_t xatlas::TrimkitThreadIndex() { return trimkit::parallel::thread_index(); }
+void xatlas::TrimkitRunTasks(std::uint32_t count, void (*run)(void* context, std::uint32_t begin, std::uint32_t end),
+                             void* context) {
+    const trimkit::platform::Failure failure = trimkit::parallel::for_each_range(
+        count,
+        [&](std::size_t begin, std::size_t end) {
+            run(context, static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end));
+        },
+        trimkit::parallel::ItemCost::Coarse);
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     FuzzedDataProvider in(data, size);

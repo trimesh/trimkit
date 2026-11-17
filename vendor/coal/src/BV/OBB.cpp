@@ -361,6 +361,7 @@ bool obbDisjointAndLowerBoundDistance(const Matrix3s& B, const Vec3s& T,
                     .array()
                     .max(Scalar(0)));
 
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   if (request.enable_distance_lower_bound) {
     // request explicitly asks for a lower bound on the distance, so we compute
     // it as tight as possible
@@ -399,6 +400,7 @@ bool obbDisjointAndLowerBoundDistance(const Matrix3s& B, const Vec3s& T,
       }
     }
   }
+  //// TRIMKIT END PATCH
 
   // Ai x Bj
   int ja = 1, ka = 2;
@@ -512,6 +514,7 @@ bool overlap(const Matrix3s& R0, const Vec3s& T0, const OBB& b1, const OBB& b2,
                                            sqrDistLowerBound);
 }
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                   const Vec3s& inv_T0, const OBB& b1,
                                   const OBB& b2,
@@ -525,6 +528,7 @@ bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                            sqrDistLowerBound);
 }
 
+//// TRIMKIT END PATCH
 OBB translate(const OBB& bv, const Vec3s& t) {
   OBB res(bv);
   res.To += t;

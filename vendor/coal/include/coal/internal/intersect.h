@@ -183,6 +183,7 @@ class COAL_DLLAPI TriangleDistance {
                                const Transform3s& tf, Vec3s& P, Vec3s& Q);
 };
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 namespace internal {
 /// @brief Returns true if triangles P1P2P3 and Q1Q2Q3 share at least one point.
 bool triangleTriangleOverlap(const Vec3s& P1, const Vec3s& P2, const Vec3s& P3,
@@ -208,6 +209,7 @@ void computeTriangleTriangleContact(const Vec3s& P1, const Vec3s& P2,
                                     Vec3s& p1, Vec3s& p2);
 }  // namespace internal
 
+//// TRIMKIT END PATCH
 }  // namespace coal
 
 /// @endcond

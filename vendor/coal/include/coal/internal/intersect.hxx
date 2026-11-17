@@ -325,6 +325,7 @@ Project<Scalar>::projectTetrahedraOrigin(const Vec3& a, const Vec3& b,
   return res;
 }
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 namespace internal {
 
 /// @brief SAT separating-axis helper.
@@ -505,6 +506,7 @@ inline void computeTriangleTriangleContact(const Vec3s& P1, const Vec3s& P2,
 }
 }  // namespace internal
 
+//// TRIMKIT END PATCH
 }  // namespace coal
 
 #endif  // COAL_INTERSECT_HXX

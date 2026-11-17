@@ -18,9 +18,30 @@
 #include <tuple>
 #include <vector>
 
+// xatlas's task groups, on the one pool (vendor/patches/xatlas-one-pool.patch):
+// its tasks are coarse (a mesh, a group of charts, a chart), so every worker
+// is woken at once, and each thread running them has its own scratch index
+std::uint32_t xatlas::TrimkitThreadSlots() { return trimkit::thread_slots(); }
+std::uint32_t xatlas::TrimkitThreadIndex() { return trimkit::thread_index(); }
+void xatlas::TrimkitRunTasks(std::uint32_t count, void (*run)(void* context, std::uint32_t begin, std::uint32_t end),
+                             void* context) {
+    struct Tasks {
+        void (*run)(void*, std::uint32_t, std::uint32_t);
+        void* context;
+    } tasks{run, context};
+    trimkit::run_ranges(
+        count,
+        [](void* each, std::size_t begin, std::size_t end) {
+            const Tasks& group = *static_cast<const Tasks*>(each);
+            group.run(group.context, static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end));
+        },
+        &tasks);
+}
+
 namespace {
 
-// xatlas reports progress from its worker threads and stops when we say so
+// xatlas reports progress from whichever thread runs a task, and stops when
+// we say so
 bool progress(xatlas::ProgressCategory /*category*/, int /*percent*/, void* interrupt) {
     return !static_cast<trimkit::Interrupt*>(interrupt)->poll();
 }
@@ -42,7 +63,7 @@ Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
     // with no faces there is nothing to parametrize, and given no indices
     // xatlas would read the vertices as an unindexed triangle list instead
     if (!indices.empty()) {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         // the one unavoidable conversion: xatlas only reads float32 positions,
         // and its tolerances are absolute, so centered and scaled to an extent
         // near 1 (a 1 cm grid got every uv at one point, a sphere offset by 1e8
@@ -70,7 +91,7 @@ Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
             pack.maxChartSize = 4096;
             xatlas::Generate(atlas, xatlas::ChartOptions(), pack);
         }
-        if (error == xatlas::AddMeshError::Success && !interrupt.interrupted()) {
+        if (error == xatlas::AddMeshError::Success && !interrupt.stopped()) {
             // one mesh went in, so one comes out: anything else is not an answer
             if (atlas->meshCount != 1) {
                 throw std::runtime_error("xatlas produced no atlas for the mesh");
@@ -92,9 +113,7 @@ Result parametrize(const trimkit::Array<double, -1, 3>& vertices_argument,
             out_faces.assign(out.indexArray, out.indexArray + out.indexCount);
         }
     }
-    if (interrupt.interrupted()) {
-        throw nb::python_error();
-    }
+    interrupt.raise_if_stopped();
     if (error != xatlas::AddMeshError::Success) {
         trimkit::value_error(xatlas::StringForEnum(error));
     }

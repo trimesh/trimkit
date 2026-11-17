@@ -1,6 +1,6 @@
 # trimkit
-
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, etc. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
+ 
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature, stable implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, etc. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
 
 ```
 pip install trimkit
@@ -70,9 +70,9 @@ This builds `abi3` wheels on `python >= 312`, for Windows, Mac, and Linux. Linux
 This releases an `sdist` that is tested on free-threaded builds, and will release `abi3t` wheels when `nanobind` supports it cleanly. As a policy there will never be per-Python releases; this is an `abi3` packaging effort.
 
 
-### API Choices
+### API Design Choices
 
-This does not and will never load meshes, parse XML, or support anything that isn't a pure data operation. For example it parses SVG path strings into numpy arrays fast; it does not parse the XML holding the path strings. It sits below `trimesh` or similar libraries in the Python ecosystem.
+This does not and will never load meshes, parse XML, or support anything that isn't a tight data operation. For example: this parses SVG path strings into numpy arrays fast; it does not parse the XML holding the path strings. It sits below `trimesh` or similar libraries in the Python ecosystem.
 
 - Functions take numpy arrays, don't play precision games, and are biased toward uniformity: everything comes in and goes out as `float64` or `int64`.
 - Generic names: functions (outside `trimkit.exchange`) are intended to be doors to the question class, not implementation specific. For example VHACD is the convex decomposition algorithm, but the function is called `decompose`. And if someone vibes the perfect header-only convex decomposition algorithm, we would add an `engine: None | DecomposeAlgorithm = None` argument.
@@ -85,15 +85,15 @@ This does not and will never load meshes, parse XML, or support anything that is
 - API: never expand without permission.
 - Geometry: these algorithms were mostly written by domain experts and have been run by millions of users. The standard of proof is extremely high for any change. Start with multiple failing tests, an absolutely solid root causea THIN fix that doesn't require new subsystems, and is justified from multiple angles and multiple cases, including performance data. And present the case coherently to a user: do not make changes to this without an explicit go-ahead, with success criteria established before implementing including failing tests; and a plan on how the change is going to be 50 lines or less to hot geometry code. 
 
-Basically: `nanobind` and the underlying geometry header should be doing 99% of the work. The main exceptions to this are three vibed out pieces of core logic:
+Basically: `nanobind` and the underlying geometry header should be doing 99% of the work. The main exceptions to this are these vibed out pieces of core logic:
 - `parallel.hpp`
-  - Because I couldn't find a thin "multiplatform rayon but for C++"
+  - This provides a multicore `map`. In rust `rayon::par_iter.map` is incredible. But this project is a C/C++ binding, and I couldn't find a thin "multiplatform rayon but for C++". This is the piece that is both most suspicious from a system design perspective, but also the most important for performance. Claude produced a TLA+ spec for this, and is checking against it. But if you were going to deep review one thing it should be the header, the TLA+ specification, and the hardness of the asserts in the GenMC and scheduler tests. 
 - `svgpath.hpp`
-  - Because it's a very easy pass through a string that is very slow in Python
+  - This is very very easy to do in a C++ loop, and extremely slow in Python. The SVG path string is the lowest-common-denominator of 2D curve representation, and this parses it to and from a structured numpy array.
 - `contour.hpp`
-  - because marching cubes is a simple algorithm, `scikit-image` is great but it's quite heavy and was used ONLY for marching cubes, and this way we can support sparse+run+dense with one function signature, reducing call complexity.
-- the tinybvh vulkan path
-  - because tinybvh is still doing most of the work, and because GPU rays are SO much faster. On my machine the check is 150x faster, but readback/overhead brings it to only a 2x win. But the future is GPU and this can probably be improved on the same API. A lot of the slowness is because I insisted on f64 rays because I have years and years of "the ray check was wrong" which are pretty much all float32 not having enough precision. It does an f32 check, f64 refine which is only a 20% performance hit over pure f32. 
+  - Marching cubes is a simple algorithm, `scikit-image` is great but it's quite heavy and was used in trimesh ONLY for marching cubes. Also this way we can support sparse, run-length, and dense voxels with one function signature, reducing call complexity from Python. Basically voxels in Python can be pure `numpy`: `(n, 3) int` for sparse voxels, `(n, 4) int` for sparse voxel runs (the last column is the run length along the Z column), and full `(n, m, p) bool` dense voxel matrices. 
+- the tinybvh vulkan ray query
+  - This adds a `use_gpu: bool` argument to rays. I did it because `tinybvh` is still doing most of the work, and because GPU rays are so much faster. On my machine the check is 150x faster, but readback/overhead brings it to only a 2x win. But the future is GPU and this can probably be improved, with the same API, and gives a nice Vulkan-only foundation. A lot of the slowness is because I insisted on float64 rays. Trimesh has had years and years of "the ray check was wrong" issues, which are pretty much all "float32 has a ULP of around 1e-7 for normalized coordinates which really isn't that small in the scheme of things." This pipeline does an f32 pass with an f64 refine which is only a 20% performance hit over pure f32. And the tests insist on bit-identical results to the CPU path.
 
 
 ## // Claude Slop
@@ -180,11 +180,11 @@ constructor takes the same names, and a `RayScene` pickled with `use_gpu=True`
 answers on the CPU, with its one warning, where no device is found.
 
 `RayScene`, `Boxes` and `CollisionScene` queries spread big batches, and
-`decompose` its hull splits and merge costs, across the cores they may run on
-(their affinity, within a cgroup's CPU quota), on one pool of workers that exit
-after 10 s idle (so a `fork` within that time gets CPython's multi-threaded
-warning); `parametrize` uses xatlas's own threads, and the rest run on the
-calling thread.
+`decompose` its hull splits and merge costs, and `parametrize` its meshes, chart
+groups and charts, across the cores they may run on (their affinity, within a
+cgroup's CPU quota), on one pool of workers that exit after 10 s idle (so a
+`fork` within that time gets CPython's multi-threaded warning); the rest run on
+the calling thread. No vendored library starts a thread of its own.
 
 `RayScene(meshes, use_gpu=True)` traces on a Vulkan device instead: the first
 GPU that computes in double precision, found through the system's Vulkan loader
@@ -347,8 +347,14 @@ headers, and 2.3 MB as an sdist.
 
 `uv run scripts fetch` re-derives all of it from the pinned commits: `git status
 vendor/` then shows nothing, so anyone can check that `vendor/` is what it says.
-Our changes are unified diffs in `vendor/patches/`, each tagged `fix` or `perf`
-with its reason, listed by sha256 and applied strictly, hunk for hunk.
+Our changes are edited where they live, in `vendor/`, each between
+`//// TRIMKIT PATCH: fix.name` (or `perf.name`) and `//// TRIMKIT END PATCH`.
+`uv run scripts patch` writes each one's unified diff to `vendor/patches/` (its
+reason, above the diff, kept as written), lists it by sha256, and fetches the
+upstream back from those patches to check `vendor/` comes back byte for byte;
+running it again changes nothing, and `fetch` puts every block back. A change
+outside a block is refused, naming its line, and `check` fails on a block edited
+since its patch was written.
 
 ## Supply chain
 

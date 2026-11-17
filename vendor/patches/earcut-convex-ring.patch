@@ -25,48 +25,55 @@ time bound), fuzz/earcut.cpp.
 
 --- a/include/mapbox/earcut.hpp
 +++ b/include/mapbox/earcut.hpp
-@@ -107,6 +107,7 @@
+@@ -107,6 +107,9 @@
      void earcutLinked(Node* ear);
      bool isEar(Node* ear);
      bool isEarHashed(Node* ear);
++    //// TRIMKIT PATCH: perf.convex-ring
 +    bool isConvex(Node* start);
++    //// TRIMKIT END PATCH
      Node* cureLocalIntersections(Node* start);
      void splitEarcut(Node* start);
      template <typename Polygon>
-@@ -380,6 +381,10 @@
+@@ -380,6 +383,12 @@
      Node* prev;
      Node* next;
      bool cured = false;
++    //// TRIMKIT PATCH: perf.convex-ring
 +    // trimkit (vendor/patches/earcut-convex-ring.patch, a port of earcut.js PR #212):
 +    // a strictly convex ring has no vertex that could block an ear, so skip the point checks until a candidate fails;
 +    // without this, a big convex ring is cut as one fan of long triangles and each hashed check scans O(n) points
 +    bool convex = hashing ? isConvex(ear) : false;
++    //// TRIMKIT END PATCH
  
      // iterate through ears, slicing them one by one
      while (ear->prev != ear->next) {
-@@ -387,7 +392,7 @@
+@@ -387,7 +396,9 @@
          next = ear->next;
  
          // reflex check is hoisted here to avoid constructing the Triangle for reflex corners
 -        if (area(prev, ear, next) < 0 && (hashing ? isEarHashed(ear) : isEar(ear))) {
++        //// TRIMKIT PATCH: perf.convex-ring
 +        if (area(prev, ear, next) < 0 && (convex || (hashing ? isEarHashed(ear) : isEar(ear)))) {
++        //// TRIMKIT END PATCH
              // cut off the triangle
              indices.emplace_back(prev->i);
              indices.emplace_back(ear->i);
-@@ -401,6 +406,7 @@
+@@ -401,6 +412,9 @@
              continue;
          }
  
++        //// TRIMKIT PATCH: perf.convex-ring
 +        convex = false;
++        //// TRIMKIT END PATCH
          ear = next;
  
          // if we looped through the whole remaining polygon and can't find any more ears
-@@ -427,6 +433,17 @@
-             break;
-         }
+@@ -429,6 +443,19 @@
      }
-+}
-+
+ }
+ 
++//// TRIMKIT PATCH: perf.convex-ring
 +// check whether every vertex of a ring is strictly convex (trimkit: earcut.js PR #212)
 +template <typename N>
 +bool Earcut<N>::isConvex(Node* start) {
@@ -76,6 +83,9 @@ time bound), fuzz/earcut.cpp.
 +        p = p->next;
 +    } while (p != start);
 +    return true;
- }
- 
++}
++
++//// TRIMKIT END PATCH
  // check whether a polygon node forms a valid ear with adjacent nodes
+ template <typename N>
+ bool Earcut<N>::isEar(Node* ear) {

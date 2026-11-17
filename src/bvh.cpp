@@ -198,7 +198,7 @@ public:
     explicit RayMesh(trimkit::Mesh<std::uint64_t> mesh) : faces_(std::move(mesh.faces)) {
         const Points& vertices = mesh.vertices;
         // copying reads every value, so it runs without the GIL too
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         const double* v = vertices.data();
         vertices_.resize(vertices.shape(0));
         for (std::size_t i = 0; i < vertices.shape(0); i++) {
@@ -463,7 +463,7 @@ private:
         if (top->instances.size() == 1 && all_identity) {
             top->direct = meshes_[static_cast<std::size_t>(top->instances[0].blasIdx)].get();
         } else if (!top->instances.empty()) {
-            const nb::gil_scoped_release release;
+            const trimkit::GilReleased release;
             // tinybvh takes the meshes' array non-const, though it only reads it
             tinybvh::BVH_Double** meshes =
                 const_cast<tinybvh::BVH_Double**>(blas_.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
@@ -472,7 +472,7 @@ private:
             pad(*top->tlas, top->extent);
         }
         if (device_meshes_ && top->tlas) {
-            const nb::gil_scoped_release release;
+            const trimkit::GilReleased release;
             upload_top(top.get());
         }
         return top;
@@ -490,7 +490,7 @@ private:
         top->which.resize(instances.count);
         top->boxes.resize(6 * instances.count);
         // read and checked: the rest touches no Python
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         for (std::size_t i = 0; i < instances.count; i++) {
             double* box = &top->boxes[6 * i];
             const std::size_t mesh_index = instances.mesh(i);
@@ -639,7 +639,7 @@ private:
         }
         // one identity instance traces its mesh directly, as on the CPU
         const std::uint32_t mesh = level.direct != nullptr ? static_cast<std::uint32_t>(level.instances[0].blasIdx) : 0;
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         return trimkit::vulkan::trace(*device_meshes_, level.device_top.get(), mesh, level.extent, occlusion, most,
                                       origins, directions, count, consume, reason);
     }
@@ -738,7 +738,7 @@ private:
             trees[m].vertices = meshes_[m]->vertices().data();
             trees[m].vertex_count = meshes_[m]->vertices().size();
         }
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         device_meshes_ = trimkit::vulkan::put_scene(device, trees.data(), trees.size(), reason);
         return device_meshes_ != nullptr;
     }
@@ -793,13 +793,13 @@ public:
             trimkit::value_error("boxes must be (n, 2, 2) or (n, 2, 3), not (n, 2, " + std::to_string(dimension_) +
                                  ")");
         }
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         build(corners_of(boxes.data(), boxes.shape(0), "boxes"));
     }
 
     // 3D boxes as (minimum, maximum) corner pairs, already checked
     explicit Boxes(std::vector<Vec>&& corners) : dimension_(3) {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         build(std::move(corners));
     }
 
@@ -827,7 +827,7 @@ public:
         const std::size_t n = size();
         std::vector<double> boxes(2 * dimension_ * n);
         {
-            const nb::gil_scoped_release release;
+            const trimkit::GilReleased release;
             for (std::size_t corner = 0; corner < 2 * n; corner++) {
                 double* out = &boxes[dimension_ * corner];
                 out[0] = boxes_[corner][0];

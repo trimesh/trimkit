@@ -13,6 +13,7 @@ import copy
 import functools
 import gc
 import importlib.metadata
+import json
 import os
 import pathlib
 import pickle
@@ -175,7 +176,9 @@ _SLOW_CALLS = {
     "decompose": (_big_mesh, lambda mesh: trimkit.decompose(*mesh, resolution=50_000)),
     "parametrize": (_big_mesh, lambda mesh: trimkit.parametrize(*mesh)),
     "simplify": (lambda: sphere(400, 800), lambda mesh: trimkit.simplify(*mesh, 1000)),
-    "contour": (lambda: ball_runs(700), trimkit.contour),
+    # a ball of radius 700 peaked at 1.15 GB (704 MB of it the surface), which
+    # late in the suite was more than the 2 GB limit had left: a MemoryError
+    "contour": (lambda: ball_runs(550), trimkit.contour),
     "exchange.draco_encode": (_big_draco, lambda i: trimkit.exchange.draco_encode(*i)),
     "exchange.draco_decode": (
         _big_buffer,
@@ -421,14 +424,12 @@ def test_values_must_be_bounded(name):
                     function(**{**arguments, argument: _replace(value, path, broken)})
 
 
-@pytest.mark.parametrize("name", API)
-def test_calls_hold_no_memory(name):
-    # What a call allocates it frees, whether it answers or refuses: many
-    # rounds leave the heap where it was. Counted by glibc, so every
-    # allocation is in it, ours, numpy's and the vendored libraries' alike
-    runs_here(name)
-    if heap_in_use() is None:
-        pytest.skip("the heap is counted by glibc's mallinfo2")
+def bytes_held(name: str) -> int:
+    """
+    What 50 more rounds of public call `name` leave allocated, answering
+    and refusing, after 50 to warm it: counted by glibc, so every
+    allocation is in it, ours, numpy's and the vendored libraries' alike
+    """
     function, arguments = _array_arguments()[name]
     calls = [small_calls()[name]]
     # and refused: its first float input NaN, as test_values_must_be_bounded
@@ -451,9 +452,6 @@ def test_calls_hold_no_memory(name):
             with contextlib.suppress(ValueError):
                 call()
 
-    # warmed by as many rounds as are measured: a cache each pool worker
-    # fills once (xatlas keeps one) is full before the count starts, while
-    # what each call leaks keeps growing
     for _ in range(50):
         every_call()
     gc.collect()
@@ -461,7 +459,49 @@ def test_calls_hold_no_memory(name):
     for _ in range(50):
         every_call()
     gc.collect()
-    grown = heap_in_use() - before
+    return heap_in_use() - before
+
+
+@functools.cache
+def _held_by_every_call() -> dict[str, int]:
+    # every call measured in one fresh process with glibc's per-thread cache
+    # off: a pool worker lives on between calls, and the chunks its cache
+    # keeps count as in use, though they're a few per size and per thread,
+    # filling once, which no call holds
+    script = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(pathlib.Path(__file__).parent)!r})\n"
+        "import test_invariants as t\n"
+        "print(json.dumps({name: t.bytes_held(name) for name in sys.argv[1:]}))\n"
+    )
+    environment = {**os.environ, "GLIBC_TUNABLES": "glibc.malloc.tcache_count=0"}
+
+    def runs(name: str) -> bool:
+        try:
+            runs_here(name)
+        except pytest.skip.Exception:
+            return False
+        return True
+
+    done = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", script, *filter(runs, API)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=True,
+        timeout=600,
+    )
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+@pytest.mark.parametrize("name", API)
+def test_calls_hold_no_memory(name):
+    # What a call allocates it frees, whether it answers or refuses: many
+    # rounds leave the heap where it was
+    runs_here(name)
+    if heap_in_use() is None:
+        pytest.skip("the heap is counted by glibc's mallinfo2")
+    grown = _held_by_every_call()[name]
     assert grown < 16 * 1024, f"{grown} bytes held after 50 more rounds"
 
 
@@ -783,8 +823,9 @@ def test_ctrl_c_stops_long_calls(name):
     # until a call takes 1 s, so this holds on fast and slow machines alike:
     # stopping takes the 50 ms timer plus up to one 50 ms poll period, and at
     # 0.5 s a loaded machine missed the half-call bound by 5 ms (2026-11-01).
-    # (xatlas polls only from its worker threads, which can't check signals:
-    # it stops at the end of the call, a known gap.)
+    # (xatlas reports progress only when a stage's percentage changes, from
+    # whichever thread runs that task, and only the calling thread's reports
+    # can see Ctrl-C: measured, it stops at 0.48 s of a 0.53 s call, a known gap.)
     scale = 1
     while True:
         call = slow_call(name) if name == "decompose" else _long_query(name, scale)
@@ -853,6 +894,8 @@ outputs = [
     *collision_fields(solids.distances(matrices, index)),
     *collision_fields(solids.collides(matrices, index)),
     *collision_fields(solids.collides(matrices, index, return_distance=True, maximum_contacts=4)),
+    # xatlas's tasks on however many threads, each with its own scratch
+    *trimkit.parametrize(*sphere(30, 60)),
 ]
 print(hashlib.sha256(b"".join(np.ascontiguousarray(a).tobytes() for a in outputs)).hexdigest())
 """

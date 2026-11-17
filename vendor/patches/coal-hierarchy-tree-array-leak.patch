@@ -11,45 +11,55 @@ grew without bound (tests/test_invariants.py::test_calls_hold_no_memory):
 Not yet reported upstream; the same lines are in coal devel as pinned.
 --- a/include/coal/broadphase/detail/hierarchy_tree_array-inl.h
 +++ b/include/coal/broadphase/detail/hierarchy_tree_array-inl.h
-@@ -100,6 +100,7 @@
+@@ -100,6 +100,9 @@
  
    n_leaves = (size_t)n_leaves_;
    root_node = NULL_NODE;
++  //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
 +  delete[] nodes;  // the 16 nodes clear() just allocated
++  //// TRIMKIT END PATCH
    nodes = new Node[n_leaves * 2];
    std::copy(leaves, leaves + n_leaves, nodes);
    freelist = n_leaves;
-@@ -125,6 +126,7 @@
+@@ -125,6 +128,9 @@
  
    n_leaves = (size_t)n_leaves_;
    root_node = NULL_NODE;
++  //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
 +  delete[] nodes;  // the 16 nodes clear() just allocated
++  //// TRIMKIT END PATCH
    nodes = new Node[n_leaves * 2];
    std::copy(leaves, leaves + n_leaves, nodes);
    freelist = n_leaves;
-@@ -163,6 +165,7 @@
+@@ -163,6 +169,9 @@
  
    n_leaves = (size_t)n_leaves_;
    root_node = NULL_NODE;
++  //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
 +  delete[] nodes;  // the 16 nodes clear() just allocated
++  //// TRIMKIT END PATCH
    nodes = new Node[n_leaves * 2];
    std::copy(leaves, leaves + n_leaves, nodes);
    freelist = n_leaves;
-@@ -201,6 +204,7 @@
+@@ -201,6 +210,9 @@
  
    n_leaves = (size_t)n_leaves_;
    root_node = NULL_NODE;
++  //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
 +  delete[] nodes;  // the 16 nodes clear() just allocated
++  //// TRIMKIT END PATCH
    nodes = new Node[n_leaves * 2];
    std::copy(leaves, leaves + n_leaves, nodes);
    freelist = n_leaves;
 --- a/src/broadphase/broadphase_dynamic_AABB_tree_array.cpp
 +++ b/src/broadphase/broadphase_dynamic_AABB_tree_array.cpp
-@@ -514,6 +514,7 @@
+@@ -514,6 +514,9 @@
      int n_leaves = (int)other_objs.size();
  
      dtree.init(leaves, n_leaves, tree_init_level);
++    //// TRIMKIT PATCH: fix.hierarchy-tree-array-leak
 +    delete[] leaves;  // copied into the tree's own nodes
++    //// TRIMKIT END PATCH
  
      setup_ = true;
    }

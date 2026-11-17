@@ -393,11 +393,13 @@ public:
         bool                m_asyncACD{ true };             // Whether or not to run asynchronously, taking advantage of additional cores
         uint32_t            m_minEdgeLength{ 2 };           // Once a voxel patch has an edge length of less than 2 on all 3 sides, we don't keep recursing
         bool                m_findBestPlane{ false };       // Whether or not to attempt to split planes along the best location. Experimental feature. False by default.
+        //// TRIMKIT PATCH: perf.parallel-for
         // trimkit (vendor/patches/vhacd-parallel-for.patch): the caller's own fan-out, if it has one: runs
         // body(bodyContext, begin, end) over [0, count) on whatever threads it likes and returns once every item
         // ran, in place of the thread pool Compute would otherwise start. Null runs every fan-out in order here.
         void              (*m_parallelFor)(void* context, size_t count, void (*body)(void* bodyContext, size_t begin, size_t end), void* bodyContext){ nullptr };
         void*               m_parallelForContext{ nullptr };
+        //// TRIMKIT END PATCH
     };
 
     /**
@@ -5113,12 +5115,14 @@ void Volume::Voxelize(const std::vector<VHACD::Vertex>& points,
     m_bounds = BoundsAABB(points);
 
     VHACD::Vect3 d = m_bounds.GetSize();
+    //// TRIMKIT PATCH: fix.empty-volume
     // trimkit (vendor/patches/vhacd-empty-volume.patch): nothing left after welding
     // dropped every collapsed triangle is an empty volume, not 0 / 0 cast to size_t
     if (!(d.MaxCoeff() > 0.0))
     {
         return;
     }
+    //// TRIMKIT END PATCH
     double r;
     // Equal comparison is important here to avoid taking the last branch when d[0] == d[1] with d[2] being the smallest
     // dimension. That would lead to dimensions in i and j to be a lot bigger than expected and make the amount of
@@ -5976,6 +5980,7 @@ public:
     std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
     std::vector<VHACD::Vertex>                  m_vertices;
     std::vector<VHACD::Triangle>                m_indices;
+    //// TRIMKIT PATCH: fix.atomic-hull-counter
     // trimkit (vendor/patches/vhacd-atomic-hull-counter.patch): atomic, as concurrent
     // decompositions all increment it (a data race under TSan); its value is never read
     static std::atomic<uint32_t>                m_voxelHullCount;
@@ -5984,6 +5989,7 @@ public:
 };
 
 std::atomic<uint32_t> VoxelHull::m_voxelHullCount{0};
+    //// TRIMKIT END PATCH
 
 VoxelHull::VoxelHull(const VoxelHull& parent,
                      SplitAxis axis,
@@ -6747,6 +6753,8 @@ public:
     IVHACD::ConvexHull* m_hullA{ nullptr };
     IVHACD::ConvexHull* m_hullB{ nullptr };
     double              m_concavity{ 0 }; // concavity of the two combined
+//// TRIMKIT PATCH: perf.parallel-for
+//// TRIMKIT END PATCH
 };
 
 class HullPair
@@ -7131,6 +7139,8 @@ bool VHACDImpl::Compute(const std::vector<VHACD::Vertex>& points,
     m_canceled = false;
 
     Clean(); // release any previous results
+    //// TRIMKIT PATCH: perf.parallel-for
+    //// TRIMKIT END PATCH
     CopyInputMesh(points,
                   triangles);
     if ( !m_canceled )
@@ -7326,6 +7336,7 @@ void VHACDImpl::ReleaseConvexHull(ConvexHull* ch)
     }
 }
 
+//// TRIMKIT PATCH: perf.parallel-for
 // trimkit (vendor/patches/vhacd-parallel-for.patch): body(i) for every i in [0, count), through the caller's
 // m_parallelFor when it gave one (an exception a body throws there comes back out of it, so the fan-out
 // unwinds like a loop), else here in order
@@ -7350,6 +7361,7 @@ void RunParallel(const IVHACD::Parameters& params, size_t count, const Body& bod
             body(i);
         }
     }
+//// TRIMKIT END PATCH
 }
 
 void VHACDImpl::PerformConvexDecomposition()
@@ -7376,6 +7388,7 @@ void VHACDImpl::PerformConvexDecomposition()
             }
             // First we make a copy of the hulls we are processing
             std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
+            //// TRIMKIT PATCH: perf.parallel-for
             // Every hull we want to split, split at once through the caller's fan-out
             std::vector<VoxelHull*> splitting;
             splitting.reserve(oldList.size());
@@ -7390,6 +7403,7 @@ void VHACDImpl::PerformConvexDecomposition()
             {
                 splitting[i]->PerformPlaneSplit();
             });
+            //// TRIMKIT END PATCH
             // Now, we rebuild the pending convex hulls list by
             // adding the two children to the output list if
             // we need to recurse them further
@@ -7495,6 +7509,7 @@ void VHACDImpl::PerformConvexDecomposition()
                     else
                     {
                         tasks.push_back(std::move(ct));
+                    //// TRIMKIT PATCH: perf.parallel-for
                     }
                 }
             }
@@ -7508,6 +7523,7 @@ void VHACDImpl::PerformConvexDecomposition()
                 for (CostTask& task : tasks)
                 {
                     AddCostToPriorityQueue(task);
+                    //// TRIMKIT END PATCH
                 }
                 ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
                                100,
@@ -7595,10 +7611,12 @@ void VHACDImpl::PerformConvexDecomposition()
                             }
                         }
                         m_hulls[combinedHull->m_meshId] = combinedHull;
+                        //// TRIMKIT PATCH: perf.parallel-for
                         RunParallel(m_params, tasks.size(), [&tasks](size_t i)
                         {
                             tasks[i].m_this->PerformMergeCostTask(tasks[i]);
                         });
+                        //// TRIMKIT END PATCH
 
                         for (CostTask& task : tasks)
                         {

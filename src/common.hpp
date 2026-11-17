@@ -19,6 +19,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -139,15 +140,38 @@ class Interrupt {
 public:
     static constexpr std::chrono::milliseconds POLL_PERIOD{50};
 
-    bool interrupted() const { return interrupted_; }
+    Interrupt() = default;
+    Interrupt(const Interrupt&) = delete;
+    Interrupt& operator=(const Interrupt&) = delete;
 
-    // returns whether the computation should stop
+    bool interrupted() const { return interrupted_; }
+    // stopped, by Ctrl-C or because the interpreter is exiting
+    bool stopped() const { return interrupted_ || exiting_; }
+    // with the GIL held, once the work has stopped: Ctrl-C as the error it
+    // set, the exit as SystemExit (gil.hpp), never what the work had so far
+    void raise_if_stopped() const {
+        if (exiting_) {
+            raise_exiting();
+        }
+        if (interrupted_) {
+            throw nb::python_error();
+        }
+    }
+
+    // returns whether the computation should stop: at Ctrl-C, or once the
+    // interpreter is exiting, which stops it without taking the GIL, so the
+    // exit isn't held up by it (gil.hpp)
     bool poll() {
+        if (exiting_ || parallel::exit_gate_closed()) {
+            exiting_ = true;
+            return true;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (interrupted_ || std::this_thread::get_id() != caller_ || now - last_ < POLL_PERIOD) {
             return interrupted_;
         }
         last_ = now;
+        parallel::checked(!parallel::holding_exclusively, "no poll takes the GIL while holding Exclusively");
         const nb::gil_scoped_acquire acquire;
         interrupted_ = PyErr_CheckSignals() != 0;
         return interrupted_;
@@ -158,33 +182,8 @@ private:
     std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();
     // read from the library's worker threads, written only by the caller
     std::atomic<bool> interrupted_{false};
+    std::atomic<bool> exiting_{false};
 };
-
-// The one way onto the pool (parallel.hpp): `body(begin, end)` over
-// [0, count) in ranges, on this thread and the pool's workers, from a thread
-// that holds no GIL. `eager` wakes every worker before the first item, for a
-// fan-out that is coarse by construction; `interrupt`, when there is one,
-// is polled by this thread between its ranges and stops the job. The first
-// exception a range threw comes back, for the caller to rethrow where it may
-template <typename Body>
-std::exception_ptr on_pool(std::size_t count, const Body& body, bool eager, Interrupt* interrupt) {
-    if (count == 0) {
-        return nullptr;
-    }
-    parallel::Job job;
-    job.count = count;
-    job.eager = eager;
-    job.run = [](const void* context, std::size_t begin, std::size_t end) {
-        (*static_cast<const Body*>(context))(begin, end);
-    };
-    job.body = &body;
-    if (interrupt != nullptr) {
-        job.poll = [](void* context) { return static_cast<Interrupt*>(context)->poll(); };
-        job.poll_context = interrupt;
-    }
-    parallel::run_job(job);
-    return job.error;
-}
 
 // The pool from Python: `work(parallel)` with the GIL released, where
 // `parallel(count, body)` runs `body(begin, end)` over [0, count) on the
@@ -195,21 +194,26 @@ std::exception_ptr on_pool(std::size_t count, const Body& body, bool eager, Inte
 template <typename Work>
 auto with_pool(const Work& work) {
     struct PoolInterrupted {};
+    // from Python, holding the GIL: a body calling back in would release a
+    // GIL it doesn't hold
+    parallel::checked(parallel::bodies_running == 0, "no body enters the pool from Python");
     Interrupt interrupt;
+    const parallel::Stop stop{[](void* context) { return static_cast<Interrupt*>(context)->poll(); }, &interrupt};
     const auto parallel = [&](std::size_t count, const auto& body) {
-        const std::exception_ptr error = on_pool(count, body, /*eager=*/false, &interrupt);
+        const std::exception_ptr error = parallel::for_each_range(count, body, parallel::ItemCost::Measured, 1, stop);
         if (error) {
             std::rethrow_exception(error);
         }
-        if (interrupt.interrupted()) {
+        if (interrupt.stopped()) {
             throw PoolInterrupted{};
         }
     };
     try {
-        const nb::gil_scoped_release release;
+        const GilReleased release;
         return work(parallel);
     } catch (const PoolInterrupted&) {
-        throw nb::python_error();
+        interrupt.raise_if_stopped();
+        throw;
     }
 }
 
@@ -221,8 +225,19 @@ void in_parallel(std::size_t count, const Body& body) {
     with_pool([&](const auto& parallel) { parallel(count, body); });
 }
 
-// The pool's fork handler, installed once by the module's init
-inline void install_fork_handler() { parallel::install_fork_handler(); }
+// What the module's init installs: the pool's fork handler (which resets the
+// exit gate too), and SystemExit for a call the interpreter's exit stopped
+// (parallel.hpp, StoppedAtExit), which no other exception translator knows
+inline void install_fork_handler() {
+    parallel::install_fork_handler();
+    nb::register_exception_translator([](const std::exception_ptr& error, void* /*unused*/) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const parallel::StoppedAtExit&) {
+            PyErr_SetNone(PyExc_SystemExit);
+        }
+    });
+}
 
 // A vendored library's own fan-out, Python-free: `body(context, begin, end)`
 // over [0, count), called by the library while the binding already holds the
@@ -231,8 +246,8 @@ inline void install_fork_handler() { parallel::install_fork_handler(); }
 // thread, for it to unwind through
 inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_t begin, std::size_t end),
                        void* context) {
-    const std::exception_ptr error =
-        on_pool(count, [&](std::size_t begin, std::size_t end) { body(context, begin, end); }, /*eager=*/true, nullptr);
+    const std::exception_ptr error = parallel::for_each_range(
+        count, [&](std::size_t begin, std::size_t end) { body(context, begin, end); }, parallel::ItemCost::Coarse);
     if (error) {
         std::rethrow_exception(error);
     }
@@ -240,17 +255,14 @@ inline void run_ranges(std::size_t count, void (*body)(void* context, std::size_
 
 // `body(from, to)` over [0, count) for code already past the GIL (a device's
 // rays copied into a chunk, its answers widened into the caller's columns),
-// the cores sharing it a block of items at a time: for a few bytes copied per
-// item, which one at a time is too little for the pool to measure. A copy the
-// caller finishes in a fraction of a millisecond wakes nobody. No Ctrl-C
-// poll: it never touches Python
+// in ranges of at least 4096 items: a few bytes copied an item, which one at
+// a time is too little to be worth a claim. A copy the caller finishes in a
+// fraction of a millisecond wakes nobody. No Ctrl-C poll: it never touches
+// Python
 template <typename Body>
 void in_blocks_without_gil(std::size_t count, const Body& body) {
     constexpr std::size_t BLOCK = 4096;
-    const std::exception_ptr error =
-        on_pool((count + BLOCK - 1) / BLOCK,
-                [&](std::size_t first, std::size_t last) { body(first * BLOCK, std::min(count, last * BLOCK)); },
-                /*eager=*/false, nullptr);
+    const std::exception_ptr error = parallel::for_each_range(count, body, parallel::ItemCost::Measured, BLOCK);
     if (error) {
         std::rethrow_exception(error);
     }
@@ -261,7 +273,7 @@ void in_blocks_without_gil(std::size_t count, const Body& body) {
 template <typename T>
 std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limit) {
     std::atomic<std::size_t> beyond{0};
-    const nb::gil_scoped_release release;
+    const GilReleased release;
     in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
         const std::size_t found = count_beyond<T>(values + from, to - from, limit, nullptr);
         if (found != 0) {
@@ -271,28 +283,13 @@ std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limi
     return beyond.load(std::memory_order_relaxed);
 }
 
-// One holder at a time of `word`, for what takes exactly one (a device's
-// queue, src/vulkan/scene.hpp, which states the rule its users keep): a
-// waiter sleeps on the scheduler's parking rather than spinning. A holder
-// takes no other lock while it holds this, the GIL included, so there is
-// nothing to deadlock on; never nested
-class Exclusively {
-public:
-    explicit Exclusively(std::atomic<std::uint32_t>& word) : word_(word) {
-        while (word_.exchange(1, std::memory_order_acquire) != 0) {
-            parallel::park(word_, 1, 1000);
-        }
-    }
-    ~Exclusively() {
-        word_.store(0, std::memory_order_release);
-        parallel::unpark(word_);
-    }
-    Exclusively(const Exclusively&) = delete;
-    Exclusively& operator=(const Exclusively&) = delete;
+// the one lock there is (parallel.hpp)
+using parallel::Exclusively;
 
-private:
-    std::atomic<std::uint32_t>& word_;
-};
+// For a library that keeps scratch per thread (xatlas): every thread running
+// the items of any one call on the pool has its own index below thread_slots()
+inline std::uint32_t thread_slots() { return parallel::thread_slots(); }
+inline std::uint32_t thread_index() { return parallel::thread_index(); }
 
 // For a query that finds its rows: `body(begin, end, out)` appends the rows
 // of items [begin, end) in order to `out`, and they come back in item order
@@ -314,25 +311,20 @@ public:
     Gathered(const Gathered&) = delete;
     Gathered& operator=(const Gathered&) = delete;
     ~Gathered() {
-        for (Chunk* chunk = head_.load(std::memory_order_acquire); chunk != nullptr;) {
+        for (Chunk* chunk = list_.take_all(); chunk != nullptr;) {
             Chunk* next = chunk->next;
             delete chunk;  // NOLINT(cppcoreguidelines-owning-memory): the list owns its chunks
             chunk = next;
         }
     }
 
-    // pushed by every thread while the query runs, never popped until it is done
-    void push(std::unique_ptr<Chunk> chunk) {
-        chunk->next = head_.load(std::memory_order_relaxed);
-        while (!head_.compare_exchange_weak(chunk->next, chunk.get(), std::memory_order_release,
-                                            std::memory_order_relaxed)) {
-        }
-        static_cast<void>(chunk.release());
-    }
+    // pushed by every thread while the query runs, never taken until it is
+    // done (parallel.hpp, ChunkList)
+    void push(std::unique_ptr<Chunk> chunk) { list_.push(chunk.release()); }
 
     // once the query is done: the chunks in item order, with their offsets
     void settle() {
-        for (Chunk* chunk = head_.load(std::memory_order_acquire); chunk != nullptr; chunk = chunk->next) {
+        for (Chunk* chunk = list_.peek(); chunk != nullptr; chunk = chunk->next) {
             chunks_.push_back(chunk);
         }
         std::sort(chunks_.begin(), chunks_.end(), [](const Chunk* a, const Chunk* b) { return a->begin < b->begin; });
@@ -356,7 +348,7 @@ public:
     }
 
 private:
-    std::atomic<Chunk*> head_{nullptr};
+    parallel::ChunkList<Chunk> list_;
     std::vector<Chunk*> chunks_;
     std::size_t total_ = 0;
 };

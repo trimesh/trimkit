@@ -46,6 +46,7 @@ enum { RelativeTransformationIsIdentity = 1 };
 namespace details {
 template <bool enabled>
 struct COAL_DLLAPI RelativeTransformation {
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   RelativeTransformation()
       : R(Matrix3s::Identity()),
         T(Vec3s::Zero()),
@@ -61,6 +62,7 @@ struct COAL_DLLAPI RelativeTransformation {
   Vec3s T;
   Matrix3s R_transpose;
   Vec3s inv_T;
+  //// TRIMKIT END PATCH
 };
 
 template <>
@@ -71,12 +73,14 @@ struct COAL_DLLAPI RelativeTransformation<false> {
   static const Vec3s& _T() {
     COAL_THROW_PRETTY("should never reach this point", std::logic_error);
   }
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   static const Matrix3s& _RTranspose() {
     COAL_THROW_PRETTY("should never reach this point", std::logic_error);
   }
   static const Vec3s& _InvT() {
     COAL_THROW_PRETTY("should never reach this point", std::logic_error);
   }
+  //// TRIMKIT END PATCH
 };
 }  // namespace details
 

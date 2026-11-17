@@ -624,3 +624,79 @@ def test_without_a_device_the_cpu_answers_with_a_warning():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "ok"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_while_another_thread_holds_the_device(device_required):
+    # one thread keeps a long device query running, holding the device, while
+    # the main thread forks: each child queries the same scene, directly and
+    # through instances (a top level it uploads), and gets the CPU's answer
+    # (the device is the parent's), never waiting for a lock the parent's
+    # thread held as it forked. A subprocess, so a hang is a timeout
+    device_scene([box()], device_required)
+    script = textwrap.dedent(
+        """
+        import os, select, sys, threading, time, warnings
+        sys.path.insert(0, sys.argv[1])
+        import numpy as np
+        import trimkit
+        from helpers import sphere
+        mesh = sphere(60, 120)
+        scene = trimkit.RayScene([mesh], use_gpu=True)
+        rng = np.random.default_rng(0)
+        origins = rng.normal(size=(400_000, 3)) * 3.0
+        directions = -origins
+        small = (origins[:64], directions[:64])
+        cpu = trimkit.RayScene([mesh])
+        expected = cpu.intersect(*small)
+        # two instances: the child builds and uploads a top level for them
+        placed = np.tile(np.eye(4), (2, 1, 1))
+        placed[1, :3, 3] = 0.5
+        index = np.zeros(2, dtype=np.int64)
+        expected_placed = cpu.intersect(*small, placed, index)
+        stop = threading.Event()
+        def hold():
+            while not stop.is_set():
+                scene.intersect(origins, directions)
+        thread = threading.Thread(target=hold)
+        thread.start()
+        time.sleep(0.2)
+        answers = []
+        for _ in range(10):
+            read, write = os.pipe()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                pid = os.fork()
+            if pid == 0:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    answer = scene.intersect(*small)
+                    answer_placed = scene.intersect(*small, placed, index)
+                same = all(a.tobytes() == b.tobytes() for a, b in zip(answer, expected, strict=True))
+                same = same and all(
+                    a.tobytes() == b.tobytes() for a, b in zip(answer_placed, expected_placed, strict=True)
+                )
+                os.write(write, b"1" if same else b"0")
+                os._exit(0)
+            os.close(write)
+            ready, _, _ = select.select([read], [], [], 30)
+            if not ready:
+                os.kill(pid, 9)
+            answers.append(os.read(read, 1) if ready else b"hung")
+            os.close(read)
+            os.waitpid(pid, 0)
+            time.sleep(0.01)
+        stop.set()
+        thread.join()
+        print(b"".join(answers).decode())
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, os.path.dirname(__file__)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "1" * 10, result.stdout

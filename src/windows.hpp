@@ -28,6 +28,7 @@ extern "C" {
 __declspec(dllimport) int __stdcall WaitOnAddress(volatile void* address, void* expected, TrimkitWin32Size size,
                                                   unsigned long timeout_ms);
 __declspec(dllimport) void __stdcall WakeByAddressAll(void* address);
+__declspec(dllimport) void __stdcall WakeByAddressSingle(void* address);
 __declspec(dllimport) int __stdcall CloseHandle(void* handle);
 // the memory still available (src/trimkit.cpp)
 __declspec(dllimport) int __stdcall GlobalMemoryStatusEx(TrimkitWin32MemoryStatus* status);

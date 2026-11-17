@@ -1,0 +1,200 @@
+kind: perf
+upstream: not for xatlas (whose last code change was in 2022): the hooks are
+trimkit's, so xatlas's task groups run on the extension's one pool.
+
+xatlas started a thread per core for every atlas (`TaskScheduler`'s workers,
+a mutex and condition variable each) and ran its task groups on them: the
+meshes, each mesh's chart groups, and each group's charts, nested. The build
+defines XA_MULTITHREADED=0, so none of that is compiled, and this changes the
+serial scheduler left in its place so `wait` hands a group's tasks to
+`TrimkitRunTasks` (xatlas.h), which src/xatlas.cpp points at the pool
+(src/parallel.hpp through common.hpp's `run_ranges`). xatlas keeps scratch per
+thread (`ThreadLocal`, indexed by `currentThreadIndex`), so each thread
+running tasks has the pool's index for it, below `TrimkitThreadSlots()` (the
+CPUs the machine has online), which `ThreadLocal` is sized by: no two threads
+running one call's tasks share one. Tasks create groups on any thread, so the
+serial scheduler's growing table becomes a fixed array of slots claimed by
+compare-and-swap, with no lock: one atlas has one caller, at most
+`TrimkitThreadSlots()` threads run its tasks, each inside at most three
+nested groups, so 4 a thread and 4 more can't run out (and if they did it
+would be a broken promise, which stops the process with that said, never a
+wrong answer).
+
+Why: one pool for the whole extension, whose workers exit when idle, and no
+threads started per call; measured 8-21% faster for `parametrize`, the same
+answers to the byte. It also retires xatlas-lost-wakeup.patch, a fix to the
+worker loop that is no longer compiled. An exception a task throws now comes
+back to the calling thread rather than ending the process; xatlas allocates
+through libc, so in practice that is the pool's own (a fork during the call,
+or the interpreter's exit).
+
+Covered by: tests/test_xatlas.py (the answers), tests/test_threads.py
+(parametrize on 8 threads gives the same bytes as one, a forked child and an
+exiting interpreter), and fuzz/xatlas.cpp, which runs xatlas on the real pool
+under AddressSanitizer.
+
+--- a/source/xatlas/xatlas.cpp
++++ b/source/xatlas/xatlas.cpp
+@@ -3304,15 +3304,33 @@
+ class TaskScheduler
+ {
+ public:
++	//// TRIMKIT PATCH: perf.one-pool
++	// Groups are created by tasks on any thread, so the table of them is a fixed array of slots claimed
++	// by compare-and-swap: no lock and no growth. Each scheduler is one atlas's, with one caller; at most
++	// TrimkitThreadSlots() threads run its tasks at once, each inside at most 3 nested groups (meshes,
++	// chart groups, charts), so 4 a thread and 4 more can't run out
++	TaskScheduler() : m_capacity(4 * TrimkitThreadSlots() + 4)
++	{
++		m_groups = XA_ALLOC_ARRAY(MemTag::Default, std::atomic<TaskGroup *>, m_capacity);
++		for (uint32_t i = 0; i < m_capacity; i++)
++			new (&m_groups[i]) std::atomic<TaskGroup *>(nullptr);
++	}
++
++	//// TRIMKIT END PATCH
+ 	~TaskScheduler()
+ 	{
+-		for (uint32_t i = 0; i < m_groups.size(); i++)
+-			destroyGroup({ i });
++		//// TRIMKIT PATCH: perf.one-pool
++		for (uint32_t i = 0; i < m_capacity; i++)
++			destroyGroup({ i });
++		XA_FREE(m_groups);
++		//// TRIMKIT END PATCH
+ 	}
+ 
+ 	uint32_t threadCount() const
+ 	{
+-		return 1;
++		//// TRIMKIT PATCH: perf.one-pool
++		return TrimkitThreadSlots();
++		//// TRIMKIT END PATCH
+ 	}
+ 
+ 	TaskGroupHandle createTaskGroup(void *userData = nullptr, uint32_t reserveSize = 0)
+@@ -3320,15 +3338,24 @@
+ 		TaskGroup *group = XA_NEW(MemTag::Default, TaskGroup);
+ 		group->queue.reserve(reserveSize);
+ 		group->userData = userData;
+-		m_groups.push_back(group);
+-		TaskGroupHandle handle;
+-		handle.value = m_groups.size() - 1;
++		//// TRIMKIT PATCH: perf.one-pool
++		TaskGroupHandle handle;
++		for (handle.value = 0; handle.value < m_capacity; handle.value++) {
++			TaskGroup *expected = nullptr;
++			if (m_groups[handle.value].compare_exchange_strong(expected, group, std::memory_order_acquire))
++				return handle;
++		}
++		XA_PRINT("xatlas: more task groups at once than any atlas makes\n");
++		abort();
++		//// TRIMKIT END PATCH
+ 		return handle;
+ 	}
+ 
+ 	void run(TaskGroupHandle handle, Task task)
+ 	{
+-		m_groups[handle.value]->queue.push_back(task);
++		//// TRIMKIT PATCH: perf.one-pool
++		m_groups[handle.value].load(std::memory_order_relaxed)->queue.push_back(task);
++		//// TRIMKIT END PATCH
+ 	}
+ 
+ 	void wait(TaskGroupHandle *handle)
+@@ -3337,24 +3364,37 @@
+ 			XA_DEBUG_ASSERT(false);
+ 			return;
+ 		}
+-		TaskGroup *group = m_groups[handle->value];
+-		for (uint32_t i = 0; i < group->queue.size(); i++)
+-			group->queue[i].func(group->userData, group->queue[i].userData);
++		//// TRIMKIT PATCH: perf.one-pool
++		// every task on the extension's one pool (TrimkitRunTasks, xatlas.h)
++		TaskGroup *group = m_groups[handle->value].load(std::memory_order_relaxed);
++		TrimkitRunTasks(group->queue.size(), [](void *context, uint32_t begin, uint32_t end) {
++			const TaskGroup &tasks = *static_cast<const TaskGroup *>(context);
++			for (uint32_t i = begin; i < end; i++)
++				tasks.queue[i].func(tasks.userData, tasks.queue[i].userData);
++		}, group);
++		//// TRIMKIT END PATCH
+ 		group->queue.clear();
+ 		destroyGroup(*handle);
+ 		handle->value = UINT32_MAX;
+ 	}
+ 
+-	static uint32_t currentThreadIndex() { return 0; }
++	//// TRIMKIT PATCH: perf.one-pool
++	static uint32_t currentThreadIndex() { return TrimkitThreadIndex(); }
++	//// TRIMKIT END PATCH
+ 
+ private:
+ 	void destroyGroup(TaskGroupHandle handle)
+ 	{
+-		TaskGroup *group = m_groups[handle.value];
++		//// TRIMKIT PATCH: perf.one-pool
++		// only the group's own thread frees it; the release hands the slot on
++		TaskGroup *group = m_groups[handle.value].load(std::memory_order_relaxed);
++		//// TRIMKIT END PATCH
+ 		if (group) {
+ 			group->~TaskGroup();
+ 			XA_FREE(group);
+-			m_groups[handle.value] = nullptr;
++			//// TRIMKIT PATCH: perf.one-pool
++			m_groups[handle.value].store(nullptr, std::memory_order_release);
++			//// TRIMKIT END PATCH
+ 		}
+ 	}
+ 
+@@ -3364,7 +3404,10 @@
+ 		void *userData;
+ 	};
+ 
+-	Array<TaskGroup *> m_groups;
++	//// TRIMKIT PATCH: perf.one-pool
++	uint32_t m_capacity;
++	std::atomic<TaskGroup *> *m_groups;
++	//// TRIMKIT END PATCH
+ };
+ #endif
+ 
+@@ -3426,7 +3469,9 @@
+ #if XA_MULTITHREADED
+ 		const uint32_t n = std::thread::hardware_concurrency();
+ #else
+-		const uint32_t n = 1;
++		//// TRIMKIT PATCH: perf.one-pool
++		const uint32_t n = TrimkitThreadSlots();
++		//// TRIMKIT END PATCH
+ #endif
+ 		m_array = XA_ALLOC_ARRAY(MemTag::Default, T, n);
+ 		for (uint32_t i = 0; i < n; i++)
+@@ -3438,7 +3483,9 @@
+ #if XA_MULTITHREADED
+ 		const uint32_t n = std::thread::hardware_concurrency();
+ #else
+-		const uint32_t n = 1;
++		//// TRIMKIT PATCH: perf.one-pool
++		const uint32_t n = TrimkitThreadSlots();
++		//// TRIMKIT END PATCH
+ #endif
+ 		for (uint32_t i = 0; i < n; i++)
+ 			m_array[i].~T();
+--- a/source/xatlas/xatlas.h
++++ b/source/xatlas/xatlas.h
+@@ -264,6 +264,16 @@
+ const char *StringForEnum(AddMeshError error);
+ const char *StringForEnum(ProgressCategory category);
+ 
++//// TRIMKIT PATCH: perf.one-pool
++// trimkit (vendor/patches/xatlas-one-pool.patch): how xatlas, built without threads of its own
++// (XA_MULTITHREADED 0), runs its task groups, defined by whatever links it (src/xatlas.cpp,
++// fuzz/xatlas.cpp): every task in [0, count) by run(context, begin, end), on any threads, returning once
++// all have run (or rethrowing an exception one threw), each thread running tasks with its own index below
++// TrimkitThreadSlots()
++uint32_t TrimkitThreadSlots();
++uint32_t TrimkitThreadIndex();
++void TrimkitRunTasks(uint32_t count, void (*run)(void *context, uint32_t begin, uint32_t end), void *context);
++//// TRIMKIT END PATCH
+ } // namespace xatlas
+ 
+ #endif // XATLAS_H

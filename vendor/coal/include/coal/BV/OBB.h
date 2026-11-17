@@ -144,6 +144,7 @@ COAL_DLLAPI bool overlap(const Matrix3s& R0, const Vec3s& T0, const OBB& b1,
                          const OBB& b2, const CollisionRequest& request,
                          Scalar& sqrDistLowerBound);
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 /// @brief Check collision between two obbs, reusing precomputed
 /// R0.transpose() and -R0.transpose() * T0 for the configuration of b1.
 COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
@@ -152,6 +153,7 @@ COAL_DLLAPI bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                               const CollisionRequest& request,
                                               Scalar& sqrDistLowerBound);
 
+//// TRIMKIT END PATCH
 /// Check collision between two boxes
 /// @param B, T orientation and position of first box,
 /// @param a half dimensions of first box,

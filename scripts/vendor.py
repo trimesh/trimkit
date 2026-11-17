@@ -6,6 +6,21 @@ touches the network and this keeps building when the upstreams are gone:
                                             `git status vendor/` then shows nothing
   uv run scripts fetch --latest [name ...]  the same, moving each pin to its ref's HEAD
   uv run scripts outdated                   list refs that moved since
+  uv run scripts patch [name ...]           write vendor/patches/ from what vendor/ holds
+
+Our changes to an upstream are edited where they live, in vendor/NAME/, each
+between two marker lines, `fix` (a bug or UB upstream) or `perf`, then a name:
+
+  //// TRIMKIT PATCH: fix.lost-wakeup
+  ...what we changed it to...
+  //// TRIMKIT END PATCH
+
+`patch` writes each name's unified diff, vendor/patches/NAME-lost-wakeup.patch,
+as the difference between the upstream at its pin and vendor/, keeping the
+text above the diff (`kind:` and why) as it was, then fetches the upstream
+again from those patches and checks that vendor/ came back byte for byte.
+Running it again changes nothing, and `fetch` puts every block back. Anything
+changed outside a block is refused, naming where.
 
 One rule picks the files. Every upstream downloads whole, its patches apply,
 and then only these stay under vendor/NAME/, at the upstream's own paths:
@@ -28,6 +43,7 @@ import sys
 import tarfile
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,7 +53,7 @@ VENDOR = ROOT / "vendor"
 # our changes to upstream code, as unified diffs: `vendor/patches/NAME.patch`,
 # applied in the order `[upstream.X.patches]` lists them, each with its sha256
 PATCHES = VENDOR / "patches"
-HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def _get(url: str, headers: dict | None = None) -> bytes:
@@ -64,6 +80,33 @@ def _tarball_url(pin: Upstream, commit: str) -> str:
     if pin.host == "gitlab.com":
         return f"https://gitlab.com/{pin.repo}/-/archive/{commit}/{pin.repo.split('/')[-1]}-{commit}.tar.gz"
     return f"https://codeload.github.com/{pin.repo}/tar.gz/{commit}"
+
+
+# an upstream at a commit is the same bytes forever: `patch` and `fetch` read
+# each one's archive from here after the first download
+TARBALLS = ROOT / "build" / "upstreams"
+
+
+def _tarball(pin: Upstream, commit: str) -> bytes:
+    cached = TARBALLS / f"{pin.name}-{commit}.tar.gz"
+    if cached.is_file():
+        return cached.read_bytes()
+    data = _get(_tarball_url(pin, commit))
+    TARBALLS.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(data)
+    return data
+
+
+def _upstream_files(pin: Upstream, commit: str) -> dict[str, list[bytes]]:
+    # every file of the upstream at `commit`, by its path in the repository
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(_tarball(pin, commit))) as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                files[member.name.split("/", 1)[-1]] = (
+                    tar.extractfile(member).read().splitlines(keepends=True)
+                )
+    return files
 
 
 # -- closure: vendor only what the build reaches ------------------------------
@@ -218,12 +261,23 @@ def _record(table: str, key: str, value: str) -> None:
     TOML.write_text(section.sub(lambda m: m[1] + value + m[2], text, count=1))
 
 
-def apply_patch(directory: Path, patch: bytes, name: str) -> None:
+@dataclass(frozen=True)
+class PatchHunk:
+    # one hunk of a unified diff: where it starts on each side (1-based, or the
+    # line it follows when that side is empty) and that side's lines
+    path: str
+    old_start: int
+    old: tuple
+    new_start: int
+    new: tuple
+
+
+def parse_patch(patch: bytes, name: str) -> tuple[bytes, list[PatchHunk]]:
     """
-    Apply a unified diff to files under `directory`, strictly: its header
-    starts `kind: fix` or `kind: perf` (then why), and every hunk must match
-    exactly where it says, with no fuzz, or nothing is guessed and it fails.
-    Bytes throughout, so line endings are never altered.
+    A patch file's header, the text above its first `--- a/` (starting
+    `kind: fix` or `kind: perf`, then why), and its hunks, strictly: every
+    hunk exactly as long as its header counts. Bytes throughout, so line
+    endings are never altered.
     """
     lines = patch.splitlines(keepends=True)
     if not lines or lines[0].strip() not in (b"kind: fix", b"kind: perf"):
@@ -231,23 +285,19 @@ def apply_patch(directory: Path, patch: bytes, name: str) -> None:
     index = next((i for i, line in enumerate(lines) if line.startswith(b"--- a/")), len(lines))
     if index == len(lines):
         raise ValueError(f"{name}: changes no file")
+    header, hunks = b"".join(lines[:index]), []
     while index < len(lines):
         if not (lines[index].startswith(b"--- a/") and lines[index + 1].startswith(b"+++ b/")):
             raise ValueError(f"{name}: malformed at line {index + 1}")
-        path = directory / lines[index + 1][6:].strip().decode()
+        path = lines[index + 1][6:].strip().decode()
         index += 2
-        source = path.read_bytes().splitlines(keepends=True)
-        result, cursor = [], 0
         while index < len(lines) and lines[index].startswith(b"@@"):
             match = HUNK.match(lines[index])
             if match is None:
                 raise ValueError(f"{name}: malformed hunk at line {index + 1}")
-            count = int(match[2] or b"1")
-            new_count = int(match[3] or b"1")
-            start = int(match[1]) - (1 if count else 0)  # an empty old side names the line it follows
+            count, new_count = int(match[2] or b"1"), int(match[4] or b"1")
             index += 1
             old, new = [], []
-
             # exactly the lines the header counts: the next file's `--- a/`
             # header would otherwise read as one more removed line
             while index < len(lines):
@@ -263,11 +313,397 @@ def apply_patch(directory: Path, patch: bytes, name: str) -> None:
                 index += 1
             if len(old) != count or len(new) != new_count:
                 raise ValueError(f"{name}: hunk ending at line {index} doesn't match its header's count")
-            if start < cursor or source[start : start + len(old)] != old:
-                raise ValueError(f"{name}: no longer applies to {path.name} at line {start + 1}")
-            result += source[cursor:start] + new
-            cursor = start + len(old)
-        path.write_bytes(b"".join(result + source[cursor:]))
+            hunks.append(PatchHunk(path, int(match[1]), tuple(old), int(match[3]), tuple(new)))
+    return header, hunks
+
+
+def apply_hunks(source: list[bytes], hunks: list[PatchHunk], name: str, reverse: bool = False) -> list[bytes]:
+    # one file's hunks, each matching exactly where it says, with no fuzz, or
+    # nothing is guessed and it fails; `reverse` takes a patched file back
+    result, cursor = [], 0
+    for hunk in hunks:
+        start, old, new = (
+            (hunk.new_start, hunk.new, hunk.old) if reverse else (hunk.old_start, hunk.old, hunk.new)
+        )
+        start -= 1 if old else 0  # an empty side names the line it follows
+        if start < cursor or source[start : start + len(old)] != list(old):
+            raise ValueError(f"{name}: no longer applies to {hunk.path} at line {start + 1}")
+        result += source[cursor:start] + list(new)
+        cursor = start + len(old)
+    return result + source[cursor:]
+
+
+def apply_patch(directory: Path, patch: bytes, name: str) -> None:
+    # a patch file applied to the files under `directory` (`fetch`)
+    _, hunks = parse_patch(patch, name)
+    for path in dict.fromkeys(h.path for h in hunks):
+        target = directory / path
+        lines = target.read_bytes().splitlines(keepends=True)
+        target.write_bytes(b"".join(apply_hunks(lines, [h for h in hunks if h.path == path], name)))
+
+
+# -- patches from vendor/: the marker blocks ------------------------------------
+
+PATCH_BEGIN = re.compile(rb"^[ \t]*//// TRIMKIT PATCH: (fix|perf)\.([a-z0-9][a-z0-9-]*)[ \t]*\r?\n$")
+PATCH_END = re.compile(rb"^[ \t]*//// TRIMKIT END PATCH[ \t]*\r?\n$")
+PATCH_ANY = re.compile(rb"//// TRIMKIT")
+CONTEXT = 3  # lines of context around each change, as `diff -u`
+PLACEHOLDER = b"why: say why, and what covers it, then run `uv run scripts patch` again"
+
+
+@dataclass(frozen=True)
+class PatchBlock:
+    # one marked block of a vendored file: the vendored lines [first, last]
+    # (both markers), the kind and name its first marker gives, and the
+    # upstream lines [old_first, old_end) it replaced
+    kind: str
+    name: str
+    first: int
+    last: int
+    old_first: int = 0
+    old_end: int = 0
+
+
+def marked_blocks(path: str, lines: list[bytes]) -> list[PatchBlock]:
+    # every block of a file, in order: never nested, never unclosed, never
+    # touching the next (one unchanged line between them, or one block)
+    blocks, opened = [], None
+    for number, line in enumerate(lines):
+        begin, end = PATCH_BEGIN.match(line), PATCH_END.match(line)
+        if begin is None and end is None and PATCH_ANY.search(line):
+            raise ValueError(
+                f"{path}:{number + 1}: not a marker: "
+                "`//// TRIMKIT PATCH: fix.name` or `//// TRIMKIT END PATCH`"
+            )
+        if begin is not None:
+            if opened is not None:
+                raise ValueError(
+                    f"{path}:{number + 1}: a block opens inside the block at line {opened[0] + 1}"
+                )
+            opened = (number, begin[1].decode(), begin[2].decode())
+        elif end is not None:
+            if opened is None:
+                raise ValueError(f"{path}:{number + 1}: a block ends that never opened")
+            if blocks and blocks[-1].last + 1 == opened[0]:
+                raise ValueError(
+                    f"{path}:{opened[0] + 1}: touches the block before it: "
+                    "merge them, or leave a line between"
+                )
+            blocks.append(PatchBlock(opened[1], opened[2], opened[0], number))
+            opened = None
+    if opened is not None:
+        raise ValueError(f"{path}:{opened[0] + 1}: the block never ends: `//// TRIMKIT END PATCH`")
+    return blocks
+
+
+def _find(haystack: list[bytes], needle: list[bytes], start: int) -> int:
+    # the first place at or after `start` that `needle` appears whole, or -1
+    for at in range(start, len(haystack) - len(needle) + 1):
+        if haystack[at : at + len(needle)] == needle:
+            return at
+    return -1
+
+
+def replaced(path: str, upstream: list[bytes], vendored: list[bytes]) -> list[PatchBlock]:
+    """
+    Each block of a vendored file with the upstream lines it replaced: the
+    text outside the blocks is the upstream's, found verbatim and in order,
+    from the start to the end, so the upstream lines between two of those
+    stretches are what the block between them replaced. Anything else
+    changed is outside a block, and refused, naming the first line that
+    differs.
+    """
+    blocks = marked_blocks(path, vendored)
+    stretches = [(0, blocks[0].first if blocks else len(vendored))]
+    stretches += [
+        (b.last + 1, (blocks[i + 1].first if i + 1 < len(blocks) else len(vendored)))
+        for i, b in enumerate(blocks)
+    ]
+
+    def outside(start: int, end: int, cursor: int) -> ValueError:
+        # the stretch [start, end) isn't in the upstream past `cursor`: name
+        # the first line where its best match there stops matching
+        stretch, best = vendored[start:end], 0
+        for at in range(cursor, len(upstream)):
+            length = 0
+            while (
+                length < len(stretch)
+                and at + length < len(upstream)
+                and upstream[at + length] == stretch[length]
+            ):
+                length += 1
+            best = max(best, length)
+        return ValueError(f"{path}:{start + best + 1}: changed outside a `//// TRIMKIT PATCH` block")
+
+    first = vendored[stretches[0][0] : stretches[0][1]]
+    if upstream[: len(first)] != first:
+        raise outside(0, len(first), 0)
+    cursor, found = len(first), []
+    for index, block in enumerate(blocks):
+        start, end = stretches[index + 1]
+        stretch = vendored[start:end]
+        if index + 1 == len(blocks):
+            at = len(upstream) - len(stretch)
+            if at < cursor or upstream[at:] != stretch:
+                raise outside(start, end, cursor)
+        else:
+            at = _find(upstream, stretch, cursor)
+            if at < 0:
+                raise outside(start, end, cursor)
+        found.append(PatchBlock(block.kind, block.name, block.first, block.last, cursor, at))
+        cursor = at + len(stretch)
+    if not blocks and upstream != vendored:
+        raise (
+            outside(0, len(vendored), 0)
+            if upstream[: len(vendored)] != vendored
+            else ValueError(f"{path}:{len(vendored) + 1}: changed outside a `//// TRIMKIT PATCH` block")
+        )
+    return found
+
+
+def _header(patch: bytes) -> bytes:
+    # a patch file's text above its first `--- a/`, or all of it when it has no diff yet
+    if patch.startswith(b"--- a/"):
+        return b""
+    at = patch.find(b"\n--- a/")
+    return patch if at < 0 else patch[: at + 1]
+
+
+def patch_file_name(upstream: str, name: str) -> str:
+    return f"{upstream}-{name}.patch"
+
+
+def _hunks_text(path: str, before: list[bytes], changes: list[tuple[int, int, list[bytes]]]) -> bytes:
+    # one file's changes, each (first, end, new lines) of `before`, as a
+    # unified diff with CONTEXT lines: changes whose context meets share a hunk
+    groups: list[list[tuple[int, int, list[bytes]]]] = []
+    for change in sorted(changes):
+        if groups and change[0] - groups[-1][-1][1] <= 2 * CONTEXT:
+            groups[-1].append(change)
+        else:
+            groups.append([change])
+    text, shift = [f"--- a/{path}\n+++ b/{path}\n".encode()], 0
+    for group in groups:
+        old_first, old_end = max(0, group[0][0] - CONTEXT), min(len(before), group[-1][1] + CONTEXT)
+        body, new_count, cursor = [], 0, old_first
+        for first, end, new in group:
+            body += [b" " + line for line in before[cursor:first]]
+            body += [b"-" + line for line in before[first:end]]
+            body += [b"+" + line for line in new]
+            new_count += (first - cursor) + len(new)
+            cursor = end
+        body += [b" " + line for line in before[cursor:old_end]]
+        new_count += old_end - cursor
+        old_count = old_end - old_first
+        if any(not line.endswith(b"\n") for line in body):
+            raise ValueError(f"{path}: a change reaches its last line, which has no newline")
+        old_at = old_first + (1 if old_count else 0)
+        new_at = old_first + shift + (1 if new_count else 0)
+        text.append(f"@@ -{old_at},{old_count} +{new_at},{new_count} @@\n".encode())
+        text += body
+        shift += new_count - old_count
+    return b"".join(text)
+
+
+def derive_patches(
+    upstream: str, pristine: dict[str, list[bytes]], vendored: dict[str, list[bytes]]
+) -> dict[str, tuple[str, bytes]]:
+    """
+    Every patch the blocks in an upstream's vendored files make, as
+    {file name: (kind, diff)}, in the order `fetch` applies them (by name):
+    each against the upstream with the patches before it applied, so they
+    apply in that order exactly, and the last leaves every file as vendored.
+    """
+    blocks = {
+        path: replaced(path, pristine[path], lines) for path, lines in vendored.items() if path in pristine
+    }
+    kinds: dict[str, str] = {}
+    for path, found in blocks.items():
+        for block in found:
+            if kinds.setdefault(block.name, block.kind) != block.kind:
+                raise ValueError(
+                    f"{path}:{block.first + 1}: `{block.name}` is a {kinds[block.name]} elsewhere"
+                )
+    order = sorted(kinds)
+    patches = {}
+    for index, name in enumerate(order):
+        text = []
+        for path in sorted(blocks):
+            # the file with the patches before this one applied
+            before, changes = [], []
+            cursor = 0
+            for block in blocks[path]:
+                before += pristine[path][cursor : block.old_first]
+                block_lines = vendored[path][block.first : block.last + 1]
+                if block.name == name:
+                    changes.append((len(before), len(before) + block.old_end - block.old_first, block_lines))
+                if order.index(block.name) < index:
+                    before += block_lines
+                else:
+                    before += pristine[path][block.old_first : block.old_end]
+                cursor = block.old_end
+            before += pristine[path][cursor:]
+            if changes:
+                text.append(_hunks_text(path, before, changes))
+        patches[patch_file_name(upstream, name)] = (kinds[name], b"".join(text))
+    return patches
+
+
+def _vendored_files(name: str) -> dict[str, list[bytes]]:
+    dest = VENDOR / name
+    return {
+        p.relative_to(dest).as_posix(): p.read_bytes().splitlines(keepends=True)
+        for p in sorted(dest.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _write_patches_table(name: str, digests: dict[str, str]) -> None:
+    # `[upstream.NAME.patches]` as `patch` found the blocks: one line a patch,
+    # in the order they apply, or no table for an upstream without any
+    text = TOML.read_text()
+    table = re.compile(rf"\n\[upstream\.{re.escape(name)}\.patches\]\n(?:\"[^\"\n]+\" = \"[0-9a-f]*\"\n)*")
+    lines = "".join(f'"{patch}" = "{digest}"\n' for patch, digest in digests.items())
+    body = f"\n[upstream.{name}.patches]\n{lines}" if digests else "\n"
+    if table.search(text):
+        text = table.sub(lambda _: body, text, count=1)
+    elif digests:
+        # after the upstream's own table, before whatever table comes next
+        own = re.compile(rf"(\[upstream\.{re.escape(name)}\]\n(?:[^\[\n][^\n]*\n|\n)*?)(?=\n\[|\Z)", re.S)
+        text = own.sub(lambda m: m[1] + body.rstrip("\n") + "\n", text, count=1)
+    TOML.write_text(text)
+
+
+def patch(names: list[str]) -> None:
+    """
+    vendor/patches/ from the blocks in vendor/: for each upstream named (all
+    by default), its patch files written from its blocks (each keeping the
+    text above its diff, a new one starting with a placeholder to replace),
+    the ones no block names any more removed, and the manifest's table and
+    hashes rewritten. Then it is fetched again, from those patches and the
+    cached upstream, and must come back byte for byte; if it doesn't, or
+    anything fails, vendor/NAME is put back as it was and nothing is kept.
+    """
+    pins = load().upstreams
+    placeholders = []
+    for name in names or list(pins):
+        pin = pins[name]
+        vendored = _vendored_files(name)
+        upstream_files = _upstream_files(pin, pin.commit)
+        # what `fetch` writes itself (a LICENSE from `license_from`) is no upstream file
+        written = {"LICENSE"} if pin.license_from else set()
+        compared = {p: lines for p, lines in vendored.items() if p not in written}
+        derived = derive_patches(
+            name, {p: upstream_files[p] for p in compared if p in upstream_files}, compared
+        )
+        if derived and pin.system:
+            raise ValueError(f"{name}: a system copy can stand in for it, so it can't be patched")
+        snapshot = {p: b"".join(lines) for p, lines in vendored.items()}
+        manifest_before = TOML.read_text()
+        written_before = {p: p.read_bytes() for p in PATCHES.glob(f"{name}-*.patch")}
+        try:
+            digests = {}
+            for patch_name, (kind, diff) in derived.items():
+                path = PATCHES / patch_name
+                # what is above its diff, as written: a header alone starts a patch too
+                header = (
+                    _header(path.read_bytes())
+                    if path.exists()
+                    else (f"kind: {kind}\n\n".encode() + PLACEHOLDER + b"\n\n")
+                )
+                if header.splitlines()[0].strip() != f"kind: {kind}".encode():
+                    raise ValueError(
+                        f"{patch_name}: its header says {header.splitlines()[0].decode().strip()}, "
+                        f"its blocks `{kind}`"
+                    )
+                if PLACEHOLDER in header:
+                    placeholders.append(f"vendor/patches/{patch_name}")
+                path.write_bytes(header + diff)
+                digests[patch_name] = hashlib.sha256(header + diff).hexdigest()
+            for stale in set(written_before) - {PATCHES / p for p in derived}:
+                stale.unlink()
+            _write_patches_table(name, digests)
+            # the manifest as just written: `load` caches the one read before
+            load.cache_clear()
+            _fetch_into(load().upstreams[name], latest=False)
+            after = {p: b"".join(lines) for p, lines in _vendored_files(name).items()}
+            if after != snapshot:
+                differ = sorted(
+                    set(after) ^ set(snapshot) | {p for p in after if snapshot.get(p) != after[p]}
+                )
+                raise ValueError(
+                    f"{name}: fetching from the patches doesn't give back vendor/{name}: "
+                    f"{', '.join(differ[:5])}"
+                )
+        except BaseException:
+            dest = VENDOR / name
+            shutil.rmtree(dest, ignore_errors=True)
+            for path, data in snapshot.items():
+                (dest / path).parent.mkdir(parents=True, exist_ok=True)
+                (dest / path).write_bytes(data)
+            for path in PATCHES.glob(f"{name}-*.patch"):
+                path.unlink()
+            for path, data in written_before.items():
+                path.write_bytes(data)
+            TOML.write_text(manifest_before)
+            load.cache_clear()
+            raise
+        print(f"{name}: {len(derived)} patches from vendor/{name}, which fetches back byte for byte")
+    if placeholders:
+        sys.exit(
+            "say why in each new patch, above its diff, then run `uv run scripts patch` again:\n  "
+            + "\n  ".join(placeholders)
+        )
+
+
+def check_patches(name: str, pin: Upstream) -> list[str]:
+    """
+    Offline: an upstream's patches are exactly what its blocks say. Taken
+    back off vendor/NAME, last first, they must leave no marker behind, and
+    from what that leaves, the blocks must derive the very same patch files.
+    """
+    vendored = _vendored_files(name)
+    rerun = f"run `uv run scripts patch {name}`"
+    pristine = {p: list(lines) for p, lines in vendored.items()}
+    headers = {}
+    try:
+        for patch_name in reversed(list(pin.patches)):
+            header, hunks = parse_patch((PATCHES / patch_name).read_bytes(), patch_name)
+            headers[patch_name] = header
+            for path in dict.fromkeys(h.path for h in hunks):
+                pristine[path] = apply_hunks(
+                    pristine[path], [h for h in hunks if h.path == path], patch_name, reverse=True
+                )
+    except (ValueError, KeyError) as error:
+        return [f"vendor/{name} changed since its patches were written ({error}): {rerun}"]
+    errors = [
+        f"vendor/{name}/{path}:{number + 1}: a marker no patch adds: {rerun}"
+        for path, lines in pristine.items()
+        for number, line in enumerate(lines)
+        if PATCH_ANY.search(line)
+    ]
+    if errors:
+        return errors
+    try:
+        derived = derive_patches(name, pristine, vendored)
+    except ValueError as error:
+        return [str(error)]
+    if list(derived) != list(pin.patches):
+        return [
+            f"vendor/{name}: its blocks make {sorted(derived) or 'no patches'}, "
+            f"trimkit.toml lists {list(pin.patches) or 'none'}: {rerun}"
+        ]
+    errors = [
+        f"vendor/patches/{p}: isn't what the blocks in vendor/{name} make: {rerun}"
+        for p, (_, diff) in derived.items()
+        if (PATCHES / p).read_bytes() != headers[p] + diff
+    ]
+    errors += [
+        f"vendor/patches/{p}: still says `{PLACEHOLDER.decode()}`"
+        for p in derived
+        if PLACEHOLDER in headers[p]
+    ]
+    return errors
 
 
 def tree_sha256(name: str, paths: list[Path]) -> str:
@@ -311,7 +747,7 @@ def _fetch_into(pin: Upstream, latest: bool) -> None:
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True)
 
-    with tarfile.open(fileobj=io.BytesIO(_get(_tarball_url(pin, commit)))) as tar:
+    with tarfile.open(fileobj=io.BytesIO(_tarball(pin, commit))) as tar:
         for member in tar.getmembers():
             # strip the `<repo>-<commit>/` prefix both hosts add
             path = member.name.split("/", 1)[-1]
@@ -413,9 +849,15 @@ def check() -> None:
         for patch, digest in sorted(listed.items())
         if patch not in on_disk or hashlib.sha256((PATCHES / patch).read_bytes()).hexdigest() != digest
     ]
+    # and every patch is exactly what the blocks in its upstream say
+    for name in fetched:
+        errors += check_patches(name, pins[name])
     if errors:
         sys.exit("\n".join(errors))
-    print(f"ok: {len(fetched)} upstreams match their tree_sha256 and {len(listed)} patches their sha256")
+    print(
+        f"ok: {len(fetched)} upstreams match their tree_sha256, and {len(listed)} patches their sha256"
+        " and the blocks in vendor/"
+    )
 
 
 def outdated() -> None:

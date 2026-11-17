@@ -28,8 +28,10 @@ constexpr int32_t kMaxTagSymbolBitLength = 32;
 constexpr int kMaxRawEncodingBitLength = 18;
 constexpr int kDefaultSymbolCodingCompressionLevel = 7;
 
+//// TRIMKIT PATCH: fix.symbol-encoding
 // One per bit length, up to and including kMaxTagSymbolBitLength.
 typedef uint64_t TaggedBitLengthFrequencies[kMaxTagSymbolBitLength + 1];
+//// TRIMKIT END PATCH
 
 void SetSymbolEncodingMethod(Options* options, SymbolCodingMethod method) {
   options->SetInt("symbol_encoding_method", method);
@@ -135,6 +137,7 @@ bool EncodeSymbols(const uint32_t* symbols, int num_values, int num_components,
   const int64_t tagged_scheme_total_bits =
       ApproximateTaggedSchemeBits(bit_lengths, num_components);
 
+  //// TRIMKIT PATCH: fix.symbol-encoding
   // The maximum bit length of a single entry value that we can encode using
   // the raw scheme.
   const int max_value_bit_length =
@@ -149,6 +152,7 @@ bool EncodeSymbols(const uint32_t* symbols, int num_values, int num_components,
     raw_scheme_total_bits = ApproximateRawSchemeBits(
         symbols, num_values, max_value, &num_unique_symbols);
   }
+  //// TRIMKIT END PATCH
 
   int method = -1;
   if (options != nullptr && options->IsOptionSet("symbol_encoding_method")) {
@@ -206,7 +210,9 @@ bool EncodeTaggedSymbols(const uint32_t* symbols, int num_values,
 
   // Create encoder for encoding the bit tags.
   SymbolEncoderT<5> tag_encoder;
+  //// TRIMKIT PATCH: fix.symbol-encoding
   tag_encoder.Create(frequencies, kMaxTagSymbolBitLength + 1, target_buffer);
+  //// TRIMKIT END PATCH
 
   // Start encoding bit tags.
   tag_encoder.StartEncoding(target_buffer);

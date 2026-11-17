@@ -372,6 +372,7 @@ struct COAL_DLLAPI GJKSolver {
     return distance;
   }
 
+  //// TRIMKIT PATCH: perf.bvh-bvh-performance
   /// @brief Specialization of `shapeDistance` for the case where both shapes
   /// are triangles. It is more efficient to pre-compute the relative
   /// transformation between the two shapes before calling GJK/EPA.
@@ -439,6 +440,7 @@ struct COAL_DLLAPI GJKSolver {
     return distance;
   }
 
+  //// TRIMKIT END PATCH
  protected:
   /// @brief initialize GJK.
   /// This method assumes `minkowski_difference` has been set.

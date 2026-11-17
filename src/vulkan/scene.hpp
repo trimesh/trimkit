@@ -32,6 +32,18 @@ inline std::atomic<std::uint32_t>& device_lock() {
     return held;
 }
 
+// Whether this process opened `device`, checked before every wait on the
+// device lock: a forked child holds the parent's device, not its own, and a
+// lock some thread of the parent may have held as it forked, never let go
+// here. False with the reason, and the CPU answers
+inline bool opened_here(const Device& device, std::string* reason) {
+    if (opened_in_this_process(device)) {
+        return true;
+    }
+    *reason = "the Vulkan device was opened before this process was forked";
+    return false;
+}
+
 // A scene's meshes, or one top level, on the device: uploaded once from the
 // trees the CPU traces, freed with the scene or top level they mirror, and
 // only in the process that opened the device (a forked child holds the
@@ -50,7 +62,7 @@ struct DeviceArrays {
     DeviceArrays(const DeviceArrays&) = delete;
     DeviceArrays& operator=(const DeviceArrays&) = delete;
     ~DeviceArrays() {
-        if (device->pid == process_id()) {
+        if (opened_in_this_process(*device)) {
             destroy(*device, &arrays);
         }
     }
@@ -172,6 +184,9 @@ inline std::unique_ptr<DeviceArrays> put_scene(Device* device, const MeshTree* m
     const Span spans[SCENE_BUFFERS] = {
         bytes_of(nodes), bytes_of(corners), bytes_of(vertices), bytes_of(table), bytes_of(node32), bytes_of(tri32),
     };
+    if (!opened_here(*device, reason)) {
+        return nullptr;
+    }
     std::unique_ptr<DeviceArrays> arrays = std::make_unique<DeviceArrays>();
     arrays->device = device;
     const Exclusively holding(device_lock());
@@ -200,6 +215,9 @@ inline std::unique_ptr<DeviceArrays> put_top(Device* device, const void* tree_no
         bytes_of(nodes),  {slots, slot_count * sizeof(std::uint64_t)}, bytes_of(inverses), bytes_of(instance_meshes),
         bytes_of(node32),
     };
+    if (!opened_here(*device, reason)) {
+        return nullptr;
+    }
     std::unique_ptr<DeviceArrays> arrays = std::make_unique<DeviceArrays>();
     arrays->device = device;
     const Exclusively holding(device_lock());
@@ -286,6 +304,9 @@ bool trace(const DeviceArrays& scene, const DeviceArrays* top, std::uint32_t mes
     query.occlusion = occlusion;
     query.most = most < UNBOUNDED ? static_cast<std::uint32_t>(most) : UNBOUNDED;
     query.extent = extent;
+    if (!opened_here(*scene.device, reason)) {
+        return false;
+    }
     const Exclusively holding(device_lock());
     return run_query(
         *scene.device, query, count,

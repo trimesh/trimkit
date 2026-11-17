@@ -56,7 +56,7 @@ static nb::tuple svg_parse(std::string_view path, const nb::object& segment_dtyp
     // vectors grow as it goes
     svgpath::Path parsed;
     {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         // like an SVG renderer, malformed data keeps everything before the
         // error rather than failing the whole path, so how far it got is unused
         static_cast<void>(svgpath::parse(path.data(), path.size(), &parsed));
@@ -74,7 +74,7 @@ static std::string svg_string(const trimkit::Array<double, -1, 2>& vertices_argu
     const char* refusal = nullptr;
     std::size_t refused = 0;
     {
-        const nb::gil_scoped_release release;
+        const trimkit::GilReleased release;
         refusal = svgpath::format(vertices.data(), vertices.shape(0), records.rows(), records.size(), &path, &refused);
     }
     if (refusal != nullptr) {

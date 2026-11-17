@@ -49,6 +49,7 @@
 /** @brief Main namespace */
 namespace coal {
 
+//// TRIMKIT PATCH: perf.bvh-bvh-performance
 template <typename BV>
 inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
                                          const Vec3s& inv_T0, const BV& b1,
@@ -60,6 +61,7 @@ inline bool overlapPrecomputedRTranspose(const Matrix3s& R0_transpose,
   return overlap(R0, T0, b1, b2, request, sqrDistLowerBound);
 }
 
+//// TRIMKIT END PATCH
 /// @cond IGNORE
 namespace details {
 

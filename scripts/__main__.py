@@ -9,10 +9,15 @@ The one way to build, test and check this package, locally and in CI alike:
   uv run scripts static      the checks that need a build: clang-tidy, the
                              sdist, stubs and the wheel audit
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
+  uv run scripts genmc       model check src/parallel.hpp itself with GenMC,
+                             and that each memory order it weakens is caught
+  uv run scripts model       check the pool's protocol (verify/tla) with TLC,
+                             and that each mutation of it is caught
   uv run scripts distro      Debian and Fedora packaging (--run: build,
                              test and lint them), when packaging changes
   uv run scripts generate    regenerate the shaders' SPIR-V, the stubs, the
                              README API summary and tests/golden.json
+  uv run scripts patch       write vendor/patches/ from the blocks in vendor/
   uv run scripts update      move every upstream and dependency to its newest
   uv run scripts format      format our C++ with the pinned clang-format
   uv run scripts wheel       this platform's release wheels
@@ -39,13 +44,16 @@ in-image command from the image's own environment, never the host's.
 
 import argparse
 import ast
+import concurrent.futures
 import doctest
 import functools
 import hashlib
 import io
+import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -550,7 +558,11 @@ THREADING = (
     "_beginthreadex",
 )
 # the vendored libraries with thread pools of their own, and the define that compiles each out
-POOLS_COMPILED_OUT = {"vhacd": "VHACD_DISABLE_THREADING", "tinybvh": "NO_THREADED_BUILDS"}
+POOLS_COMPILED_OUT = {
+    "vhacd": "VHACD_DISABLE_THREADING",
+    "tinybvh": "NO_THREADED_BUILDS",
+    "xatlas": "XA_MULTITHREADED=0",
+}
 
 DOOR_ONLY = re.compile(r"nb::ndarray|try_cast|check_values|trimkit::detail::|\b(malloc|calloc|realloc)\(")
 
@@ -675,30 +687,52 @@ def check_door() -> None:
     ]
     if found:
         sys.exit("Win32 calls must be declared in src/windows.hpp, never windows.h:\n  " + "\n  ".join(found))
-    # threads: only common.hpp reaches the pool, through in_parallel and gather_in_parallel
+    # threads: only common.hpp reaches the pool, through in_parallel and
+    # gather_in_parallel, and gil.hpp, for the pool's exit gate (platform.hpp
+    # is the pool's own layer)
     found = [
         f"{path.relative_to(ROOT)}: {needle}"
         for path in sources
-        if path.name not in ("common.hpp", "parallel.hpp")
+        if path.name not in ("common.hpp", "gil.hpp", "parallel.hpp", "platform.hpp")
         for needle in ("parallel.hpp", "parallel::")
         if needle in path.read_text()
     ]
     if found:
         sys.exit("threads must go through in_parallel in src/common.hpp:\n  " + "\n  ".join(found))
+    # and the platform only through the pool, but for the Vulkan code's fork
+    # generation: platform.hpp is no second door to threads
+    found = [
+        f"{path.relative_to(ROOT)}: platform.hpp"
+        for path in sources
+        if path.name not in ("parallel.hpp", "platform.hpp", "vulkan.hpp")
+        and re.search(r'#\s*include\s*"[./]*platform\.hpp"', path.read_text())
+    ]
+    if found:
+        sys.exit("src/platform.hpp is only for parallel.hpp and Vulkan:\n  " + "\n  ".join(found))
     # and the pool is the only thread, mutex or wait there is: nothing of ours
     # starts or blocks on anything else
     found = [
         f"{path.relative_to(ROOT)}: {needle}"
         for path in sources
-        if path.name != "parallel.hpp"
+        if path.name not in ("parallel.hpp", "platform.hpp")
         for needle in THREADING
         if needle in path.read_text()
     ]
     if found:
         sys.exit("the pool in src/parallel.hpp is the only threading there is:\n  " + "\n  ".join(found))
+    # the GIL: released only through GilReleased (src/gil.hpp), which makes the
+    # interpreter's exit safe for every call that releases it
+    found = [
+        f"{path.relative_to(ROOT)}: {needle}"
+        for path in sources
+        if path.name != "gil.hpp"
+        for needle in ("gil_scoped_release", "PyEval_SaveThread", "Py_BEGIN_ALLOW_THREADS")
+        if needle in path.read_text()
+    ]
+    if found:
+        sys.exit("release the GIL only through GilReleased in src/gil.hpp:\n  " + "\n  ".join(found))
     # every vendored library with a pool of its own has it compiled out, and
-    # runs its fan-outs on ours or on the calling thread; xatlas is the one
-    # exception, kept as it is with its own workers (README)
+    # runs its fan-outs on ours or on the calling thread
     for upstream, define in POOLS_COMPILED_OUT.items():
         if define not in MANIFEST.upstreams[upstream].defines:
             sys.exit(f"trimkit.toml: [upstream.{upstream}.defines] must set {define}: one pool, parallel.hpp")
@@ -710,16 +744,708 @@ def cmd_audit(args) -> None:
     run(dev(args.root).python, ROOT / "scripts" / "check_wheel.py", dev(args.root).wheel)
 
 
+def check_model_steps() -> None:
+    """
+    The model (verify/tla/Scheduler.tla) and the code name the same steps:
+    each CallerStep and WorkerStep of src/parallel.hpp has an action named
+    Caller<Step> or Worker<Step> (or <Step><Part>, an atomic part of it), and
+    each such action is part of a step the code has.
+    """
+    header = (ROOT / "src" / "parallel.hpp").read_text()
+    spec = (ROOT / "verify" / "tla" / "Scheduler.tla").read_text()
+    problems = []
+    for side in ("Caller", "Worker"):
+        enum = re.search(rf"enum class {side}Step : std::uint8_t \{{(.*?)\}};", header, re.S)
+        steps = set(re.findall(r"^\s*(\w+),", enum.group(1), re.M)) if enum else set()
+        actions = set(re.findall(rf"^{side}(\w+)\(t, f\) ==", spec, re.M))
+        if not steps:
+            problems.append(f"src/parallel.hpp has no {side}Step")
+        for action in sorted(actions):
+            if not any(action.startswith(step) for step in steps):
+                problems.append(f"{side}{action} in the model is no step of {side}Step")
+        for step in sorted(steps):
+            if not any(action.startswith(step) for action in actions):
+                problems.append(f"{side}Step::{step} has no action {side}{step} in the model")
+            if f"case {side}Step::{step}:" not in header:
+                problems.append(f"{side}Step::{step} has no case in its switch")
+    # and each traced step is one of the model's actions, and each action is
+    # traced, but for running items, which is local, and a mutation's
+    traced = set(re.findall(r'"((?:Caller|Worker)\w+)"', header))
+    modelled = set(re.findall(r"^((?:Caller|Worker)\w+)\(t, f\) ==", spec, re.M))
+    local = {
+        "CallerRun",
+        "CallerRunNested",
+        "WorkerRun",
+        "WorkerRunNested",
+        "CallerClaimStore",
+        "WorkerClaimStore",
+    }
+    problems += [
+        f"src/parallel.hpp traces {name}, which the model has no action for"
+        for name in sorted(traced - modelled)
+    ]
+    problems += [
+        f"the model's {name} is no step src/parallel.hpp traces" for name in sorted(modelled - traced - local)
+    ]
+    if problems:
+        sys.exit("the model and src/parallel.hpp name different steps:\n  " + "\n  ".join(problems))
+
+
 def cmd_lint(args) -> None:
     # fast and deterministic, nothing compiled: what every file must already be
     vendor.check()
     builder.check()
     check_door()
     check_default_ints()
+    check_model_steps()
     # the lock matches pyproject.toml
     run(tool("uv"), "lock", "--check")
     for command in (cmd_clang_format, cmd_ruff, cmd_actions, cmd_licenses, cmd_shader, cmd_cppcheck):
         command(args)
+
+
+# What starts, blocks on or sleeps a thread, or handles a signal: in the code a
+# build compiles, after every #if and every patch, only src/parallel.hpp may
+# (`cmd_threads`). A regular expression over preprocessed C++, so a name in a
+# comment or a compiled-out branch is never seen
+THREAD_CALLS = re.compile(
+    r"\b(?:std::(?:thread|jthread|async|future|promise|mutex|recursive_mutex|timed_mutex|shared_mutex"
+    r"|condition_variable(?:_any)?|counting_semaphore|binary_semaphore|latch|barrier)\b"
+    r"|std::this_thread::(?:sleep_for|sleep_until|yield)"
+    r"|pthread_(?:create|mutex_lock|mutex_trylock|cond_wait|cond_timedwait|sigmask|kill|cancel)"
+    r"|_beginthreadex|CreateThread|WaitOnAddress|WakeByAddress\w*|SYS_futex|__ulock_wait|__ulock_wake"
+    r"|sched_yield|nanosleep|usleep|Sleep|SleepEx|sigaction|sigprocmask|SetConsoleCtrlHandler"
+    r"|PyErr_CheckSignals|PyErr_SetInterrupt\w*|notify_one|notify_all)\b"
+    r"|\bsignal\s*\(|\braise\s*\(\s*SIG"
+)
+# the pool itself, and what is still to move into it, each with why it may
+THREAD_CALLS_ALLOWED = {
+    "src/platform.hpp": "the operating system's threads, waits and signal masks, for the pool alone",
+    "src/parallel.hpp": "the pool",
+    "src/common.hpp": "Interrupt polls for Ctrl-C on the calling thread (PyErr_CheckSignals)",
+}
+# Eigen is vendored unmodified (MPL-2.0, `check` refuses a patch to it) and
+# isn't scanned: its thread pool is compiled only with EIGEN_USE_THREADS,
+# which no build may define
+THREAD_CALLS_UNSCANNED = ("vendor/eigen/",)
+
+
+def cmd_threads(args) -> None:
+    """
+    Nothing the extension compiles starts, blocks on or sleeps a thread, or
+    handles a signal, outside the pool: every translation unit the dev build
+    compiles is preprocessed with its own command, so what is seen is what is
+    built, every vendored library's #if decided and every patch applied, and
+    each call is traced by its line markers to the file it is written in.
+    The dev build's platform only: another's branches go unread here.
+    """
+    compile_commands(args.root)
+    build = dev(args.root)
+    entries = json.loads((build.build_dir / "compile_commands.json").read_text())
+    defined = [d for u in MANIFEST.upstreams.values() for d in u.defines if d.startswith("EIGEN_USE_THREADS")]
+    if defined:
+        sys.exit(f"trimkit.toml defines {defined[0]}: Eigen's thread pool stays compiled out")
+
+    def scan(entry: dict) -> set[tuple[str, str]]:
+        command, skip = [], False
+        for word in shlex.split(entry["command"]):
+            if skip or word in ("-c", "-MD", "-MMD"):
+                skip = False
+                continue
+            skip = word in ("-o", "-MF", "-MT", "-MQ")
+            if not skip:
+                command.append(word)
+        text = subprocess.run(
+            [*command, "-E"], cwd=entry["directory"], capture_output=True, text=True, check=True
+        ).stdout
+        found, where = set(), ""
+        for line in text.splitlines():
+            marker = re.match(r'# \d+ "([^"]+)"', line)
+            if marker:
+                path = (Path(entry["directory"]) / marker[1]).resolve()
+                where = path.relative_to(build.source).as_posix() if path.is_relative_to(build.source) else ""
+            elif where and where not in THREAD_CALLS_ALLOWED and not where.startswith(THREAD_CALLS_UNSCANNED):
+                found |= {(where, call[0]) for call in THREAD_CALLS.finditer(line)}
+        return found
+
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 1) as pool:
+        found = sorted(set().union(*pool.map(scan, entries)))
+    if found:
+        sys.exit(
+            "threads, waits and signals are src/parallel.hpp's alone, in what the build compiles:\n  "
+            + "\n  ".join(f"{where}: {call}" for where, call in found)
+        )
+    print(f"ok: {len(entries)} translation units start, wait on and signal no thread outside the pool")
+
+
+# the pool against the best of what people write by hand, in every cell of
+# bench/parallel.cpp: no slower than this times the best of them, plus this,
+# plus the tail no dynamic schedule can promise to beat, which the pool states
+# as its bound: the cell's costliest single item and one first claim
+# (src/parallel.hpp, MIN_CLAIM_NS)
+POOL_AGAINST_HAND = 1.10
+POOL_SLACK_US = 20.0
+POOL_TAIL_CLAIM_US = 4.0
+# and no more CPU than this times the persistent hand-written pools', plus
+# this: spinning on cores a neighbour could use is a cost too
+POOL_CPU_AGAINST_HAND = 1.25
+POOL_CPU_SLACK_US = 50.0
+# the cores `bench` gets, by default: enough to see the pool scale, the last ones
+BENCH_CORES = 8
+
+
+def _bench_misses(cell: dict) -> list[str]:
+    # why a cell misses the gate, if it does
+    hand = min(cell["spawn"], cell["cv_static"], cell["cv_chunks"])
+    allowed = POOL_AGAINST_HAND * hand + POOL_SLACK_US + cell["costliest_us"] + POOL_TAIL_CLAIM_US
+    hand_cpu = min(cell["cv_static_cpu"], cell["cv_chunks_cpu"])
+    reasons = []
+    if cell["pool"] > allowed:
+        reasons.append(f"pool {cell['pool']:.0f} us, best by hand {hand:.0f} us")
+    if cell["pool"] > cell["serial"] + POOL_SLACK_US + cell["costliest_us"] + POOL_TAIL_CLAIM_US:
+        reasons.append(f"pool {cell['pool']:.0f} us, serial {cell['serial']:.0f} us")
+    if cell["pool_cpu"] > POOL_CPU_AGAINST_HAND * hand_cpu + POOL_CPU_SLACK_US:
+        reasons.append(f"pool CPU {cell['pool_cpu']:.0f} us, by hand {hand_cpu:.0f} us")
+    return reasons
+
+
+def cmd_bench(args) -> None:
+    """
+    src/parallel.hpp against a serial loop and three pools written by hand
+    (bench/parallel.cpp), with 1 and 4 callers, alone and with a noisy
+    neighbour, on `--cores` cores. In every cell the pool must be within
+    POOL_AGAINST_HAND of the best hand-written way plus POOL_SLACK_US and the
+    costliest item, never slower than the serial loop by more than that, and
+    use no more than POOL_CPU_AGAINST_HAND of the persistent pools' CPU plus
+    POOL_CPU_SLACK_US. A cell that misses is measured twice more, and misses
+    only if it does every time: a busy machine slows a round, not every round.
+    Prints each cell, then fails naming every cell that missed, and why.
+    """
+    binary = args.root / "bench" / "parallel"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        tool("clang++"),
+        "-std=c++20",
+        "-O2",
+        "-DNDEBUG",
+        "-pthread",
+        ROOT / "bench" / "parallel.cpp",
+        "-o",
+        binary,
+    )
+    threads = str(len(os.sched_getaffinity(0)))
+    missed = []
+    for callers in ("1", "4"):
+        for noise in ("0", threads):
+            cells = [
+                json.loads(line) for line in run(binary, threads, callers, noise, capture=True).splitlines()
+            ]
+            for index, first in enumerate(cells):
+                best = first
+                for _ in range(2):
+                    if not _bench_misses(best):
+                        break
+                    only = f"{best['items']},{best['item_ns']:.0f},{best['skew_index']}"
+                    again = json.loads(
+                        run(binary, threads, callers, noise, only, capture=True).splitlines()[-1]
+                    )
+                    best = min(
+                        best, again, key=lambda c: len(_bench_misses(c)) + c["pool"] / (c["serial"] + 1)
+                    )
+                cells[index] = best
+            print(
+                f"\n{threads} threads, {callers} callers, noise {noise}\n"
+                f"{'items':>8} {'item ns':>8} {'skew':>15} {'serial':>10} {'pool':>10} {'best hand':>10} "
+                f"{'pool/best':>9} {'cpu/hand cpu':>12} {'threads':>7} {'wakes':>5} {'sleeps':>6}"
+            )
+            for cell in cells:
+                hand = min(cell["spawn"], cell["cv_static"], cell["cv_chunks"])
+                hand_cpu = min(cell["cv_static_cpu"], cell["cv_chunks_cpu"])
+                print(
+                    f"{cell['items']:>8} {cell['item_ns']:>8.0f} {cell['skew']:>15} {cell['serial']:>10.0f} "
+                    f"{cell['pool']:>10.0f} {hand:>10.0f} {cell['pool'] / hand:>9.2f} "
+                    f"{cell['pool_cpu'] / hand_cpu:>12.2f} {cell['pool_threads']:>7} {cell['wakes']:>5} "
+                    f"{cell['sleeps']:>6}"
+                )
+                reasons = _bench_misses(cell)
+                if reasons:
+                    missed.append(
+                        f"{cell['items']} items of {cell['item_ns']:.0f} ns, {cell['skew']}, "
+                        f"{callers} callers, noise {noise}: " + "; ".join(reasons)
+                    )
+    if missed:
+        sys.exit(f"the pool missed the gate in {len(missed)} cells:\n  " + "\n  ".join(missed))
+    print("ok: the pool is within the gate in every cell")
+
+
+# GenMC (docker/Dockerfile.verify) runs src/parallel.hpp itself, built for its
+# backend (src/platform.hpp, TRIMKIT_GENMC), in every execution the C++
+# memory model allows (RC11), and reports an assertion, a data race, a use
+# after free, or a wait that can never end. Each harness in verify/genmc must
+# explore at least its floor of executions, about half what it does now, so
+# one that stops sharing work (and passes for want of anything to check)
+# fails too. One call at a time, with its worker: two jobs at once (two
+# callers, a nested call, or one caller's two calls) GenMC estimates at some
+# 170 million executions, so those are verify/tla's, the fuzzer's and TSan's
+GENMC_HARNESSES = {
+    "visibility": 40,
+    "early_worker": 32000,
+    "failure": 290,
+    "stop": 560,
+    "exit_stop": 660,
+    "thread_index": 260,
+    "exclusively": 2,
+    "chunk_list": 5,
+    "exit_gate": 15,
+}
+GENMC_SECONDS = 1200
+# the memory orders in src/parallel.hpp that may be weakened by one step with
+# no harness failing, each with why it is still as strong as it is: keyed by
+# the line's code, so a moved or edited line is looked at again
+_LOST_WAKE = (
+    "keeps a wake from being lost (the wake, spinning and live counts' pairings): GenMC's waits return at"
+    " once, so a lost wake can't show there; verify/tla checks the pairings (P1, P2), which these orders make"
+    " sequentially consistent"
+)
+_LEFT = (
+    "orders a worker's leave before its bump of `left`, so a caller that sees the bump sees the leave and"
+    " doesn't sleep on it: a stall, never a wrong answer, which GenMC's waits (they return at once)"
+    " can't show"
+)
+_TWO_HOLDERS = (
+    "orders one holder of a thread index before the next, which are two workers' lifetimes: no harness of one"
+    " call reaches that (verify/tla's S3 checks the holders; TSan the scratch)"
+)
+_TWO_JOBS = (
+    "orders the last job's last leave before the next reservation of its slot: two jobs, which GenMC can't"
+    " reach here (some 170 million executions); verify/tla models the reuse"
+)
+GENMC_MUTANTS_SURVIVING: dict[str, str] = {
+    "if ((held_indexes[index / 64].fetch_or(bit, std::memory_order_acquire) & bit) == 0) {  [acquire -> relaxed]": _TWO_HOLDERS,  # noqa: E501
+    "held_indexes[index / 64].fetch_and(~(std::uint64_t{1} << (index % 64)), std::memory_order_release);  [release -> relaxed]": _TWO_HOLDERS,  # noqa: E501
+    "std::memory_order_acquire, std::memory_order_relaxed)) {  [acquire -> relaxed]": _TWO_JOBS,
+    "slot.left.fetch_add(1, std::memory_order_release);  [release -> relaxed]": _LEFT,
+    "left = slot.left.load(std::memory_order_acquire);  [acquire -> relaxed]": _LEFT,
+    "moved = slot.left.load(std::memory_order_acquire) != left;  [acquire -> relaxed]": _LEFT,
+    "pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements  [seq_cst -> acq_rel]": _LOST_WAKE,  # noqa: E501
+    "spinning = pool.spinning.load(std::memory_order_seq_cst);  [seq_cst -> acquire]": _LOST_WAKE,
+    "if (pool.live.load(std::memory_order_seq_cst) < want) {  [seq_cst -> acquire]": _LOST_WAKE,
+    "pool.spinning.fetch_add(1, std::memory_order_seq_cst);  [seq_cst -> acq_rel]": _LOST_WAKE,
+    "saw = pool.wake.load(std::memory_order_acquire) != observed;  [acquire -> relaxed]": _LOST_WAKE,
+    "pool.spinning.fetch_sub(1, std::memory_order_seq_cst);  // out of the count before the wake is compared  [seq_cst -> acq_rel]": _LOST_WAKE,  # noqa: E501
+    "moved = pool.wake.load(std::memory_order_seq_cst) != observed;  [seq_cst -> acquire]": _LOST_WAKE,
+    "pool.live.fetch_sub(1, std::memory_order_seq_cst);  [seq_cst -> acq_rel]": _LOST_WAKE,
+    "if (pool.wake.load(std::memory_order_seq_cst) != observed) {  [seq_cst -> acquire]": _LOST_WAKE,
+    "holding.observed = pool.wake.load(std::memory_order_acquire);  [acquire -> relaxed]": _LOST_WAKE,
+}
+
+
+def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
+    # one harness against the header under `root`: whether it passed, the
+    # executions it explored, and the first line saying why it didn't
+    try:
+        done = subprocess.run(
+            [
+                "/opt/genmc/bin/genmc",
+                "--rc11",
+                "--check-liveness",
+                "--disable-estimation",
+                "--",
+                "-std=c++17",
+                "-ffp-contract=off",
+                "-DTRIMKIT_GENMC",
+                f"-I{root}",
+                str(ROOT / "verify" / "genmc" / f"{harness}.cpp"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GENMC_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, 0, f"no answer in {GENMC_SECONDS} s"
+    found = re.search(r"complete executions explored: (\d+)", done.stdout)
+    why = next(
+        (line for line in done.stdout.splitlines() if re.search(r"Error|FAILURE|violation|race", line)),
+        done.stderr.strip().splitlines()[-1] if done.returncode != 0 and done.stderr.strip() else "",
+    )
+    return done.returncode == 0, int(found.group(1)) if found else 0, why
+
+
+def _weakened(source: str) -> list[tuple[str, str]]:
+    # every non-relaxed memory order in `source`, weakened one step, as (the
+    # line it is on, the source with only it weakened): seq_cst to what its
+    # operation can take below it, acq_rel to acquire and to release, and
+    # acquire and release to relaxed
+    mutants = []
+    traced = re.search(r"#if defined\(TRIMKIT_TRACE\)\nclass TraceStep.*?#else", source, re.S)
+    for found in re.finditer(r"std::memory_order_(seq_cst|acq_rel|acquire|release)\b", source):
+        if traced and traced.start() <= found.start() < traced.end():
+            continue  # a traced build's lock, which GenMC never builds
+        order = found.group(1)
+        line = source[source.rfind("\n", 0, found.start()) + 1 : source.find("\n", found.end())].strip()
+        operation = re.findall(r"\.(\w+)\(", source[max(0, found.start() - 300) : found.start()])
+        operation = operation[-1] if operation else ""
+        if order == "seq_cst":
+            weaker = {"load": ["acquire"], "store": ["release"]}.get(operation, ["acq_rel"])
+        elif order == "acq_rel":
+            weaker = ["acquire", "release"]
+        else:
+            weaker = ["relaxed"]
+        for to in weaker:
+            mutated = source[: found.start()] + f"std::memory_order_{to}" + source[found.end() :]
+            mutants.append((f"{line}  [{order} -> {to}]", mutated))
+    return mutants
+
+
+def cmd_genmc(args) -> None:
+    """
+    Every harness in verify/genmc on src/parallel.hpp as it is, then on each
+    mutant of it, one memory order weakened by one step: each mutant must
+    fail some harness, unless GENMC_MUTANTS_SURVIVING says why it may not.
+    """
+    found = sorted(p.stem for p in (ROOT / "verify" / "genmc").glob("*.cpp"))
+    if found != sorted(GENMC_HARNESSES):
+        sys.exit(f"verify/genmc has {found}, GENMC_HARNESSES lists {sorted(GENMC_HARNESSES)}")
+    workers = len(os.sched_getaffinity(0))
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        ran = pool.map(lambda h: _genmc(ROOT / "src", h), GENMC_HARNESSES)
+        results = dict(zip(GENMC_HARNESSES, ran, strict=True))
+    for harness, (passed, executions, why) in results.items():
+        floor = GENMC_HARNESSES[harness]
+        verdict = "pass" if passed and executions >= floor else "FAIL"
+        print(f"  {verdict}  {harness:<14} {executions:>7} executions (floor {floor}) {why}")
+        if not passed:
+            failed.append(f"{harness}: {why}")
+        elif executions < floor:
+            failed.append(f"{harness}: {executions} executions, under its floor of {floor}")
+    if failed:
+        sys.exit("GenMC found:\n  " + "\n  ".join(failed))
+    # fastest first, so most mutants are caught after a few seconds
+    order = sorted(GENMC_HARNESSES, key=lambda h: results[h][1])
+    source = (ROOT / "src" / "parallel.hpp").read_text()
+    mutants = _weakened(source)
+
+    def survives(mutant: tuple[str, str]) -> str | None:
+        line, mutated = mutant
+        with tempfile.TemporaryDirectory() as scratch:
+            shutil.copy(ROOT / "src" / "platform.hpp", scratch)
+            (Path(scratch) / "parallel.hpp").write_text(mutated)
+            for harness in order:
+                if not _genmc(Path(scratch), harness)[0]:
+                    return None
+        return line
+
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        surviving = [line for line in pool.map(survives, mutants) if line is not None]
+    print(f"  {len(mutants) - len(surviving)} of {len(mutants)} weakened memory orders caught")
+    unexplained = [line for line in surviving if line not in GENMC_MUTANTS_SURVIVING]
+    stale = [line for line in GENMC_MUTANTS_SURVIVING if line not in surviving]
+    for line in surviving:
+        print(f"  survives: {line}\n            {GENMC_MUTANTS_SURVIVING.get(line, 'UNEXPLAINED')}")
+    if unexplained or stale:
+        sys.exit(
+            "every weakened memory order must fail a harness, or be explained in GENMC_MUTANTS_SURVIVING:\n  "
+            + "\n  ".join(
+                [f"survives, unexplained: {line}" for line in unexplained]
+                + [f"explained, but caught now (remove it): {line}" for line in stale]
+            )
+        )
+
+
+# verify/tla/Scheduler.tla, the pool's protocol, checked by TLC in every
+# interleaving of each scenario: its constants over MODEL_BASE's, and the
+# fewest distinct states it must reach, so a scenario that stops exploring
+# fails. Then each mutation breaks one guard of the C++ in the model, and TLC
+# must find the property it names broken in its scenario
+MODEL_BASE = {
+    "Callers": 1, "Calls": 2, "Cap": 1, "NSlots": 2, "Items": 2, "ThrowAt": 0, "NestAt": 0,
+    "Interrupt": False, "SpawnFails": False, "IdleExit": False, "Fork": False, "ThreadEnds": False,
+    "AtExit": False,
+}  # fmt: skip
+MODEL_SCENARIOS = {
+    "two sequential calls": ({}, 110_000),
+    "two workers": ({"Calls": 1, "Cap": 2}, 130_000),
+    "an item fails": ({"Calls": 1, "ThrowAt": 1}, 1_600),
+    "ctrl-c": ({"Calls": 1, "Interrupt": True}, 1_500),
+    "thread creation fails": ({"Calls": 1, "Cap": 2, "SpawnFails": True}, 130_000),
+    "workers exit idle, then start again": ({"IdleExit": True}, 300_000),
+    "a thread ends in a body": ({"Calls": 1, "Cap": 2, "ThreadEnds": True}, 370_000),
+    "fork": ({"Calls": 1, "Cap": 2, "Fork": True}, 390_000),
+    "the interpreter exits": ({"Calls": 1, "AtExit": True}, 3_400),
+    "a nested call": ({"Calls": 1, "NestAt": 1}, 70_000),
+    "two callers, one slot": ({"Callers": 2, "Calls": 1, "NSlots": 1}, 390_000),
+    "two callers, two slots": ({"Callers": 2, "Calls": 1}, 2_000_000),
+}
+MODEL_MUTATIONS = {
+    "join_ignores_open": ("S1|SlotWord", {"Calls": 1}),
+    "close_without_waiting": ("S1|L1|R", {"Calls": 1}),
+    "publish_keeps_epoch": ("E", {}),
+    "claim_load_then_store": ("S2", {"Calls": 1, "Cap": 2}),
+    "park_ignores_wake": ("P1", {}),
+    "wake_reads_spinning_first": ("P1", {}),
+    "end_without_leaving": ("L1", {"Calls": 1, "ThreadEnds": True}),
+    "wait_checks_count_first": ("L1", {"Calls": 1}),
+    "wait_ignores_epoch": ("L1", {"Callers": 2, "Calls": 1, "NSlots": 1}),
+    "exit_without_recheck": ("P2", {"IdleExit": True}),
+    "wake_counts_live_first": ("P2", {"IdleExit": True}),
+    "fork_ignores_workers": ("R", {"Calls": 1, "Fork": True}),
+    "fork_keeps_slots": ("L1", {"Calls": 1, "Fork": True}),
+    "fork_keeps_held_epoch": ("R", {"Calls": 1, "Cap": 2, "Fork": True}),
+    "claims_ignore_exit": ("X", {"Calls": 1, "AtExit": True}),
+}
+MODEL_PROPERTIES = ["S1", "S2", "S3", "P1", "P2", "R", "X", "E"]
+# no run of TLC takes this long but one that can't end: a model whose state
+# space has no bound (a mutation that bumps the wake for ever) fails here
+MODEL_SECONDS = 3600
+# The code held to the model (verify/tla/SchedulerTrace.tla): a traced build of
+# src/parallel.hpp (verify/tla/trace.cpp) runs real calls on the real pool,
+# round after round, at the container's own cores, and TLC must find that the
+# model allows every step of each log. Then each of these reorderings of the
+# C++ (one step moved, or dropped) must make some round's log one the model
+# doesn't allow: so the replay is shown able to tell
+TRACE_ROUNDS = 8
+TRACE_CALLERS, TRACE_CALLS, TRACE_ITEMS = 2, 4, 32
+TRACE_MUTANTS = {
+    # the spinning count read before the wake's bump: a spinner can miss it
+    "wake_reads_spinning_first": (
+        """    {
+        const TraceStep step("CallerWake");
+        pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
+    }
+    std::uint32_t spinning = 0;
+    {
+        const TraceStep step("CallerWakeSpinning");
+        spinning = pool.spinning.load(std::memory_order_seq_cst);
+    }
+""",
+        """    std::uint32_t spinning = 0;
+    {
+        const TraceStep step("CallerWakeSpinning");
+        spinning = pool.spinning.load(std::memory_order_seq_cst);
+    }
+    {
+        const TraceStep step("CallerWake");
+        pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
+    }
+""",
+    ),
+    # no second look after reading `left`: the last leave can slip between
+    "wait_skips_recheck": (
+        """        {
+            const TraceStep step("CallerCloseRecheck");
+            if (workers_gone(slot, epoch)) {
+                return;
+            }
+        }
+""",
+        "",
+    ),
+    # `left` bumped before the worker is out of the count
+    "leave_bumps_first": (
+        """    SlotWord before;
+    {
+        const TraceStep step("WorkerLeave");""",
+        """    {
+        const TraceStep bump("WorkerLeaveBump");
+        slot.left.fetch_add(1, std::memory_order_relaxed);
+    }
+    SlotWord before;
+    {
+        const TraceStep step("WorkerLeave");""",
+    ),
+}
+
+
+def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, str, dict[str, int]]:
+    # TLC on one configuration: the distinct states it found, the property it
+    # found broken ("" when none was), and how often each step's action was
+    # taken (from TLC's coverage of each arm of Step)
+    values = {**MODEL_BASE, **constants, "Mutation": mutation}
+    lines = [f"    {key} = {str(value).upper() if isinstance(value, bool) else value}"
+             for key, value in values.items() if key != "Mutation"]  # fmt: skip
+    # each in its own directory, as TLC writes files beside the spec when it
+    # finds something broken
+    here = spec / re.sub(r"[^a-z0-9]+", "_", name)
+    here.mkdir()
+    for module in ("Scheduler.tla", "SlotWordTable.tla"):
+        shutil.copy(spec / module, here)
+    config = here / "run.cfg"
+    config.write_text(
+        "SPECIFICATION Spec\nCONSTANTS\n" + "\n".join(lines) + f'\n    Mutation = "{mutation}"\n'
+        f"INVARIANTS {' '.join(MODEL_PROPERTIES)}\nPROPERTIES L1\n"
+    )
+    try:
+        done = subprocess.run(
+            [tool("java"), "-Xss64m", "-XX:+UseParallelGC", "-cp", "/opt/tla2tools.jar", "tlc2.TLC",
+             "-deadlock", "-workers", "1", "-coverage", "100000", "-metadir", str(here / "states"),
+             "-config", config.name, "Scheduler.tla"],
+            cwd=here, capture_output=True, text=True, check=False, timeout=MODEL_SECONDS,
+        )  # fmt: skip
+    except subprocess.TimeoutExpired:
+        return 0, f"TLC failed: no answer in {MODEL_SECONDS} s", {}
+    finally:
+        shutil.rmtree(here / "states", ignore_errors=True)  # gigabytes, for the biggest
+    (here / "tlc.log").write_text(done.stdout + done.stderr)
+    found = re.findall(r"([\d,]+) distinct states found", done.stdout)  # the last: the whole run's
+    states = int(found[-1].replace(",", "")) if found else 0
+    taken = {}
+    for number, text in enumerate((spec / "Scheduler.tla").read_text().splitlines(), 1):
+        arm = re.search(r"-> ((?:Caller|Worker)\w+)\(t, f\)", text)
+        if arm:
+            column = arm.end(1) + 2  # TLC counts an arm by its first argument, `t`
+            at = rf"line {number}, col {column} to line \d+, col \d+ of module Scheduler: (\d+)"
+            counts = re.findall(at, done.stdout)
+            taken[arm.group(1)] = max((int(c) for c in counts), default=0)
+    broken = re.search(r"Invariant (\w+) is violated|Temporal properties were (violated)", done.stdout)
+    if broken:
+        return states, broken.group(1) or "L1", taken
+    # a step outside a transition's precondition: outside SlotWordTable's domain
+    if "Attempted to apply function" in done.stdout:
+        return states, "SlotWord", taken
+    if done.returncode != 0 or "No error has been found" not in done.stdout:
+        error = [line for line in done.stdout.splitlines() if "rror" in line]
+        why = error[0] if error else done.stdout[-300:]
+        return states, f"TLC failed ({here / 'tlc.log'}): {why}", taken
+    return states, "", taken
+
+
+def _traces(spec: Path, src: Path, name: str) -> list[tuple[Path, dict]]:
+    # the traced driver built on the header in `src`, then TRACE_ROUNDS logs
+    # of it, each with the constants the model replays it with
+    here = spec / f"trace_{name}"
+    here.mkdir()
+    driver = here / "trace"
+    run(tool("clang++"), "-std=c++20", "-O1", "-pthread", f"-I{src}", ROOT / "verify" / "tla" / "trace.cpp",
+        "-o", driver)  # fmt: skip
+    logs = []
+    for round_ in range(TRACE_ROUNDS):
+        log = here / f"round{round_}" / "TraceLog.tla"
+        log.parent.mkdir()
+        printed = run(driver, TRACE_CALLERS, TRACE_CALLS, TRACE_ITEMS, round_, log, capture=True)
+        constants = {key: int(value) for key, value in re.findall(r"^(\w+) = (\d+)$", printed, re.M)}
+        logs.append((log, constants))
+    return logs
+
+
+def _replay(spec: Path, log: Path, constants: dict) -> tuple[bool, int, int]:
+    # TLC walking the model along one log: whether it reached the end, how
+    # many records it matched, and how many there were
+    here = log.parent
+    for module in ("Scheduler.tla", "SchedulerTrace.tla", "SlotWordTable.tla"):
+        shutil.copy(spec / module, here)
+    values = {**MODEL_BASE, "IdleExit": True, **{k: v for k, v in constants.items() if k != "records"}}
+    lines = [
+        f"    {key} = {str(value).upper() if isinstance(value, bool) else value}"
+        for key, value in values.items()
+    ]
+    (here / "replay.cfg").write_text(
+        "SPECIFICATION TraceSpec\nCONSTANTS\n"
+        + "\n".join(lines)
+        + '\n    Mutation = "none"\nINVARIANT Unmatched\n'
+    )
+    done = subprocess.run(
+        [tool("java"), "-Xss64m", "-XX:+UseParallelGC", "-cp", "/opt/tla2tools.jar", "tlc2.TLC", "-deadlock",
+         "-workers", "1", "-metadir", str(here / "states"), "-config", "replay.cfg", "SchedulerTrace.tla"],
+        cwd=here, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    (here / "tlc.log").write_text(done.stdout + done.stderr)
+    matched = [int(n) for n in re.findall(r'<<"matched", (\d+)>>', done.stdout)]
+    return (
+        "Invariant Unmatched is violated" in done.stdout,
+        max(matched, default=0),
+        constants.get("records", 0),
+    )
+
+
+def cmd_model(args) -> None:
+    """
+    TLC on verify/tla/Scheduler.tla, its slot word arithmetic generated from
+    the C++ first (verify/tla/slot_word_table.cpp): every scenario must pass
+    and reach its floor of states, and every mutation must break the property
+    it names.
+    """
+    spec = args.root / "model"
+    shutil.rmtree(spec, ignore_errors=True)
+    spec.mkdir(parents=True)
+    shutil.copy(ROOT / "verify" / "tla" / "Scheduler.tla", spec)
+    shutil.copy(ROOT / "verify" / "tla" / "SchedulerTrace.tla", spec)
+    table = spec / "slot_word_table"
+    run(tool("clang++"), "-std=c++20", "-O1", ROOT / "verify" / "tla" / "slot_word_table.cpp", "-o", table)
+    (spec / "SlotWordTable.tla").write_text(run(table, capture=True))
+    failed = []
+    traced = _traces(spec, ROOT / "src", "code")
+    mutants = {}
+    for name, (old, new) in TRACE_MUTANTS.items():
+        source = (ROOT / "src" / "parallel.hpp").read_text()
+        if source.count(old) != 1:
+            failed.append(f"trace mutant {name} no longer applies to src/parallel.hpp")
+            continue
+        mutated = spec / f"src_{name}"
+        mutated.mkdir()
+        for header in (ROOT / "src").glob("*.hpp"):
+            shutil.copy(header, mutated)
+        (mutated / "parallel.hpp").write_text(source.replace(old, new))
+        mutants[name] = mutated
+    with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
+        replays = {log: pool.submit(_replay, spec, log, constants) for log, constants in traced}
+        mutant_replays = {
+            name: [pool.submit(_replay, spec, log, constants) for log, constants in _traces(spec, src, name)]
+            for name, src in mutants.items()
+        }
+        scenarios = {
+            name: pool.submit(_tlc, spec, name, constants, "none")
+            for name, (constants, _) in MODEL_SCENARIOS.items()
+        }
+        mutations = {
+            name: pool.submit(_tlc, spec, f"mutation {name}", constants, name)
+            for name, (_, constants) in MODEL_MUTATIONS.items()
+        }
+        taken: dict[str, int] = {}
+        for name, (_, floor) in MODEL_SCENARIOS.items():
+            states, broken, counts = scenarios[name].result()
+            for action, count in counts.items():
+                taken[action] = taken.get(action, 0) + count
+            verdict = "pass" if not broken and states >= floor else "FAIL"
+            print(f"  {verdict}  {name:<38} {states:>9} states (floor {floor}) {broken}", flush=True)
+            if broken:
+                failed.append(f"{name}: {broken}")
+            elif states < floor:
+                failed.append(f"{name}: {states} states, under its floor of {floor}")
+        actions: dict[str, int] = {}
+        for log, replay in replays.items():
+            accepted, matched, records = replay.result()
+            for action in re.findall(r'action \|-> "(\w+)"', log.read_text()):
+                actions[action] = actions.get(action, 0) + 1
+            verdict = "pass" if accepted else "FAIL"
+            print(
+                f"  {verdict}  the code's trace {log.parent.name:<26} {records:>6} steps, {matched} matched"
+            )
+            if not accepted:
+                failed.append(f"the code took a step the model doesn't allow: {log}, record {matched + 1}")
+        print("  steps traced: " + ", ".join(f"{a} {n}" for a, n in sorted(actions.items())), flush=True)
+        for name, runs in mutant_replays.items():
+            outcomes = [run.result() for run in runs]
+            rejected = sum(1 for accepted, _, _ in outcomes if not accepted)
+            verdict = "pass" if rejected else "FAIL"
+            print(f"  {verdict}  trace mutant {name:<26} rejected in {rejected} of {len(outcomes)} rounds")
+            if not rejected:
+                failed.append(f"trace mutant {name}: every round's log was one the model allows")
+        # a step no scenario takes is one no scenario checks
+        mutation_only = {"CallerClaimStore", "WorkerClaimStore"}  # claim_load_then_store's
+        never = sorted(a for a, count in taken.items() if count == 0 and a not in mutation_only)
+        if not taken or never:
+            failed.append("no scenario takes " + (", ".join(never) or "any step: coverage unread"))
+        for name, (expected, _) in MODEL_MUTATIONS.items():
+            states, broken, _ = mutations[name].result()
+            caught = bool(re.fullmatch(expected, broken))
+            verdict = "pass" if caught else "FAIL"
+            print(f"  {verdict}  mutation {name:<29} broke {broken or 'nothing'}", flush=True)
+            if not caught:
+                failed.append(f"mutation {name}: expected {expected} broken, found {broken or 'nothing'}")
+    if failed:
+        sys.exit("the model found:\n  " + "\n  ".join(failed))
 
 
 def cmd_static(args) -> None:
@@ -731,6 +1457,7 @@ def cmd_static(args) -> None:
         cmd_stubs,
         cmd_audit,
         cmd_tidy,
+        cmd_threads,
     ):
         command(args)
 
@@ -796,6 +1523,15 @@ def cmd_fetch(args) -> None:
     held = vendor.fetch(args.names, args.latest)
     if held:
         sys.exit("patches that no longer apply, their upstreams left as they were:\n  " + "\n  ".join(held))
+
+
+def cmd_patch(args) -> None:
+    # vendor/patches/ from the `//// TRIMKIT PATCH` blocks in vendor/ (default
+    # every upstream), each fetched back byte for byte (scripts/vendor.py)
+    try:
+        vendor.patch(args.names)
+    except ValueError as error:
+        sys.exit(str(error))
 
 
 def cmd_outdated(args) -> None:
@@ -893,7 +1629,7 @@ def cmd_generate(args) -> None:
 # the gate, which should take minutes after a small change: the distribution
 # packages (`distro --run`, two more builds and suites) are checked when the
 # packaging changes, and the sdist's own build (`sdist`) in release CI
-STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz"]
+STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz", "genmc", "model"]
 
 
 def cmd_check(args) -> None:
@@ -917,15 +1653,19 @@ def cmd_check(args) -> None:
 
 
 IMAGE = "trimkit-dev"
+# the dev image with the checkers built on it (GenMC and TLC), for the
+# `genmc` and `model` stages alone
+VERIFY_IMAGE = "trimkit-verify"
+VERIFIES = {"genmc", "model"}
 # every container of ours gets this many cores, the last ones, so a check
 # never takes over a shared machine: by affinity rather than a quota, so the
 # thread pool (which counts the cores it may run on) sizes itself to them
 CORES = 2
 
 
-def docker_cores() -> list[str]:
+def docker_cores(cores: int = CORES) -> list[str]:
     total = os.cpu_count() or 1
-    first = max(0, total - CORES)
+    first = max(0, total - cores)
     return ["--cpuset-cpus", f"{first}-{total - 1}"]
 
 
@@ -934,12 +1674,15 @@ def docker_cores() -> list[str]:
 # builds it, and `outdated` only asks the upstreams
 ON_HOST = {"check", "lock", "wheel", "image", "outdated", "distro"}
 SANITIZED = {"asan", "tsan", "fuzz"}
-WRITES_SOURCES = {"generate", "fetch", "update", "format"}
+WRITES_SOURCES = {"generate", "fetch", "patch", "update", "format"}
 
 
 def cmd_image(args) -> None:
     # docker's layer cache makes this quick unless the Dockerfile or lock changed
     run(tool("docker"), "build", "-q", "-f", ROOT / "docker" / "Dockerfile", "-t", IMAGE, ROOT, capture=True)
+    if getattr(args, "command", None) in VERIFIES:
+        verify = ROOT / "docker" / "Dockerfile.verify"
+        run(tool("docker"), "build", "-q", "-f", verify, "-t", VERIFY_IMAGE, ROOT / "docker", capture=True)
 
 
 def in_image(args) -> None:
@@ -953,6 +1696,10 @@ def in_image(args) -> None:
         forwarded += ["--seconds", str(args.seconds)]
     if args.command == "fetch":
         forwarded += [*args.names, *(["--latest"] if args.latest else [])]
+    if args.command == "patch":
+        forwarded += args.names
+    if args.command == "bench":
+        forwarded += ["--cores", str(args.cores)]
     builds = ROOT / "build" / "docker"
     builds.mkdir(parents=True, exist_ok=True)
     access = "rw" if args.command in WRITES_SOURCES else "ro"
@@ -965,7 +1712,7 @@ def in_image(args) -> None:
         "run",
         "--rm",
         "--init",
-        *docker_cores(),
+        *docker_cores(args.cores if args.command == "bench" else CORES),
         *seccomp,
         # Docker's default open-file limit is about 2**31, and sanitizers
         # close every descriptor up to it before starting llvm-symbolizer:
@@ -993,7 +1740,7 @@ def in_image(args) -> None:
         run(*docker, IMAGE, *inside, "build")
         # no swap to page out to, as the limit is what it's testing
         docker += ["--memory", "2g", "--memory-swap", "2g"]
-    run(*docker, IMAGE, *inside, *forwarded)
+    run(*docker, VERIFY_IMAGE if args.command in VERIFIES else IMAGE, *inside, *forwarded)
 
 
 def main() -> None:
@@ -1005,8 +1752,11 @@ def main() -> None:
     documented = {
         "check": "the gate: lint, tests, static checks, sanitizers and fuzzers",
         "lint": "the fast deterministic checks, nothing compiled",
+        "genmc": "model check src/parallel.hpp itself with GenMC, and its weakened memory orders",
+        "model": "check the pool's protocol in verify/tla with TLC, and that each mutation is caught",
         "fuzz": "every fuzzer, native then Atheris, --seconds each",
         "generate": "regenerate the shaders' SPIR-V, the stubs, the README API summary and tests/golden.json",
+        "patch": "write vendor/patches/ from the //// TRIMKIT PATCH blocks in vendor/",
         "update": "move every upstream and dependency to its newest",
         "format": "format our C++ with the pinned clang-format",
         "wheel": "this platform's release wheels",
@@ -1020,8 +1770,13 @@ def main() -> None:
             command.set_defaults(function=function)
             if name == "cmd_fuzz":
                 command.add_argument("--seconds", type=int, default=60)
-            if name == "cmd_fetch":
+            if name in ("cmd_fetch", "cmd_patch"):
                 command.add_argument("names", nargs="*")
+            if name == "cmd_bench":
+                command.add_argument(
+                    "--cores", type=int, default=BENCH_CORES, help="the last this many cores"
+                )
+            if name == "cmd_fetch":
                 command.add_argument("--latest", action="store_true", help="move each pin to its ref's HEAD")
             if name == "cmd_distro":
                 command.add_argument(

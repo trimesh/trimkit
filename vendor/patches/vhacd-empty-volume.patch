@@ -16,16 +16,18 @@ run under UBSan by `uv run scripts asan`), fuzz/vhacd.cpp.
 
 --- a/include/VHACD.h
 +++ b/include/VHACD.h
-@@ -5108,6 +5108,12 @@
+@@ -5108,6 +5108,14 @@
      m_bounds = BoundsAABB(points);
  
      VHACD::Vect3 d = m_bounds.GetSize();
++    //// TRIMKIT PATCH: fix.empty-volume
 +    // trimkit (vendor/patches/vhacd-empty-volume.patch): nothing left after welding
 +    // dropped every collapsed triangle is an empty volume, not 0 / 0 cast to size_t
 +    if (!(d.MaxCoeff() > 0.0))
 +    {
 +        return;
 +    }
++    //// TRIMKIT END PATCH
      double r;
      // Equal comparison is important here to avoid taking the last branch when d[0] == d[1] with d[2] being the smallest
      // dimension. That would lead to dimensions in i and j to be a lot bigger than expected and make the amount of
