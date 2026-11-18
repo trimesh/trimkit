@@ -4,14 +4,12 @@ CPU answering with a warning when no device can.
 """
 
 import os
-import subprocess
-import sys
 import textwrap
 import threading
 
 import numpy as np
 import pytest
-from helpers import box, camera, cycloidal, device_scene, exploded, same, sphere, subdivided
+from helpers import box, camera, cycloidal, device_scene, exploded, run_python, same, sphere, subdivided
 
 import trimkit
 
@@ -566,11 +564,11 @@ def test_threads_never_deadlock_on_the_device(device_required):
         print("ok")
         """
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script, os.path.dirname(__file__)],
-        capture_output=True,
+    result = run_python(
+        "-c",
+        script,
+        os.path.dirname(__file__),
         text=True,
-        check=False,
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -615,12 +613,12 @@ def test_without_a_device_the_cpu_answers_with_a_warning():
         """
     )
     env = {**os.environ, "VK_ICD_FILENAMES": os.devnull, "VK_DRIVER_FILES": os.devnull}
-    result = subprocess.run(
-        [sys.executable, "-c", script, os.path.dirname(__file__)],
+    result = run_python(
+        "-c",
+        script,
+        os.path.dirname(__file__),
         env=env,
-        capture_output=True,
         text=True,
-        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "ok"
@@ -691,11 +689,11 @@ def test_fork_while_another_thread_holds_the_device(device_required):
         print(b"".join(answers).decode())
         """
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script, os.path.dirname(__file__)],
-        capture_output=True,
+    result = run_python(
+        "-c",
+        script,
+        os.path.dirname(__file__),
         text=True,
-        check=False,
         timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr

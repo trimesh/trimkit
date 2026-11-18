@@ -134,6 +134,9 @@ markers = [
     "device: needs a Vulkan device computing in double precision, else skips (see check/tests/conftest.py)",
 ]
 xfail_strict = true
+# a test this slow is hung: dump every thread's stack (and keep running), so
+# CI shows where before its own timeout kills the job
+faulthandler_timeout = 900
 filterwarnings = ["error"]
 
 [tool.ruff]

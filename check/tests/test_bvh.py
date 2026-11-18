@@ -1,6 +1,4 @@
 import gc
-import subprocess
-import sys
 import textwrap
 import warnings
 from fractions import Fraction
@@ -8,7 +6,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import box, check_boxes, first_hits, flatten, heap_in_use, ray_scene, same, sphere, transform
+from helpers import (
+    box,
+    check_boxes,
+    first_hits,
+    flatten,
+    heap_in_use,
+    ray_scene,
+    run_python,
+    same,
+    sphere,
+    transform,
+)
 
 import trimkit
 
@@ -539,8 +548,11 @@ def test_no_leaks_and_shared_meshes():
         """
     )
     tests = str(Path(__file__).parent)
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, cwd=tests, check=False
+    result = run_python(
+        "-c",
+        code,
+        text=True,
+        cwd=tests,
     )
     assert result.returncode == 0, result.stderr
     assert "leaked" not in result.stderr, result.stderr

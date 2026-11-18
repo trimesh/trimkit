@@ -19,7 +19,6 @@ import pathlib
 import pickle
 import select
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -39,6 +38,7 @@ from helpers import (
     leaves,
     longest_gil_stall,
     public_api,
+    run_python,
     runs_here,
     small_calls,
     sphere,
@@ -483,9 +483,12 @@ def _held_by_every_call() -> dict[str, int]:
             return False
         return True
 
-    done = subprocess.run(
-        [sys.executable, "-W", "ignore", "-c", script, *filter(runs, API)],
-        capture_output=True,
+    done = run_python(
+        "-W",
+        "ignore",
+        "-c",
+        script,
+        *filter(runs, API),
         text=True,
         env=environment,
         check=True,
@@ -907,10 +910,12 @@ def test_one_core_matches_every_core():
     # same bytes: each item's output depends on that item alone
     tests = str(pathlib.Path(__file__).parent)
     digests = {
-        cores: subprocess.run(
-            [sys.executable, "-c", _PARALLEL_QUERIES, cores, tests],
+        cores: run_python(
+            "-c",
+            _PARALLEL_QUERIES,
+            cores,
+            tests,
             check=True,
-            capture_output=True,
             text=True,
         ).stdout
         for cores in ("one", "every")

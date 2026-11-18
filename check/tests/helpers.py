@@ -5,7 +5,10 @@ Small numpy-only fixtures and predicates shared by the tests.
 import ctypes
 import functools
 import math
+import os
+import signal
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -19,6 +22,38 @@ import pytest
 # it copies raw bytes): test_invariants asserts that, and everything else
 # skips draco there, saying so
 LITTLE_ENDIAN = sys.byteorder == "little"
+
+
+def run_python(
+    *args: str, timeout: float = 600, check: bool = False, **options
+) -> subprocess.CompletedProcess:
+    """
+    `python *args` with its output captured, as subprocess.run would run it.
+    A child still running after `timeout` seconds gets SIGABRT first, so its
+    faulthandler (on in every child: conftest.py) prints every thread's stack,
+    and the test fails with that stderr: a hang says where it hung. `check`
+    fails the test with the stderr too, not only the exit code.
+    """
+    pipes = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    with subprocess.Popen([sys.executable, *args], **pipes, **options) as child:
+        try:
+            out, err = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                child.send_signal(signal.SIGABRT)
+            try:
+                out, err = child.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                out, err = child.communicate()
+            pytest.fail(f"a child Python was still running after {timeout} s:\n{_tail(err)}")
+    if check and child.returncode != 0:
+        pytest.fail(f"a child Python exited with {child.returncode}:\n{_tail(err)}")
+    return subprocess.CompletedProcess(child.args, child.returncode, out, err)
+
+
+def _tail(output: str | bytes) -> str:
+    return (output if isinstance(output, str) else output.decode(errors="replace"))[-4000:]
 
 
 def heap_in_use() -> int | None:

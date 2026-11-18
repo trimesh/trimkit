@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import leaves, runs_here, small_calls
+from helpers import leaves, run_python, runs_here, small_calls
 
 CASES = small_calls()
 
@@ -180,7 +180,6 @@ def test_exit_while_a_daemon_thread_queries():
     # (3.12 and 3.13 unwind it on glibc, and end it without unwinding on musl
     # and Windows), so no worker is left inside a job on a vanished stack.
     # Each run must exit cleanly, never crash or hang
-    import subprocess
     import textwrap
 
     script = textwrap.dedent(
@@ -208,11 +207,11 @@ def test_exit_while_a_daemon_thread_queries():
     import time
 
     for _ in range(8):
-        done = subprocess.run(
-            [sys.executable, "-c", script, str(Path(__file__).parent)],
-            capture_output=True,
+        done = run_python(
+            "-c",
+            script,
+            str(Path(__file__).parent),
             timeout=60,
-            check=False,
         )
         exited = time.monotonic()
         assert done.returncode == 0, done.stderr.decode()[-2000:]
@@ -228,14 +227,11 @@ def test_fork_from_inside_a_query():
     # with its workers mid-range, and forks: in the child those workers are
     # gone with the items they held. The child's query must raise, never
     # return an answer missing them, and the child's pool must still answer
-    import subprocess
     import textwrap
 
     script = textwrap.dedent(
         """
-        import faulthandler, os, signal, sys, time
-        # a child that crashes says where, on the stderr it shares
-        faulthandler.enable()
+        import os, signal, sys, time
         import numpy as np
         sys.path.insert(0, sys.argv[1])
         from helpers import sphere
@@ -245,24 +241,32 @@ def test_fork_from_inside_a_query():
         origins, directions = np.random.default_rng(0).normal(size=(2, 2_000_000, 3))
         query = lambda: scene.intersect(origins, directions)
         same = lambda answer: all(a.tobytes() == b.tobytes() for a, b in zip(answer, expected, strict=True))
-        tic = time.perf_counter()
         expected = query()
+        # how long a warm query takes: the first starts the workers and faults
+        # its pages in, so a fraction of it can land after a warm one returned
+        tic = time.perf_counter()
+        query()
         took = time.perf_counter() - tic
-        child = []
+        forked, child = [], []
 
         def fork(signum, frame):
-            if os.fork() == 0:
-                child.append(True)
+            if not forked:
+                forked.append(True)
+                if os.fork() == 0:
+                    child.append(True)
 
         signal.signal(signal.SIGALRM, fork)
-        # within the query, past its first poll
-        signal.setitimer(signal.ITIMER_REAL, float(sys.argv[2]) * took)
+        # the first fork at this fraction of the query, past its first poll; the
+        # timer repeats, so one lands inside the query whatever this run's speed
+        signal.setitimer(signal.ITIMER_REAL, float(sys.argv[2]) * took, took / 20)
         try:
             outcome = "same" if same(query()) else "different"
         except RuntimeError:
             outcome = "raised"
+        signal.setitimer(signal.ITIMER_REAL, 0)
         if not child:
             # the parent: its answer is the answer, and the child exited cleanly
+            assert forked, "the timer never fired inside the query"
             assert outcome == "same", outcome
             _, status = os.wait()
             if status != 0:
@@ -275,11 +279,14 @@ def test_fork_from_inside_a_query():
     )
     outcomes = []
     for fraction in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6):
-        done = subprocess.run(
-            [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent), str(fraction)],
-            capture_output=True,
+        done = run_python(
+            "-W",
+            "ignore",
+            "-c",
+            script,
+            str(Path(__file__).parent),
+            str(fraction),
             timeout=120,
-            check=False,
         )
         assert done.returncode == 0, done.stderr.decode()[-2000:]
         outcome, again = done.stdout.decode().split()
@@ -297,7 +304,6 @@ def test_forked_child_exits_promptly():
     # child has none of the parent's calls, so its exit waits for none of
     # them (it once waited out the whole drain limit for a call that
     # existed only in the parent)
-    import subprocess
     import textwrap
 
     script = textwrap.dedent(
@@ -336,12 +342,14 @@ def test_forked_child_exits_promptly():
         print(f"{slowest:.3f}")
         """
     )
-    done = subprocess.run(
-        [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent)],
-        capture_output=True,
+    done = run_python(
+        "-W",
+        "ignore",
+        "-c",
+        script,
+        str(Path(__file__).parent),
         text=True,
         timeout=120,
-        check=False,
     )
     assert done.returncode == 0, done.stderr[-2000:]
     assert float(done.stdout.split()[-1]) < 2.0, f"a forked child took {done.stdout.split()[-1]} s to exit"
@@ -353,7 +361,6 @@ def test_workers_follow_affinity_as_it_widens():
     # may use more CPUs, the next big call after the pool reads them again
     # starts workers for them (the worker count was once fixed at whatever the
     # first call saw)
-    import subprocess
     import textwrap
 
     if len(__import__("os").sched_getaffinity(0)) < 2:
@@ -380,12 +387,14 @@ def test_workers_follow_affinity_as_it_widens():
         print(alone, len(os.listdir("/proc/self/task")))
         """
     )
-    done = subprocess.run(
-        [sys.executable, "-W", "ignore", "-c", script, str(Path(__file__).parent)],
-        capture_output=True,
+    done = run_python(
+        "-W",
+        "ignore",
+        "-c",
+        script,
+        str(Path(__file__).parent),
         text=True,
         timeout=120,
-        check=False,
     )
     assert done.returncode == 0, done.stderr[-2000:]
     alone, widened = map(int, done.stdout.split())
