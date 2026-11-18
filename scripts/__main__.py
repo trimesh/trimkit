@@ -364,12 +364,63 @@ def cmd_fuzz(args) -> None:
         # last job ran out of memory, even with those ignored: a crash is 77
         ignored_oom = name == "draco" and report.endswith(f"{name}: exit 71")
         failed |= "exit " in report and not ignored_oom
+    # the pool's harness must fail on each bug planted for it
+    failed |= not planted_bugs_fuzzed(args.root, corpus / "parallel")
     # the header-only harnesses again as 32-bit programs, over that corpus
     failed |= not replay_32bit(args.root, corpus, findings)
     # then the bindings, whatever the harnesses found
     atheris(args)
     if failed:
         sys.exit(f"fuzzing found something: see {findings}")
+
+
+# how long check/fuzz/parallel.cpp gets to fail on a planted bug: its fixed
+# checks, then inputs. Most fail in the first second; one that hangs (a wake
+# that never comes) takes all of it
+PLANTED_SECONDS = 30
+
+
+def planted_bugs_fuzzed(root: Path, corpus: Path) -> bool:
+    """
+    check/fuzz/parallel.cpp, built on src/parallel.hpp with each bug planted
+    for the fuzzer (CODE_MUTANTS), must crash or hang on it: so the harness
+    is shown able to fail on the real code. Returns whether every one did.
+    """
+
+    def caught(planted: tuple[str, str]) -> tuple[str, bool]:
+        name, source = planted
+        here = root / "fuzz" / "planted" / name
+        shutil.rmtree(here, ignore_errors=True)
+        (here / "src").mkdir(parents=True)
+        (here / "check" / "fuzz").mkdir(parents=True)
+        for header in (ROOT / "src").glob("*.hpp"):
+            shutil.copy(header, here / "src")
+        (here / "src" / "parallel.hpp").write_text(source)
+        shutil.copy(CHECK / "fuzz" / "parallel.cpp", here / "check" / "fuzz")
+        shutil.copytree(corpus, here / "corpus")
+        binary = here / "fuzz_parallel"
+        subprocess.run(
+            [tool("clang++"), "-std=c++20", "-O1", "-g", "-pthread", "-fsanitize=fuzzer,address,undefined",
+             "-fno-sanitize-recover=all", "-DTRIMKIT_CHECKED", str(here / "check" / "fuzz" / "parallel.cpp"),
+             "-o", str(binary)],
+            check=True, capture_output=True,
+        )  # fmt: skip
+        try:
+            done = subprocess.run(
+                [*no_aslr(), str(binary), str(here / "corpus"), f"-max_total_time={PLANTED_SECONDS}",
+                 "-timeout=10", f"-artifact_prefix={here}/"],
+                cwd=here, capture_output=True, check=False, timeout=PLANTED_SECONDS + 30,
+            )  # fmt: skip
+        except subprocess.TimeoutExpired:
+            return name, True  # hung in a fixed check, before libFuzzer's own timeout applies
+        return name, done.returncode != 0
+
+    planted = code_mutants("fuzz")
+    with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
+        results = list(pool.map(caught, planted.items()))
+    for name, found in results:
+        print(f"  {'pass' if found else 'FAIL'}  planted bug {name}", flush=True)
+    return all(found for _, found in results)
 
 
 def replay_32bit(root: Path, corpus: Path, findings: Path) -> bool:
@@ -1026,10 +1077,10 @@ def cmd_bench(args) -> None:
 # 170 million executions, so those are check/verify/tla's, the fuzzer's and TSan's
 GENMC_HARNESSES = {
     "visibility": 40,
-    "early_worker": 32000,
+    "early_worker": 20000,
     "failure": 290,
     "stop": 560,
-    "exit_stop": 660,
+    "exit_stop": 240,
     "thread_index": 260,
     "exclusively": 2,
     "chunk_list": 5,
@@ -1039,23 +1090,25 @@ GENMC_SECONDS = 1200
 # the memory orders in src/parallel.hpp that may be weakened by one step with
 # no harness failing, each with why it is still as strong as it is: keyed by
 # the line's code, so a moved or edited line is looked at again
+# No entry may rest on the model alone, which assumes sequentially consistent
+# memory: each says what does check the code, or that nothing does
 _LOST_WAKE = (
-    "keeps a wake from being lost (the wake, spinning and live counts' pairings): GenMC's waits return at"
-    " once, so a lost wake can't show there; check/verify/tla checks the pairings (P1, P2), which these"
-    " orders make sequentially consistent"
+    "keeps a wake from being lost (the wake, spinning and live counts' pairings). Argued only under weak"
+    " memory: GenMC's waits return at once, so it can't see a lost wake. On real threads the fuzzer does"
+    " (a caller with no Stop waits with no timeout, and its fixed check counts sleepers woken), on x86 alone"
 )
 _LEFT = (
     "orders a worker's leave before its bump of `left`, so a caller that sees the bump sees the leave and"
-    " doesn't sleep on it: a stall, never a wrong answer, which GenMC's waits (they return at once)"
-    " can't show"
+    " doesn't sleep on it. Argued only under weak memory, as GenMC's waits return at once; on real threads"
+    " the fuzzer's callers wait with no timeout, so sleeping through the last leave hangs it, on x86 alone"
 )
 _TWO_HOLDERS = (
     "orders one holder of a thread index before the next, which are two workers' lifetimes: no harness of one"
-    " call reaches that (check/verify/tla's S3 checks the holders; TSan the scratch)"
+    " call reaches that. ThreadSanitizer checks the scratch they index (check/tests/test_threads.py)"
 )
 _TWO_JOBS = (
     "orders the last job's last leave before the next reservation of its slot: two jobs, which GenMC can't"
-    " reach here (some 170 million executions); check/verify/tla models the reuse"
+    " reach here (some 170 million executions). Argued only"
 )
 GENMC_MUTANTS_SURVIVING: dict[str, str] = {
     "if ((held_indexes[index / 64].fetch_or(bit, std::memory_order_acquire) & bit) == 0) {  [acquire -> relaxed]": _TWO_HOLDERS,  # noqa: E501
@@ -1091,6 +1144,7 @@ def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
                 "-std=c++17",
                 "-ffp-contract=off",
                 "-DTRIMKIT_GENMC",
+                "-DTRIMKIT_CHECKED",  # the header's own assertions, each a failure GenMC reports
                 f"-I{root}",
                 str(CHECK / "verify" / "genmc" / f"{harness}.cpp"),
             ],
@@ -1174,8 +1228,13 @@ def cmd_genmc(args) -> None:
                     return None
         return line
 
+    bugs = [(name, mutated) for name, mutated in code_mutants("genmc").items()]
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        uncaught = [name for name in pool.map(survives, bugs) if name is not None]
         surviving = [line for line in pool.map(survives, mutants) if line is not None]
+    print(f"  {len(bugs) - len(uncaught)} of {len(bugs)} planted bugs caught")
+    if uncaught:
+        sys.exit("GenMC passed src/parallel.hpp with a planted bug (CODE_MUTANTS): " + ", ".join(uncaught))
     print(f"  {len(mutants) - len(surviving)} of {len(mutants)} weakened memory orders caught")
     unexplained = [line for line in surviving if line not in GENMC_MUTANTS_SURVIVING]
     stale = [line for line in GENMC_MUTANTS_SURVIVING if line not in surviving]
@@ -1198,8 +1257,7 @@ def cmd_genmc(args) -> None:
 # must find the property it names broken in its scenario
 MODEL_BASE = {
     "Callers": 1, "Calls": 2, "Cap": 1, "NSlots": 2, "Items": 2, "ThrowAt": 0, "NestAt": 0,
-    "Interrupt": False, "SpawnFails": False, "IdleExit": False, "Fork": False, "ThreadEnds": False,
-    "AtExit": False,
+    "Interrupt": False, "SpawnFails": False, "IdleExit": False, "Fork": False, "AtExit": False,
 }  # fmt: skip
 MODEL_SCENARIOS = {
     "two sequential calls": ({}, 110_000),
@@ -1208,12 +1266,17 @@ MODEL_SCENARIOS = {
     "ctrl-c": ({"Calls": 1, "Interrupt": True}, 1_500),
     "thread creation fails": ({"Calls": 1, "Cap": 2, "SpawnFails": True}, 130_000),
     "workers exit idle, then start again": ({"IdleExit": True}, 300_000),
-    "a thread ends in a body": ({"Calls": 1, "Cap": 2, "ThreadEnds": True}, 370_000),
     "fork": ({"Calls": 1, "Cap": 2, "Fork": True}, 390_000),
     "the interpreter exits": ({"Calls": 1, "AtExit": True}, 3_400),
     "a nested call": ({"Calls": 1, "NestAt": 1}, 70_000),
     "two callers, one slot": ({"Callers": 2, "Calls": 1, "NSlots": 1}, 390_000),
     "two callers, two slots": ({"Callers": 2, "Calls": 1}, 2_000_000),
+    # features together: each alone passing says nothing of the pair
+    "fork at the exit": ({"Calls": 1, "Fork": True, "AtExit": True}, 7_000),
+    "fork in a nested call": ({"Calls": 1, "Fork": True, "NestAt": 1}, 270_000),
+    "fork with two callers": ({"Callers": 2, "Calls": 1, "NSlots": 1, "Fork": True}, 430_000),
+    "fork, a failure and ctrl-c": ({"Calls": 1, "Fork": True, "ThrowAt": 1, "Interrupt": True}, 3_000),
+    "the exit in a nested call": ({"Calls": 1, "AtExit": True, "NestAt": 1}, 240_000),
 }
 MODEL_MUTATIONS = {
     "join_ignores_open": ("S1|SlotWord", {"Calls": 1}),
@@ -1222,33 +1285,104 @@ MODEL_MUTATIONS = {
     "claim_load_then_store": ("S2", {"Calls": 1, "Cap": 2}),
     "park_ignores_wake": ("P1", {}),
     "wake_reads_spinning_first": ("P1", {}),
-    "end_without_leaving": ("L1", {"Calls": 1, "ThreadEnds": True}),
     "wait_checks_count_first": ("L1", {"Calls": 1}),
     "wait_ignores_epoch": ("L1", {"Callers": 2, "Calls": 1, "NSlots": 1}),
     "exit_without_recheck": ("P2", {"IdleExit": True}),
     "wake_counts_live_first": ("P2", {"IdleExit": True}),
-    "fork_ignores_workers": ("R", {"Calls": 1, "Fork": True}),
-    "fork_keeps_slots": ("L1", {"Calls": 1, "Fork": True}),
-    "fork_keeps_held_epoch": ("R", {"Calls": 1, "Cap": 2, "Fork": True}),
+    "fork_fails_nothing": ("R", {"Calls": 1, "Fork": True}),
+    "fork_keeps_slots": ("S1", {"Calls": 1, "Fork": True}),
+    "fork_closes_wiped_slot": ("SlotWord", {"Calls": 1, "Fork": True}),
     "claims_ignore_exit": ("X", {"Calls": 1, "AtExit": True}),
-    "spawn_chain_ignores_wanted": ("P3", {"Calls": 1, "Cap": 2}),
-    "spawn_ignores_live": ("P3", {"Cap": 2}),
 }
-MODEL_PROPERTIES = ["S1", "S2", "S3", "P1", "P2", "P3", "R", "X", "E"]
+MODEL_PROPERTIES = ["S1", "S2", "S3", "P1", "P2", "R", "X", "E"]
 # no run of TLC takes this long but one that can't end: a model whose state
 # space has no bound (a mutation that bumps the wake for ever) fails here
 MODEL_SECONDS = 3600
+
+
+def tlc_java(here: Path) -> list[str]:
+    # the JVM's options for one TLC, run in `here`. Its heap is bounded, as
+    # many run at once as the stage has cores; and its temporary directory is
+    # its own, as TLC unpacks its standard modules there under fixed names,
+    # and two unpacking at once into /tmp fail to parse them
+    (here / "tmp").mkdir(exist_ok=True)
+    return ["-Xss64m", "-Xmx3g", "-XX:+UseParallelGC", f"-Djava.io.tmpdir={here / 'tmp'}"]
+
+
 # The code held to the model (check/verify/tla/SchedulerTrace.tla): a traced build of
 # src/parallel.hpp (check/verify/tla/trace.cpp) runs real calls on the real pool,
-# round after round, at the container's own cores, and TLC must find that the
-# model allows every step of each log. Then each of these reorderings of the
-# C++ (one step moved, or dropped) must make some round's log one the model
-# doesn't allow: so the replay is shown able to tell
+# round after round, and TLC must find that the model allows every step of
+# each log. Then each bug planted for it (CODE_MUTANTS: a step moved, or
+# dropped) must make some round's log one the model doesn't allow: so the
+# replay is shown able to tell
 TRACE_ROUNDS = 8
 TRACE_CALLERS, TRACE_CALLS, TRACE_ITEMS = 2, 4, 32
-TRACE_MUTANTS = {
+# the cores the traced driver runs on, whatever the stage has: three workers,
+# so more than one joins, leaves and is woken at once
+TRACE_CORES = 4
+
+# Bugs planted in src/parallel.hpp, one at a time, each with the check that
+# must fail on it: "genmc" (a harness of check/verify/genmc), "trace" (some
+# round's log is one the model doesn't allow) or "fuzz" (check/fuzz/parallel.cpp
+# crashes or hangs). A check that passes a planted bug fails its stage, and so
+# does an edit that no longer applies: so each check is shown able to fail on
+# the real code, not only on the model. Not here, as nothing at code level
+# sees them (they cost speed, never an answer, and `bench` is what would
+# notice): an exiting worker that doesn't look at the wake again, a spawn
+# chain that stops early, and a caller's wait that ignores the epoch
+CODE_MUTANTS = {
+    "close_without_waiting": (
+        "genmc",
+        "            if (inside) {\n"
+        "                wait_for_workers(*slot_, job_, epoch_, poll);\n"
+        "            }\n",
+        "",
+    ),
+    "join_ignores_open": (
+        "genmc",
+        "while (SlotWord{word}.open() && SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
+        "while (SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
+    ),
+    "touch_job_after_leave": (
+        "genmc",
+        "                holding.leave();\n                job = nullptr;",
+        "                holding.leave();\n"
+        "                (void)job->stopped.load(std::memory_order_relaxed);\n"
+        "                job = nullptr;",
+    ),
+    "claim_load_then_store": (
+        "genmc",
+        "        job.next.fetch_add(take, std::memory_order_relaxed);"
+        "  // atomicity alone: each item claimed once (T2)",
+        "        job.next.load(std::memory_order_relaxed);\n"
+        "    job.next.store(first + take, std::memory_order_relaxed);",
+    ),
+    "open_before_store": (
+        "genmc",
+        """    {
+        const TraceStep step("CallerPublishStore");
+        reserved->job.store(&job, std::memory_order_relaxed);
+    }
+    const TraceStep step("CallerPublishOpen");
+    // release: pairs with join_job's acquire, publishing the job and its pointer
+    const SlotWord opened{reserved->word.fetch_or(SlotWord::OPEN, std::memory_order_release)};
+""",
+        """    const TraceStep step("CallerPublishOpen");
+    const SlotWord opened{reserved->word.fetch_or(SlotWord::OPEN, std::memory_order_release)};
+    reserved->job.store(&job, std::memory_order_relaxed);
+""",
+    ),
+    "exit_live_before_index": (
+        "genmc",
+        """                give_thread_index();
+                // out of the count before it reads the wake (pairs with wake_helpers)
+                pool.live.fetch_sub(1, std::memory_order_seq_cst);""",
+        """                pool.live.fetch_sub(1, std::memory_order_seq_cst);
+                give_thread_index();""",
+    ),
     # the spinning count read before the wake's bump: a spinner can miss it
     "wake_reads_spinning_first": (
+        "trace",
         """    {
         const TraceStep step("CallerWake");
         pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
@@ -1272,6 +1406,7 @@ TRACE_MUTANTS = {
     ),
     # no second look after reading `left`: the last leave can slip between
     "wait_skips_recheck": (
+        "trace",
         """        {
             const TraceStep step("CallerCloseRecheck");
             if (workers_gone(slot, epoch)) {
@@ -1283,6 +1418,7 @@ TRACE_MUTANTS = {
     ),
     # `left` bumped before the worker is out of the count
     "leave_bumps_first": (
+        "trace",
         """    SlotWord before;
     {
         const TraceStep step("WorkerLeave");""",
@@ -1294,7 +1430,53 @@ TRACE_MUTANTS = {
     {
         const TraceStep step("WorkerLeave");""",
     ),
+    # the last worker out tells no one: its caller sleeps for ever
+    "leave_never_bumps": (
+        "fuzz",
+        "        slot.left.fetch_add(1, std::memory_order_release);\n"
+        "        platform::wake_all(slot.left);\n",
+        "",
+    ),
+    "leave_never_wakes": ("fuzz", "        platform::wake_all(slot.left);\n", ""),
+    "never_wake_sleepers": (
+        "fuzz",
+        "const std::uint32_t woken = platform::wake_some(pool.wake, more - spinning);",
+        "const std::uint32_t woken = 0;",
+    ),
+    "failure_not_stopping": (
+        "fuzz",
+        "    job.stopped.store(true, std::memory_order_relaxed);\n"
+        "}\n\n// Items [begin, end) run on this thread",
+        "}\n\n// Items [begin, end) run on this thread",
+    ),
+    "fork_fails_nothing": (
+        "fuzz",
+        "        held->job->forked.store(true, std::memory_order_relaxed);\n",
+        "",
+    ),
+    "fork_closes_wiped_slot": (
+        "fuzz",
+        "        if (generation_ == platform::fork_generation()) {",
+        "        if (slot_ != nullptr) {",
+    ),
+    "exit_refusal_forgotten": (
+        "fuzz",
+        "        job.refused_at_exit.store(true, std::memory_order_relaxed);\n",
+        "",
+    ),
 }
+
+
+def code_mutants(checker: str) -> dict[str, str]:
+    # src/parallel.hpp with each of `checker`'s planted bugs, by name
+    source = (ROOT / "src" / "parallel.hpp").read_text()
+    mutated = {}
+    for name, (by, old, new) in CODE_MUTANTS.items():
+        if source.count(old) != 1:
+            sys.exit(f"CODE_MUTANTS: {name} no longer applies to src/parallel.hpp")
+        if by == checker:
+            mutated[name] = source.replace(old, new)
+    return mutated
 
 
 def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, str, dict[str, int]]:
@@ -1317,7 +1499,7 @@ def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, st
     )
     try:
         done = subprocess.run(
-            [tool("java"), "-Xss64m", "-XX:+UseParallelGC", "-cp", "/opt/tla2tools.jar", "tlc2.TLC",
+            [tool("java"), *tlc_java(here), "-cp", "/opt/tla2tools.jar", "tlc2.TLC",
              "-deadlock", "-workers", "1", "-coverage", "100000", "-metadir", str(here / "states"),
              "-config", config.name, "Scheduler.tla"],
             cwd=here, capture_output=True, text=True, check=False, timeout=MODEL_SECONDS,
@@ -1352,17 +1534,22 @@ def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, st
 
 def _traces(spec: Path, src: Path, name: str) -> list[tuple[Path, dict]]:
     # the traced driver built on the header in `src`, then TRACE_ROUNDS logs
-    # of it, each with the constants the model replays it with
+    # of it on TRACE_CORES cores, each with the constants the model replays
+    # it with
     here = spec / f"trace_{name}"
     here.mkdir()
     driver = here / "trace"
     run(tool("clang++"), "-std=c++20", "-O1", "-pthread", f"-I{src}", CHECK / "verify" / "tla" / "trace.cpp",
         "-o", driver)  # fmt: skip
+    cores = sorted(os.sched_getaffinity(0))[:TRACE_CORES]
     logs = []
     for round_ in range(TRACE_ROUNDS):
         log = here / f"round{round_}" / "TraceLog.tla"
         log.parent.mkdir()
-        printed = run(driver, TRACE_CALLERS, TRACE_CALLS, TRACE_ITEMS, round_, log, capture=True)
+        printed = subprocess.run(
+            [str(driver), str(TRACE_CALLERS), str(TRACE_CALLS), str(TRACE_ITEMS), str(round_), str(log)],
+            capture_output=True, text=True, check=True, preexec_fn=lambda: os.sched_setaffinity(0, cores),
+        ).stdout  # fmt: skip
         constants = {key: int(value) for key, value in re.findall(r"^(\w+) = (\d+)$", printed, re.M)}
         logs.append((log, constants))
     return logs
@@ -1370,11 +1557,14 @@ def _traces(spec: Path, src: Path, name: str) -> list[tuple[Path, dict]]:
 
 def _replay(spec: Path, log: Path, constants: dict) -> tuple[bool, int, int]:
     # TLC walking the model along one log: whether it reached the end, how
-    # many records it matched, and how many there were
+    # many records it matched, and how many there were. TLC failing any other
+    # way (a log outside the generated tables, a spec that doesn't parse) is
+    # no verdict on the code, and stops the stage
     here = log.parent
     for module in ("Scheduler.tla", "SchedulerTrace.tla", "SlotWordTable.tla"):
         shutil.copy(spec / module, here)
     values = {**MODEL_BASE, "IdleExit": True, **{k: v for k, v in constants.items() if k != "records"}}
+    values["Interrupt"] = bool(values["Interrupt"])
     lines = [
         f"    {key} = {str(value).upper() if isinstance(value, bool) else value}"
         for key, value in values.items()
@@ -1382,28 +1572,29 @@ def _replay(spec: Path, log: Path, constants: dict) -> tuple[bool, int, int]:
     (here / "replay.cfg").write_text(
         "SPECIFICATION TraceSpec\nCONSTANTS\n"
         + "\n".join(lines)
-        + '\n    Mutation = "none"\nINVARIANTS Unmatched P3\n'
+        + '\n    Mutation = "none"\nINVARIANTS Unmatched\n'
     )
     done = subprocess.run(
-        [tool("java"), "-Xss64m", "-XX:+UseParallelGC", "-cp", "/opt/tla2tools.jar", "tlc2.TLC", "-deadlock",
+        [tool("java"), *tlc_java(here), "-cp", "/opt/tla2tools.jar", "tlc2.TLC", "-deadlock",
          "-workers", "1", "-metadir", str(here / "states"), "-config", "replay.cfg", "SchedulerTrace.tla"],
         cwd=here, capture_output=True, text=True, check=False,
     )  # fmt: skip
     (here / "tlc.log").write_text(done.stdout + done.stderr)
+    accepted = "Invariant Unmatched is violated" in done.stdout
+    if not accepted and "Model checking completed. No error has been found" not in done.stdout:
+        sys.exit(f"TLC couldn't replay {log}: see {here / 'tlc.log'}")
     matched = [int(n) for n in re.findall(r'<<"matched", (\d+)>>', done.stdout)]
-    return (
-        "Invariant Unmatched is violated" in done.stdout,
-        max(matched, default=0),
-        constants.get("records", 0),
-    )
+    return accepted, max(matched, default=0), constants.get("records", 0)
 
 
 def cmd_model(args) -> None:
     """
     TLC on check/verify/tla/Scheduler.tla, its slot word arithmetic generated from
     the C++ first (check/verify/tla/slot_word_table.cpp): every scenario must pass
-    and reach its floor of states, and every mutation must break the property
-    it names.
+    and reach its floor of states, every mutation of the model must break the
+    property it names, every traced run of the code must be one the model
+    allows, and every bug planted in the code for the trace to catch
+    (CODE_MUTANTS) must make some run one it doesn't.
     """
     spec = args.root / "model"
     shutil.rmtree(spec, ignore_errors=True)
@@ -1416,16 +1607,12 @@ def cmd_model(args) -> None:
     failed = []
     traced = _traces(spec, ROOT / "src", "code")
     mutants = {}
-    for name, (old, new) in TRACE_MUTANTS.items():
-        source = (ROOT / "src" / "parallel.hpp").read_text()
-        if source.count(old) != 1:
-            failed.append(f"trace mutant {name} no longer applies to src/parallel.hpp")
-            continue
+    for name, source in code_mutants("trace").items():
         mutated = spec / f"src_{name}"
         mutated.mkdir()
         for header in (ROOT / "src").glob("*.hpp"):
             shutil.copy(header, mutated)
-        (mutated / "parallel.hpp").write_text(source.replace(old, new))
+        (mutated / "parallel.hpp").write_text(source)
         mutants[name] = mutated
     with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
         replays = {log: pool.submit(_replay, spec, log, constants) for log, constants in traced}
@@ -1461,18 +1648,16 @@ def cmd_model(args) -> None:
             print(
                 f"  {verdict}  the code's trace {log.parent.name:<26} {records:>6} steps, {matched} matched"
             )
-            if not accepted and "Invariant P3 is violated" in (log.parent / "tlc.log").read_text():
-                failed.append(f"the code's trace breaks P3: {log}, at record {matched}")
-            elif not accepted:
+            if not accepted:
                 failed.append(f"the code took a step the model doesn't allow: {log}, record {matched + 1}")
         print("  steps traced: " + ", ".join(f"{a} {n}" for a, n in sorted(actions.items())), flush=True)
         for name, runs in mutant_replays.items():
             outcomes = [run.result() for run in runs]
             rejected = sum(1 for accepted, _, _ in outcomes if not accepted)
             verdict = "pass" if rejected else "FAIL"
-            print(f"  {verdict}  trace mutant {name:<26} rejected in {rejected} of {len(outcomes)} rounds")
+            print(f"  {verdict}  planted bug {name:<27} rejected in {rejected} of {len(outcomes)} rounds")
             if not rejected:
-                failed.append(f"trace mutant {name}: every round's log was one the model allows")
+                failed.append(f"planted bug {name}: every round's log was one the model allows")
         # a step no scenario takes is one no scenario checks
         mutation_only = {"CallerClaimStore", "WorkerClaimStore"}  # claim_load_then_store's
         never = sorted(a for a, count in taken.items() if count == 0 and a not in mutation_only)
@@ -1671,7 +1856,7 @@ def cmd_generate(args) -> None:
 # the gate, which should take minutes after a small change: the distribution
 # packages (`distro --run`, two more builds and suites) are checked when the
 # packaging changes, and the sdist's own build (`sdist`) in release CI
-STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz", "genmc", "model"]
+STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz", "bench", "genmc", "model"]
 
 
 def cmd_check(args) -> None:
@@ -1680,6 +1865,8 @@ def cmd_check(args) -> None:
         command = [sys.executable, str(ROOT / "scripts"), "--root", str(args.root), stage]
         if stage == "fuzz":
             command += ["--seconds", str(args.fuzz_seconds)]
+        if stage == "bench":
+            command += ["--quick"]  # the short calls, in seconds: a pool that works but stalls fails here
         print(f"\n==== {stage} ====", flush=True)
         tic = time.monotonic()
         code = subprocess.run(command, cwd=ROOT, check=False).returncode
@@ -1703,6 +1890,10 @@ VERIFIES = {"genmc", "model"}
 # never takes over a shared machine: by affinity rather than a quota, so the
 # thread pool (which counts the cores it may run on) sizes itself to them
 CORES = 2
+# but the `genmc` and `model` stages, which run dozens of single-threaded
+# checkers and nothing that measures time (the traced driver pins itself to
+# TRACE_CORES): half the machine, or they are most of an hour on two cores
+VERIFY_CORES = max(CORES, (os.cpu_count() or CORES) // 2)
 
 
 def docker_cores(cores: int = CORES) -> list[str]:
@@ -1754,7 +1945,9 @@ def in_image(args) -> None:
         "run",
         "--rm",
         "--init",
-        *docker_cores(args.cores if args.command == "bench" else CORES),
+        *docker_cores(
+            args.cores if args.command == "bench" else VERIFY_CORES if args.command in VERIFIES else CORES
+        ),
         *seccomp,
         # Docker's default open-file limit is about 2**31, and sanitizers
         # close every descriptor up to it before starting llvm-symbolizer:

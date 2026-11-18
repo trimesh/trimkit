@@ -4,8 +4,9 @@
 // `callers` threads, `calls` calls of `items` items each on the real pool,
 // round after round a mix of Coarse calls, Measured calls long enough to be
 // shared and ones too short to be (round 0 then waits until its workers exit
-// idle, and calls once more), then writes every step the pool took as
-// TraceLog.tla, and prints the constants the model needs to replay it
+// idle, and calls once more; the last round is one caller whose poll says
+// stop, once), then writes every step the pool took as TraceLog.tla, and
+// prints the constants the model needs to replay it
 #define TRIMKIT_TRACE 1
 #include "parallel.hpp"
 
@@ -27,9 +28,22 @@ void work(std::int64_t ns) {
     }
 }
 
-void call(std::size_t items, int kind) {
+// Ctrl-C, once: the model's Interrupt, which the first poll finds
+std::atomic<bool> interrupt{false};
+
+void call(std::size_t items, int kind, bool polled) {
     std::vector<std::atomic<int>> ran(items);
     const std::int64_t each = kind == 2 ? 100 : 100'000;  // the last kind is too short to share
+    bool stopped = false;
+    parallel::Stop stop;
+    if (polled) {
+        stop.poll = [](void* context) {
+            const bool now = interrupt.exchange(false);
+            *static_cast<bool*>(context) |= now;
+            return now;
+        };
+        stop.context = &stopped;
+    }
     const auto failure = parallel::for_each_range(
         items,
         [&](std::size_t begin, std::size_t end) {
@@ -38,9 +52,9 @@ void call(std::size_t items, int kind) {
                 ran[i].fetch_add(1, std::memory_order_relaxed);
             }
         },
-        kind == 0 ? parallel::ItemCost::Coarse : parallel::ItemCost::Measured);
+        kind == 0 ? parallel::ItemCost::Coarse : parallel::ItemCost::Measured, 1, stop);
     for (auto& count : ran) {
-        if (failure || count.load() != 1) {
+        if (failure || count.load() > 1 || (count.load() == 0 && !stopped)) {
             std::fprintf(stderr, "a call didn't run every item once\n");
             std::exit(2);
         }
@@ -75,10 +89,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: trace <callers> <calls> <items> <round> <TraceLog.tla>\n");
         return 1;
     }
-    const auto callers = static_cast<std::uint32_t>(std::atoi(argv[1]));
     const int calls = std::atoi(argv[2]);
     const auto items = static_cast<std::size_t>(std::atoi(argv[3]));
     const int round = std::atoi(argv[4]);
+    // the stopping round: one caller, so the poll that stops is the first
+    // logged, as the model's is, and its first call Measured (kind 1), so that
+    // poll is the one after its first range
+    const bool stopping = round == 7;
+    const auto callers = stopping ? 1U : static_cast<std::uint32_t>(std::atoi(argv[1]));
+    interrupt.store(stopping);
     std::vector<parallel::TraceRecord> records(std::size_t{1} << 20);
     parallel::trace_log.records = records.data();
     parallel::trace_log.capacity = records.size();
@@ -88,13 +107,13 @@ int main(int argc, char** argv) {
         threads.emplace_back([=] {
             parallel::trace_thread = c + 1;
             for (int k = 0; k < calls; k++) {
-                call(items, static_cast<int>((c + static_cast<std::uint32_t>(k + round)) % 3));
+                call(items, static_cast<int>((c + static_cast<std::uint32_t>(k + round)) % 3), stopping);
             }
             // round 0 waits past IDLE_EXIT_MS, so its workers exit idle, and
             // calls again, so their replacements start
             if (round == 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(parallel::IDLE_EXIT_MS + 500));
-                call(items, 0);
+                call(items, 0, false);
             }
         });
     }
@@ -115,7 +134,8 @@ int main(int argc, char** argv) {
     }
     print_log(out);
     std::fclose(out);
-    std::printf("Callers = %u\nCalls = %d\nItems = %zu\nCap = %u\nNSlots = %zu\nrecords = %zu\n", callers, calls + (round == 0 ? 1 : 0), items,
-                parallel::worker_cap(), parallel::SLOTS, parallel::trace_log.size);
+    std::printf("Callers = %u\nCalls = %d\nItems = %zu\nCap = %u\nNSlots = %zu\nInterrupt = %d\nrecords = %zu\n", callers,
+                calls + (round == 0 ? 1 : 0), items, parallel::worker_cap(), parallel::SLOTS, stopping ? 1 : 0,
+                parallel::trace_log.size);
     return 0;
 }

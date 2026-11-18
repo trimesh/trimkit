@@ -18,29 +18,23 @@
 (*   S2  no item runs twice                                                *)
 (*   S3  no two workers hold one thread index                              *)
 (*   P1  a worker counted as spinning by a waking caller never sleeps      *)
-(*       through that caller's wake (the wake and spinning counts, both    *)
-(*       sequentially consistent, pair)                                    *)
+(*       through that caller's wake                                        *)
 (*   P2  a job published, wanting help, with items left, has a live worker *)
-(*       or one leaving that will start its replacement (the wake and live *)
-(*       counts pair); but in a forked child, whose caller runs alone      *)
-(*   P3  no call wakes or starts more workers than it asked for, but to    *)
-(*       replace one it roused that has gone back to sleep: the sleepers   *)
-(*       its rounds wake, and the threads it and its spawn chain start     *)
-(*       (spinning workers join for free, and a worker's replacement is    *)
-(*       its own); and a worker roused for a call sleeps again only once   *)
-(*       that call has no item left to hand out, has stopped, or returned  *)
+(*       or one leaving that will start its replacement; but in a forked   *)
+(*       child, whose caller runs alone                                    *)
 (*   R   a call that returned ran every item, or failed, or was stopped    *)
 (*       by its caller's poll                                              *)
 (*   X   no range is claimed once the interpreter's exit closed the gate   *)
 (*       (here a claim is one step; in the C++ its look at the gate comes  *)
 (*       just before its fetch-add, so one that read the gate open may     *)
-(*       still take its range, and the call then fails by R's StoppedAtExit*)
-(*       check rather than by stopping first)                              *)
+(*       still take its range)                                             *)
 (*   E   an epoch names one job, so a worker skips only a job it drained   *)
 (* A step outside a SlotWord transition's precondition (which the C++'s    *)
 (* checked() asserts) is outside its table's domain, and stops TLC too.    *)
-(* and over every behaviour, each thread taking its steps fairly:          *)
+(* And over every behaviour, each thread taking its steps fairly:          *)
 (*   L1  every call returns                                                *)
+(* How many workers a call wakes, and when, is speed, not safety: that is  *)
+(* measured (`uv run scripts bench`, the fuzzer's counters), not modelled. *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, Sequences, SlotWordTable
 
@@ -56,7 +50,6 @@ CONSTANTS
     SpawnFails,  \* starting a thread may fail
     IdleExit,    \* idle workers may exit
     Fork,        \* the process may fork, twice, from any thread in a body or a caller's poll
-    ThreadEnds,  \* a worker's thread may end inside a body (pthread_exit, a forced unwind)
     AtExit,      \* the interpreter may exit, once
     Mutation     \* one guard of the C++ broken, or "none"
 
@@ -76,7 +69,7 @@ VARIABLES
     wake,       \* bumped to tell idle workers to look
     spinning,   \* workers counted as spinning
     live,       \* workers counted live
-    wanted,     \* how far the spawn chain goes, and for which job (P3)
+    wanted,     \* how far the spawn chain goes
     indexes,    \* thread indexes held, and by which thread
     promised,   \* per worker, the wake a caller counted it to see while it spun (0: none)
     gate,       \* the exit gate has closed
@@ -86,27 +79,23 @@ VARIABLES
 vars == <<slot, job, jobs, stack, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 NoDrain == [s \in SlotIds |-> 0]
-NoWanted == [n |-> 0, by |-> 0]
 
 CallerFrame(j, pc) ==
     [kind |-> "caller", pc |-> pc, j |-> j, k |-> 0, b |-> 0, e |-> 0, helpers |-> 0, want |-> 0,
      epoch |-> 0, seen |-> 0, observed |-> 0, joined |-> FALSE, drained |-> NoDrain, drained_job |-> NoDrain,
      closed |-> FALSE,
-     spun |-> 0, bumped |-> 0, top |-> TRUE, ending |-> FALSE, held |-> 0, rf |-> 0]
+     \* gone: a fork wiped the slot this frame published or joined
+     spun |-> 0, bumped |-> 0, top |-> TRUE, gone |-> FALSE]
 WorkerFrame ==
     [kind |-> "worker", pc |-> "Start", j |-> 0, k |-> 1, b |-> 0, e |-> 0, helpers |-> 0, want |-> 0,
      epoch |-> 0, seen |-> 0, observed |-> 0, joined |-> FALSE, drained |-> NoDrain, drained_job |-> NoDrain,
      closed |-> FALSE,
-     spun |-> 0, bumped |-> 0, top |-> FALSE, ending |-> FALSE, held |-> 0, rf |-> 0]
+     spun |-> 0, bumped |-> 0, top |-> FALSE, gone |-> FALSE]
 
 NewJob(count, nest, throw) ==
     [count |-> count, next |-> 1, stopped |-> FALSE, done |-> {}, twice |-> FALSE, returned |-> FALSE,
      failed |-> FALSE, interrupted |-> FALSE, forked |-> FALSE, touched_after |-> FALSE,
-     claimed_after_exit |-> FALSE, nest |-> nest,
-     throw |-> throw,
-     \* P3's ghost: the helpers it asked for, and those it roused that went
-     \* back to sleep while it ran, less the workers it woke or started
-     slack |-> 0]
+     claimed_after_exit |-> FALSE, refused |-> FALSE, nest |-> nest, throw |-> throw]
 
 \* a call's first frame: claiming, or publishing at once (Coarse, wanting any
 \* number of helpers, or with workers spinning, wanting none)
@@ -122,7 +111,7 @@ Init ==
            /\ \A c \in 1 .. Callers : first[c].j = c
            /\ stack = [t \in Threads |-> IF t <= Callers THEN <<first[t]>> ELSE <<>>]
     /\ calls = [t \in Threads |-> IF t <= Callers THEN Calls - 1 ELSE 0]
-    /\ wake = 0 /\ spinning = 0 /\ live = 0 /\ wanted = NoWanted
+    /\ wake = 0 /\ spinning = 0 /\ live = 0 /\ wanted = 0
     /\ indexes = [w \in Workers |-> 0]
     /\ promised = [w \in Workers |-> 0]
     /\ gate = FALSE /\ interrupt = Interrupt /\ forked = 0
@@ -142,41 +131,34 @@ SetWord(sl, s, w) == [sl EXCEPT ![s].epoch = w.epoch, ![s].open = w.open, ![s].a
 \* a thread touching job j: once its call has returned, S1 is broken
 Touch(j) == IF job[j].returned THEN [job EXCEPT ![j].touched_after = TRUE] ELSE job
 
-\* one more worker, roused for job j (0: a replacement, its own), unless as
-\* many as the cap are live; starting it may fail
-SpawnWorker(st, lv, j) ==
+\* one more worker, unless as many as the cap are live; starting it may fail
+SpawnWorker(st, lv) ==
     LET idle == {w \in Workers : st[w] = <<>> /\ indexes[w] = 0}
     IN IF lv >= Cap \/ idle = {} THEN {<<st, lv>>}
        ELSE LET w == CHOOSE x \in idle : \A y \in idle : x <= y
-                started == <<Push(st, w, [WorkerFrame EXCEPT !.rf = j]), lv + 1>>
+                started == <<Push(st, w, WorkerFrame), lv + 1>>
             IN IF SpawnFails THEN {started, <<st, lv>>} ELSE {started}
-
-\* job j roused `n` more workers (P3)
-Roused(jb, j, n) == IF j = 0 THEN jb ELSE [jb EXCEPT ![j].slack = @ - n]
-
-Round == {"Publish", "PublishStore", "PublishOpen", "Wake", "WakeSpinning", "WakeSpawn", "WakeSome"}
-Asking(j) == {f \in UNION {{stack[t][i] : i \in 1 .. Len(stack[t])} : t \in Threads} :
-                f.kind = "caller" /\ f.j = j /\ f.pc \in Round /\ f.want > f.helpers}
-\* the ask of a round under way, which it makes as it ends (CallerWakeSome)
-Pending(j) == IF Asking(j) = {} THEN 0 ELSE LET f == CHOOSE x \in Asking(j) : TRUE IN f.want - f.helpers
 
 ----------------------------------------------------------------------------
 \* claim_range and run_range, shared by callers and workers
 
-Claimable(f) == ~job[f.j].stopped /\ ~(gate /\ ~Broken("claims_ignore_exit")) /\ job[f.j].next <= job[f.j].count
-
 \* the next range, of any size: the policy's claim_items, as a free choice.
-\* One fetch-add (claim_load_then_store: a load, then a store)
+\* None once every item is handed out; none, and the call marked refused, once
+\* the exit closed the gate; none once the job stopped. One fetch-add
+\* (claim_load_then_store: a load, then a store)
 Claim(t, f, none) ==
-    IF Claimable(f)
-    THEN \E take \in 1 .. (job[f.j].count - job[f.j].next + 1):
+    IF job[f.j].next > job[f.j].count
+    THEN job' = Touch(f.j) /\ Go(t, [f EXCEPT !.pc = none])
+    ELSE IF gate /\ ~Broken("claims_ignore_exit")
+    THEN job' = [Touch(f.j) EXCEPT ![f.j].refused = TRUE] /\ Go(t, [f EXCEPT !.pc = none])
+    ELSE IF job[f.j].stopped
+    THEN job' = Touch(f.j) /\ Go(t, [f EXCEPT !.pc = none])
+    ELSE \E take \in 1 .. (job[f.j].count - job[f.j].next + 1):
              IF Broken("claim_load_then_store")
              THEN /\ job' = Touch(f.j)
                   /\ Go(t, [f EXCEPT !.pc = "ClaimStore", !.b = job[f.j].next, !.e = job[f.j].next + take])
              ELSE /\ job' = [Touch(f.j) EXCEPT ![f.j].next = job[f.j].next + take, ![f.j].claimed_after_exit = @ \/ gate]
                   /\ Go(t, [f EXCEPT !.pc = "Run", !.b = job[f.j].next, !.e = job[f.j].next + take])
-    ELSE /\ job' = Touch(f.j)
-         /\ Go(t, [f EXCEPT !.pc = none])
 
 ClaimStore(t, f) ==
     /\ job' = [Touch(f.j) EXCEPT ![f.j].next = f.e]
@@ -243,7 +225,7 @@ CallerPublish(t, f) ==
                             THEN [Reserved(Word(s)) EXCEPT !.epoch = Word(s).epoch]
                             ELSE Reserved(Word(s))
                    IN /\ slot' = SetWord(slot, s, w)
-                      /\ Go(t, [f EXCEPT !.pc = "PublishStore", !.k = s, !.epoch = w.epoch, !.held = w.epoch])
+                      /\ Go(t, [f EXCEPT !.pc = "PublishStore", !.k = s, !.epoch = w.epoch])
        /\ (free = {} => UNCHANGED slot)
        /\ UNCHANGED <<job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
@@ -278,36 +260,34 @@ CallerWakeSpinning(t, f) ==
 CallerWakeSpawn(t, f) ==
     LET after == IF Broken("wake_counts_live_first") THEN "Wake" ELSE "WakeSome"
         g == [f EXCEPT !.pc = after]
-    \* (spawn_ignores_live: a thread started though enough are live)
-    IN /\ IF live < f.want \/ (Broken("spawn_ignores_live") /\ f.want > 0)
-          THEN /\ wanted' = [n |-> f.want, by |-> f.j]
-               /\ \E r \in SpawnWorker(SetTop(t, g), live, f.j):
-                      /\ stack' = r[1] /\ live' = r[2]
-                      /\ job' = Roused(job, f.j, r[2] - live)
-          ELSE /\ Go(t, g) /\ UNCHANGED <<wanted, live, job>>
-       /\ UNCHANGED <<slot, jobs, calls, wake, spinning, indexes, promised, gate, interrupt, forked>>
+    IN /\ IF live < f.want
+          THEN /\ wanted' = f.want
+               /\ \E r \in SpawnWorker(SetTop(t, g), live): stack' = r[1] /\ live' = r[2]
+          ELSE /\ Go(t, g) /\ UNCHANGED <<wanted, live>>
+       /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, indexes, promised, gate, interrupt, forked>>
 
 CallerWakeSome(t, f) ==
     LET n == (f.want - f.helpers) - f.spun
         asleep == {w \in Workers : stack[w] # <<>> /\ Top(w).pc = "ParkSleep"}
-        woken(st, ws) == [w \in Threads |-> IF w \in ws THEN [st[w] EXCEPT ![Len(st[w])].pc = "ParkCompare",
-                                                                            ![Len(st[w])].rf = f.j]
+        woken(st, ws) == [w \in Threads |-> IF w \in ws THEN [st[w] EXCEPT ![Len(st[w])].pc = "ParkCompare"]
                                              ELSE st[w]]
     IN /\ \E ws \in SUBSET asleep:
               /\ Cardinality(ws) <= IF n > 0 THEN n ELSE 0  \* at most n: the kernel wakes what is asleep
               /\ stack' = woken(SetTop(t, [f EXCEPT !.pc = "Claim", !.helpers = f.want, !.bumped = 0]), ws)
-              \* the round's ask, want - helpers, is made here, where helpers becomes want
-              /\ job' = [job EXCEPT ![f.j].slack = @ + (f.want - f.helpers) - Cardinality(ws)]
-       /\ UNCHANGED <<slot, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
+       /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
-\* close_job: no more joins, and the caller out; wait if workers are inside
+\* close_job: no more joins, and the caller out; wait if workers are inside.
+\* In a forked child the slot is no longer this job's, and no worker exists
+\* (fork_closes_wiped_slot: it closes the slot anyway)
 CallerClose(t, f) ==
     LET before == Word(f.k)
         waits == before.active # 1 /\ ~Broken("close_without_waiting")
-    IN /\ slot' = SetWord(slot, f.k, Closed(before))
-       /\ Go(t, [f EXCEPT !.pc = IF waits THEN "CloseCheck" ELSE "Return", !.epoch = before.epoch,
-                          !.closed = TRUE])
-    /\ UNCHANGED <<job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
+    IN /\ IF f.gone /\ ~Broken("fork_closes_wiped_slot")
+          THEN Go(t, [f EXCEPT !.pc = "Return"]) /\ UNCHANGED slot
+          ELSE /\ slot' = SetWord(slot, f.k, Closed(before))
+               /\ Go(t, [f EXCEPT !.pc = IF waits THEN "CloseCheck" ELSE "Return", !.epoch = before.epoch,
+                                  !.closed = TRUE])
+       /\ UNCHANGED <<job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 WorkersGone(f) == slot[f.k].active = 0 \/ (slot[f.k].epoch # f.epoch /\ ~Broken("wait_ignores_epoch"))
 
@@ -334,8 +314,7 @@ CallerClosePark(t, f) ==
 \* item was claimed; then its caller thread makes its next call
 CallerCloseReturn(t, f) ==
     LET j == f.j
-        exited == gate /\ job[j].next <= job[j].count
-        ended == [job EXCEPT ![j].returned = TRUE, ![j].failed = @ \/ job[j].forked \/ exited]
+        ended == [job EXCEPT ![j].returned = TRUE, ![j].failed = @ \/ job[j].forked \/ job[j].refused]
         popped == Pop(stack, t)
         again == popped[t] = <<>> /\ t <= Callers /\ calls[t] > 0
     IN /\ IF again
@@ -349,8 +328,7 @@ CallerCloseReturn(t, f) ==
 ----------------------------------------------------------------------------
 \* the worker: worker_main's WorkerStep
 
-\* take the lowest free thread index, then the next of the spawn chain,
-\* roused for the job that wanted it
+\* take the lowest free thread index, then the next of the spawn chain
 WorkerStart(t, f) ==
     LET held == {indexes[w] : w \in Workers} \ {0}
         free == {i \in 1 .. Cap : i \notin held}
@@ -358,13 +336,10 @@ WorkerStart(t, f) ==
         g == [f EXCEPT !.pc = "Scan"]
     IN /\ free # {}
        /\ indexes' = [indexes EXCEPT ![t] = index]
-       \* spawn_chain_ignores_wanted: the chain runs on to the cap
-       /\ IF live < (IF Broken("spawn_chain_ignores_wanted") THEN Cap ELSE wanted.n)
-          THEN \E r \in SpawnWorker(SetTop(t, g), live, wanted.by):
-                   /\ stack' = r[1] /\ live' = r[2]
-                   /\ job' = Roused(job, wanted.by, r[2] - live)
-          ELSE Go(t, g) /\ UNCHANGED <<live, job>>
-       /\ UNCHANGED <<slot, jobs, calls, wake, spinning, wanted, promised, gate, interrupt, forked>>
+       /\ IF live < wanted
+          THEN \E r \in SpawnWorker(SetTop(t, g), live): stack' = r[1] /\ live' = r[2]
+          ELSE Go(t, g) /\ UNCHANGED live
+       /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, promised, gate, interrupt, forked>>
 
 \* the wake read before looking, then each slot's word
 WorkerScan(t, f) ==
@@ -407,14 +382,15 @@ WorkerRunNested(t, f) ==
        /\ UNCHANGED <<slot, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 \* leave_job: never touching the job again; the last out of a closed job
-\* bumps `left` and wakes its caller
+\* bumps `left` and wakes its caller. In a forked child the slot is no longer
+\* that job's, and is left alone
 WorkerLeave(t, f) ==
     LET before == Word(f.k)
-        last == ~before.open /\ before.active = 1
-    IN /\ slot' = SetWord(slot, f.k, Left(before))
-       /\ Go(t, [f EXCEPT !.pc = IF last THEN "LeaveBump" ELSE IF f.ending THEN "ExitEnding" ELSE "ScanSlot",
-                          !.k = IF last \/ f.ending THEN f.k ELSE f.k + 1, !.j = 0, !.drained[f.k] = f.epoch,
-                          !.drained_job[f.k] = f.j])
+        last == ~f.gone /\ ~before.open /\ before.active = 1
+    IN /\ slot' = IF f.gone THEN slot ELSE SetWord(slot, f.k, Left(before))
+       /\ Go(t, [f EXCEPT !.pc = IF last THEN "LeaveBump" ELSE "ScanSlot",
+                          !.k = IF last THEN f.k ELSE f.k + 1, !.j = 0, !.drained[f.k] = f.epoch,
+                          !.drained_job[f.k] = f.j, !.gone = FALSE])
        /\ UNCHANGED <<job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 LeaveWakes(st, k) ==
@@ -423,8 +399,7 @@ LeaveWakes(st, k) ==
 
 WorkerLeaveBump(t, f) ==
     /\ slot' = [slot EXCEPT ![f.k].left = @ + 1]
-    /\ stack' = LeaveWakes(SetTop(t, IF f.ending THEN [f EXCEPT !.pc = "ExitEnding"]
-                                       ELSE [f EXCEPT !.pc = "ScanSlot", !.k = f.k + 1]), f.k)
+    /\ stack' = LeaveWakes(SetTop(t, [f EXCEPT !.pc = "ScanSlot", !.k = f.k + 1]), f.k)
     /\ UNCHANGED <<job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 \* park_worker: counted spinning, it looks at the wake while it spins (or
@@ -451,16 +426,13 @@ WorkerParkSpinDone(t, f) ==
     /\ Go(t, [f EXCEPT !.pc = "ParkCompare"])
     /\ UNCHANGED <<slot, job, jobs, calls, wake, live, wanted, indexes, promised, gate, interrupt, forked>>
 
-\* the sleep: a worker roused for a call that hasn't returned is lost to it,
-\* which may then rouse another in its place (P3)
+\* the sleep's compare, which the kernel makes with it
 WorkerParkCompare(t, f) ==
     /\ \/ /\ wake = f.observed \/ Broken("park_ignores_wake")
-          /\ Go(t, [f EXCEPT !.pc = "ParkSleep", !.rf = 0])
-          /\ job' = IF f.rf # 0 /\ ~job[f.rf].returned THEN [job EXCEPT ![f.rf].slack = @ + 1] ELSE job
+          /\ Go(t, [f EXCEPT !.pc = "ParkSleep"])
        \/ /\ wake # f.observed
           /\ Go(t, [f EXCEPT !.pc = "Scan"])
-          /\ UNCHANGED job
-    /\ UNCHANGED <<slot, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
+    /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 \* idle long enough: its index given back, then out of the live count, then
 \* (Holding's destructor) a last look at the wake, which a caller may have
@@ -468,27 +440,12 @@ WorkerParkCompare(t, f) ==
 WorkerExit(t, f) ==
     /\ indexes' = [indexes EXCEPT ![t] = 0]
     /\ live' = live - 1
-    /\ Go(t, [f EXCEPT !.pc = "ExitRecheck", !.rf = 0])
-    \* a worker roused for a call, gone: lost to it, which the spawn chain may
-    \* replace even once the call has returned (P3)
-    /\ job' = IF f.rf # 0 THEN [job EXCEPT ![f.rf].slack = @ + 1] ELSE job
-    /\ UNCHANGED <<slot, jobs, calls, wake, spinning, wanted, promised, gate, interrupt, forked>>
-
-\* the same, for a thread ending inside a body, once it has left its job
-WorkerExitEnding(t, f) == WorkerExit(t, f)
-
-\* a worker's thread ending inside a body: the job fails, as the items it held
-\* never run, and Holding's destructor leaves the job (leave_job), then exits
-ThreadEndsInBody(t) ==
-    LET f == Top(t) IN
-    /\ ThreadEnds /\ Len(stack[t]) = 1 /\ f.kind = "worker" /\ f.pc = "Run"
-    /\ job' = [Touch(f.j) EXCEPT ![f.j].stopped = TRUE, ![f.j].failed = TRUE]
-    /\ Go(t, [f EXCEPT !.pc = IF Broken("end_without_leaving") THEN "ExitEnding" ELSE "Leave", !.ending = TRUE])
-    /\ UNCHANGED <<slot, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
+    /\ Go(t, [f EXCEPT !.pc = "ExitRecheck"])
+    /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, promised, gate, interrupt, forked>>
 
 WorkerExitRecheck(t, f) ==
     /\ IF wake # f.observed /\ ~Broken("exit_without_recheck")
-       THEN \E r \in SpawnWorker(Pop(stack, t), live, 0): stack' = r[1] /\ live' = r[2]
+       THEN \E r \in SpawnWorker(Pop(stack, t), live): stack' = r[1] /\ live' = r[2]
        ELSE stack' = Pop(stack, t) /\ UNCHANGED live
     /\ promised' = [promised EXCEPT ![t] = 0]
     /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, indexes, gate, interrupt, forked>>
@@ -499,51 +456,33 @@ MayExit(f) == IdleExit /\ f.pc = "ParkSleep"
 ----------------------------------------------------------------------------
 \* the environment: fork, the interpreter's exit
 
-\* child_after_fork, in the child of a fork by thread t from inside a body:
-\* only t is left; every slot is freed under a new epoch, but one t published
-\* and hasn't closed is opened again with only t counted, and one t is inside
-\* as a worker is closed with only t counted; a job a vanished worker was
-\* inside stops, and fails
+\* child_after_fork, in the child of a fork by thread t: only t is left. Every
+\* slot is freed under a new epoch; every job t had shared fails; the job t
+\* is inside as a worker stops; and t's frames that published or joined see
+\* the fork (fork_generation) and leave the slots alone
 ChildAfterFork(t) ==
-    LET mine == {i \in 1 .. Len(stack[t]) : stack[t][i].kind = "caller" /\ stack[t][i].k # 0}
-        \* workers of this very call inside: its caller is counted until it closes,
-        \* and a closed slot may hold another caller's job since
-        lost(i) == LET f == stack[t][i] IN
-                   slot[f.k].epoch = f.held /\ slot[f.k].active > (IF f.closed THEN 0 ELSE 1)
-                   /\ ~Broken("fork_ignores_workers")
-        lostjobs == {stack[t][i].j : i \in {x \in mine : lost(x)}}
-        worker == {i \in 1 .. Len(stack[t]) : stack[t][i].kind = "worker" /\ stack[t][i].j # 0}
-        As(s, w, j) == [epoch |-> w.epoch, open |-> w.open, active |-> w.active, job |-> j, left |-> slot[s].left]
-        reopened == [s \in SlotIds |->
-                       IF \E i \in mine : stack[t][i].k = s /\ ~stack[t][i].closed
-                       THEN LET i == CHOOSE x \in mine : stack[t][x].k = s /\ ~stack[t][x].closed
-                            IN As(s, ReopenedByFork(Word(s)), stack[t][i].j)
-                       ELSE IF \E i \in worker : stack[t][i].k = s
-                            THEN As(s, KeptByFork(Word(s)), 0)
-                            ELSE As(s, FreedByFork(Word(s)), 0)]
-        stopped == {stack[t][i].j : i \in worker}
-    IN /\ slot' = IF Broken("fork_keeps_slots") THEN slot ELSE reopened
-       \* and every worker roused for a call, but t, is lost to it, and a
-       \* round its vanished caller was in has made its ask (P3)
+    LET Shared(f) == f.kind = "caller" /\ f.k # 0
+        Inside(f) == f.kind = "worker" /\ f.j # 0
+        frames == {stack[t][i] : i \in 1 .. Len(stack[t])}
+        shared == {f.j : f \in {x \in frames : Shared(x)}}
+        inside == {f.j : f \in {x \in frames : Inside(x)}}
+        freed(s) == LET w == FreedByFork(Word(s))
+                    IN [epoch |-> w.epoch, open |-> w.open, active |-> w.active, job |-> 0, left |-> slot[s].left]
+    IN /\ slot' = IF Broken("fork_keeps_slots") THEN slot ELSE [s \in SlotIds |-> freed(s)]
        /\ job' = [j \in 1 .. MaxJobs |->
-                    LET gone == Cardinality({w \in Workers \ {t} : stack[w] # <<>> /\ stack[w][1].rf = j})
-                        kept == [job[j] EXCEPT !.slack = @ + gone + Pending(j)]
-                    IN IF j \in lostjobs THEN [kept EXCEPT !.forked = TRUE, !.stopped = TRUE]
-                       ELSE IF j \in stopped THEN [kept EXCEPT !.stopped = TRUE] ELSE kept]
-       \* a call it reopened is held under the slot's new epoch, which a second
-       \* fork compares with (HeldSlot's epoch; fork_keeps_held_epoch: the one
-       \* it published under). Its wait, if it closes, reads the epoch afresh
+                    IF j \in shared /\ ~Broken("fork_fails_nothing")
+                    THEN [job[j] EXCEPT !.forked = TRUE, !.stopped = TRUE]
+                    ELSE IF j \in inside THEN [job[j] EXCEPT !.stopped = TRUE] ELSE job[j]]
        /\ stack' = [x \in Threads |->
                      IF x # t THEN <<>>
                      ELSE [i \in 1 .. Len(stack[t]) |->
-                             IF i \in mine /\ ~stack[t][i].closed /\ ~Broken("fork_keeps_held_epoch")
-                             THEN [stack[t][i] EXCEPT !.held = ReopenedByFork(Word(stack[t][i].k)).epoch]
-                             ELSE stack[t][i]]]
+                             IF Shared(stack[t][i]) \/ Inside(stack[t][i])
+                             THEN [stack[t][i] EXCEPT !.gone = TRUE] ELSE stack[t][i]]]
        /\ calls' = [x \in Threads |-> IF x = t THEN calls[t] ELSE 0]
        /\ live' = IF t \in Workers THEN 1 ELSE 0
        /\ indexes' = [w \in Workers |-> IF w = t THEN indexes[w] ELSE 0]
        /\ promised' = [w \in Workers |-> 0]
-       /\ spinning' = 0 /\ wanted' = NoWanted /\ gate' = FALSE /\ forked' = forked + 1
+       /\ spinning' = 0 /\ wanted' = 0 /\ gate' = FALSE /\ forked' = forked + 1
        /\ UNCHANGED <<jobs, wake, interrupt>>
 
 \* inside a body (Run), or in a caller's poll: between ranges (Decide), or
@@ -607,7 +546,6 @@ Step(t) ==
              [] f.pc = "ParkSpinDone" -> WorkerParkSpinDone(t, f)
              [] f.pc = "ParkCompare" -> WorkerParkCompare(t, f)
              [] f.pc = "ParkSleep" -> FALSE  \* until a caller wakes it
-             [] f.pc = "ExitEnding" -> WorkerExitEnding(t, f)
              [] f.pc = "ExitRecheck" -> WorkerExitRecheck(t, f)
 
 Idle(t) == stack[t] # <<>> /\ MayExit(Top(t)) /\ WorkerExit(t, Top(t))
@@ -615,7 +553,6 @@ Idle(t) == stack[t] # <<>> /\ MayExit(Top(t)) /\ WorkerExit(t, Top(t))
 Next ==
     \/ \E t \in Threads : Step(t) \/ Idle(t)
     \/ \E t \in Threads : Forking(t) /\ ChildAfterFork(t)
-    \/ \E t \in Workers : stack[t] # <<>> /\ ThreadEndsInBody(t)
     \/ \E t \in Threads : ParkTimeout(t) \/ CloseTimeout(t)
     \/ ExitGateClose
 
@@ -643,18 +580,6 @@ P2 == SpawnFails \/ forked > 0 \/
         (f.kind = "caller" /\ f.k # 0 /\ ~f.closed /\ f.helpers > 0 /\ f.pc \notin Waking
          /\ job[f.j].next <= job[f.j].count /\ ~job[f.j].stopped)
         => live > 0 \/ Leaving
-
-\* P3: a call's wake-ups beyond what it asked for, its round under way
-\* counted, each replace a worker it roused that went back to sleep while it
-\* ran, or ended; and a roused worker sleeps only once its call has nothing
-\* left to hand out (or stopped, or returned, or the interpreter's exit
-\* closed the gate), as it joins its call while that has items: so a call
-\* asks again, and pays again, only when it decided to just as they ran out
-P3 == /\ \A j \in 1 .. MaxJobs : job[j].slack + Pending(j) >= 0
-      /\ \A w \in Workers :
-           stack[w] # <<>> /\ Top(w).pc \in {"ParkCompare"} /\ Top(w).rf # 0 /\ ~job[Top(w).rf].returned
-           /\ Top(w).observed = wake
-           => job[Top(w).rf].next > job[Top(w).rf].count \/ job[Top(w).rf].stopped \/ gate
 
 \* an epoch names one job: a worker skips an open slot whose epoch it found
 \* drained only while that slot still holds the job it drained

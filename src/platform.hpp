@@ -109,6 +109,9 @@ inline void cpu_relax() {
 
 // -- sleeping on a word ----------------------------------------------------------
 
+// A timeout that never comes (Windows' INFINITE is this value)
+constexpr std::uint32_t FOREVER = UINT32_MAX;
+
 // Sleep while `word` holds `expected`, for at most `timeout_ms`. The system
 // compares the word and sleeps in one step, so a wake after the word changes
 // is never lost. It may also return early, so callers read the word again.
@@ -142,17 +145,18 @@ inline void wait_while_equal(std::atomic<std::uint32_t>& word, std::uint32_t exp
     FutexTimeout timeout{static_cast<FutexWord>(timeout_ms / 1000),
                          static_cast<FutexWord>(timeout_ms % 1000) * 1'000'000};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): futex has no wrapper
-    syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected, &timeout, nullptr, 0);
+    syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected, timeout_ms == FOREVER ? nullptr : &timeout, nullptr, 0);
 #elif defined(__APPLE__)
     constexpr std::uint32_t COMPARE_AND_WAIT = 1;
     constexpr std::uint32_t NO_ERRNO = 0x01000000;
-    // a timeout of 0 means forever to __ulock_wait: never pass one
-    __ulock_wait(COMPARE_AND_WAIT | NO_ERRNO, address, expected, (timeout_ms == 0 ? 1 : timeout_ms) * 1000);
+    // in microseconds, and 0 means forever to __ulock_wait: pass one only for that
+    const std::uint32_t timeout_us = timeout_ms == FOREVER ? 0 : (timeout_ms == 0 ? 1 : timeout_ms) * 1000;
+    __ulock_wait(COMPARE_AND_WAIT | NO_ERRNO, address, expected, timeout_us);
 #else
     // no way to sleep on a word here: nap, and let the caller read it again
     (void)address;
     (void)expected;
-    std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms < 1 ? timeout_ms : 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms < 1 ? timeout_ms : 1));  // FOREVER too
 #endif
 #endif
 }

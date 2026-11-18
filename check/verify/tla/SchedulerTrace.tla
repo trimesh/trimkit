@@ -46,8 +46,7 @@ SameChoice(t, r) ==
            IF r.arg[1] > Top(t).helpers THEN After(t).want = r.arg[1] ELSE After(t).pc = "Claim"
     /\ r.action = "CallerPublish" /\ r.arg[1] # 0 => After(t).k = r.arg[1]
     /\ r.action = "CallerPublish" /\ r.arg[1] = 0 => After(t).pc = "Claim"
-    \* a wake wakes as many sleepers as the system said it woke: so P3 holds
-    \* along the log for the code's own wakes, not just some the model chose
+    \* a wake wakes as many sleepers as the system said it woke
     /\ r.action = "CallerWakeSome" =>
            Cardinality({w \in Workers : stack[w] # <<>> /\ Top(w).pc = "ParkSleep" /\ stack'[w] # <<>>
                                         /\ stack'[w][Len(stack'[w])].pc = "ParkCompare"}) = r.arg[1]

@@ -40,56 +40,32 @@
 // fails if it loses to the serial loop or the best of three pools written by
 // hand (check/bench/parallel.cpp), or uses much more CPU, in any case it measures.
 //
-// WHAT CHECKS IT, on every `scripts check`, each failing the run on any break
+// WHAT CHECKS IT, on every `scripts check`
 //
 // The hard part is a job on the caller's stack handed to other threads: no
 // thread may touch it after the call returns, no item may run twice, nothing
 // may deadlock and no wake-up may be lost, through exceptions, Ctrl-C, fork()
 // and interpreter exit, on machines that reorder memory.
-//   - check/verify/genmc: GenMC runs this header (platform.hpp's TRIMKIT_GENMC) in
-//     every execution the C++ memory model allows, for one call of a few
-//     items with its worker: T1 (a missing happens-before is a race on the
-//     body's plain outputs), T2, T3, T4 for a failing body and a stop, a call
-//     as the interpreter exits, the thread indexes, Exclusively, ChunkList and
-//     the exit gate. Each harness explores at least a recorded number of
-//     executions, and each memory order here weakened one step fails some
-//     harness or is listed with why it can't. Two jobs at once are too many
-//     executions (some 170 million): two callers, nesting and slot reuse are
-//     the model's.
-//   - check/verify/tla/Scheduler.tla: TLC checks the protocol in every
-//     interleaving at small sizes, with every choice the policy makes free:
-//     publish, join, leave, close and wait; the wake, spinning and live
-//     counts; idle exit and its replacement; the thread indexes; up to two
-//     forks, from a body or a poll; a thread ending in a body; the
-//     interpreter's exit; and P3, that no call wakes or starts more workers
-//     than it asked for but to replace one it lost, and that a worker roused
-//     for a call sleeps again only once that call has nothing left to hand
-//     out (or stopped, or returned). Each mutation breaks one
-//     guard and must be found as the promise it breaks. Its steps are this
-//     file's (a lint holds CallerStep, WorkerStep and every TraceStep to its
-//     actions), and its slot arithmetic is SlotWord's, generated each run.
-//   - check/verify/tla/SchedulerTrace.tla: a traced build (TRIMKIT_TRACE: each
-//     TraceStep logs its action and the shared state after it) runs real
-//     calls on the real pool, an idle exit included, and TLC must find the
-//     model allows every step of every log, each wake waking as many as the
-//     system said it did, and P3 holding along it. Three
-//     reorderings of this file's steps must each be rejected.
-//   - Checked builds (TRIMKIT_CHECKED: every sanitized build and fuzzer):
-//     each slot transition asserts the state it found, and each call W1.
-//   - check/fuzz/parallel.cpp, under ASan: any count, cost, ItemCost, min_range and
-//     number of callers, with items that throw, nest and sleep; the policy's
-//     rules over grids of inputs; and fixed checks for a poll that throws, a
-//     thread ending in an item, exit, fork from a worker and a held slot, W1
-//     on real calls, a min_range past the count, and too many items.
-//   - check/tests/test_threads.py, under ThreadSanitizer too: fork inside a call, a
-//     forked child's exit, exit during a call, the workers following
-//     affinity.
-//   - A lint over all the extension compiles: only this header and
-//     platform.hpp start, wait on or sleep a thread, but common.hpp's poll.
-// The checkers are exhaustive only at small sizes; at real sizes the fuzzer
-// and sanitizers run what the machine schedules. GenMC's waits return at once
-// (a wait may), so it checks every wait ends; TLC's sleeps have no timeouts,
-// so it checks no wake is lost.
+//   - check/verify/genmc: GenMC runs this header, its assertions on, in every
+//     execution the C++ memory model allows, for one call of a few items and
+//     its worker: T1 to T4, the exit, the thread indexes, Exclusively and
+//     ChunkList. Its waits return at once, so it can't see a lost wake.
+//   - check/verify/tla: TLC checks the protocol as a model, in every
+//     interleaving at small sizes: two callers, nesting, slot reuse, idle
+//     exit, fork and the exit, alone and together. Then it replays logs of
+//     this code running (TRIMKIT_TRACE) and must find the model allows every
+//     step: the model is held to the code, not only the code to the model.
+//   - check/fuzz/parallel.cpp, under AddressSanitizer: real threads at real
+//     sizes, with items that throw, nest and sleep, forks, and the exit. A
+//     caller with no Stop waits with no timeout, so a lost wake is a hang.
+//   - check/tests/test_threads.py, under ThreadSanitizer too.
+//   - `scripts bench`: speed, against a serial loop and pools written by hand.
+// Each of the first three is also run on bugs planted in this file, one at a
+// time (scripts/__main__.py, CODE_MUTANTS), and must fail on each: a check is
+// only trusted for what it has been seen to catch. Checked builds
+// (TRIMKIT_CHECKED: GenMC, every sanitized build and fuzzer) assert the state
+// each slot transition found. A lint keeps every other file from starting,
+// waiting on or sleeping a thread.
 //
 // WHAT A CALL PROMISES, however it ends (return, exception, Ctrl-C, fork, exit)
 //
@@ -105,11 +81,12 @@
 //      for_each_range returns one of the exceptions. A Stop that says stop
 //      (Ctrl-C) stops it the same way, but no failure is returned: the caller
 //      knows it asked, and that some items may not have run.
-//   T5 A fork() during a call never gives the child a wrong answer: if a
-//      worker was in the middle of the job, the child's call fails instead.
-//      As the interpreter exits, every job stops, and fails rather than
-//      return part of an answer.
-//   And the scheduling policy's W1 to W3 and C1, stated with it.
+//   T5 A fork() during a call never gives the child a wrong answer: a call
+//      the forking thread had shared with workers fails there instead. As
+//      the interpreter exits, every job stops, and one refused a range fails
+//      rather than return part of an answer.
+// How fast it is, is the scheduling policy's (W1 to W3 and C1, stated with
+// it): measured, not proved.
 //
 // WHAT IT DOES NOT PROMISE
 //
@@ -121,7 +98,9 @@
 // threaded process only exec or exit, as the others may have been inside
 // malloc. Linux lets it run on, and only there are its call's failure and its
 // later calls tested; macOS's malloc may abort it as that call unwinds. T5
-// holds either way: it never gets a wrong answer.
+// holds either way: it never gets a wrong answer. A call that was running on
+// the forking thread fails in the child even if no worker held an item: the
+// child calls it again.
 //
 // SHARP EDGES: rules for the body
 //
@@ -147,7 +126,7 @@
 //   - Only Linux runs the fuzzers, ThreadSanitizer and lints. The Windows and
 //     macOS sleep and wake code builds there, and every wheel runs the tests.
 //
-// FOR REVIEWERS: the slot protocol
+// THE SLOT PROTOCOL
 //
 // The state, checked in every interleaving by check/verify/tla/Scheduler.tla (each
 // transition a function of the same name below, and SlotWord's arithmetic):
@@ -168,8 +147,7 @@
 // which compares and sleeps in one step, so no wake-up is lost, and the pool
 // holds no lock a fork could leave held (Exclusively is the extension's own,
 // whose users refuse a device the parent opened): the child frees every slot
-// but those its one thread is still inside (child_after_fork), and starts its
-// own workers when it needs them.
+// (child_after_fork), and starts its own workers when it needs them.
 #pragma once
 
 #include "platform.hpp"
@@ -277,8 +255,8 @@ constexpr bool too_many_items(std::uint64_t count) { return count > MAX_ITEMS; }
 //      shorter than TIMED_NS is counted as TIMED_NS, which only ever makes the
 //      next claim smaller than its aim.
 // The cap is the CPUs this process may use (affinity, narrowed by any cgroup
-// quota) less the caller, read at most every CAP_REFRESH_NS (worker_cap). P3
-// (check/verify/tla) holds the protocol to waking no more than this asks
+// quota) less the caller, read at most every CAP_REFRESH_NS (worker_cap).
+// None of this is proved: `scripts bench` and the fuzzer's counters measure it
 namespace policy {
 
 constexpr double WAKE_COST_NS = 5'000;   // C
@@ -433,15 +411,18 @@ struct RangeJob {
     // joins starts from both, then measures its own ranges
     std::atomic<std::uint64_t> item_cost_16{0};
     std::atomic<std::uint32_t> sharing{1};
-    std::atomic<bool> stopped{false};  // a failure, a poll, a fork or the exit: no more ranges
+    std::atomic<bool> stopped{false};  // a failure, a poll or a fork: no more ranges
+    // a claim was refused with items left because the interpreter is exiting:
+    // the call fails with StoppedAtExit, whatever the gate says by its return
+    std::atomic<bool> refused_at_exit{false};
     std::atomic<bool> failure_claimed{false};
     platform::Failure failure;  // the first, read by the caller once the job is closed
-    // set in a forked child: a worker was inside when the process forked, so
-    // the items it held never run here, and the job fails (child_after_fork)
+    // set in a forked child on every job its one thread had shared: the
+    // workers are gone, so the job fails (child_after_fork)
     std::atomic<bool> forked{false};
 };
 
-// One slot's word (FOR REVIEWERS, at the top). Each transition is one
+// One slot's word (THE SLOT PROTOCOL, at the top). Each transition is one
 // read-modify-write by a delta below (but the fork's, on the child's one
 // thread): the functions the model checks, from a table this generates
 struct SlotWord {
@@ -467,10 +448,6 @@ struct SlotWord {
     constexpr SlotWord closed() const { return SlotWord{bits - CLOSE}; }
     // in a forked child: free, under the next epoch
     constexpr SlotWord freed_by_fork() const { return SlotWord{(bits & ~(OPEN | ACTIVE)) + EPOCH}; }
-    // in a forked child, a job its one thread is still calling: open, only it counted
-    constexpr SlotWord reopened_by_fork() const { return SlotWord{freed_by_fork().bits | OPEN | 1}; }
-    // in a forked child, a job its one thread is inside as a worker: closed, only it counted
-    constexpr SlotWord kept_by_fork() const { return SlotWord{freed_by_fork().bits + 1}; }
 };
 
 static_assert(SlotWord{}.free() && SlotWord{}.reserved().active() == 1 && !SlotWord{}.reserved().open());
@@ -483,8 +460,6 @@ static_assert(!SlotWord{}.reserved().opened().joined().closed().open());
 static_assert(SlotWord{}.reserved().opened().joined().closed().left().free());
 static_assert(SlotWord{}.reserved().opened().joined().freed_by_fork().free());
 static_assert(SlotWord{}.reserved().opened().freed_by_fork().epoch() == 2);
-static_assert(SlotWord{}.reserved().opened().reopened_by_fork().closed().free());
-static_assert(SlotWord{}.reserved().opened().joined().kept_by_fork().left().free());
 
 // A place one job is shared from
 struct alignas(64) JobSlot {
@@ -614,7 +589,7 @@ public:
 // in (gil.hpp's GilReleased: every call that lets Python run beside it). At
 // the exit the gate closes: every job stops at the next claim that reads it
 // closed (one that read it open still takes its range), and run_job
-// fails one that didn't run every item with StoppedAtExit; then whoever
+// fails a call that had a claim refused with StoppedAtExit; then whoever
 // closed it waits for every call inside to leave. A call counts itself in
 // before it reads whether the gate is closed, and the closer closes it before
 // it reads the count, both sequentially consistent, so either the call sees
@@ -744,8 +719,14 @@ inline bool claim_range(RangeJob& job, const policy::Ran& ran, const char* actio
         most<std::size_t>(
             1, policy::claim_items(ran, items_left(job), job.sharing.load(std::memory_order_relaxed), job.min_range)));
     const TraceStep step(action);
-    if (job.stopped.load(std::memory_order_relaxed) || exit_gate_closed() ||
-        job.next.load(std::memory_order_relaxed) >= job.count) {
+    if (job.next.load(std::memory_order_relaxed) >= job.count) {
+        return false;
+    }
+    if (exit_gate_closed()) {
+        job.refused_at_exit.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    if (job.stopped.load(std::memory_order_relaxed)) {
         return false;
     }
     const std::uint64_t first =
@@ -806,57 +787,35 @@ inline void poll_stop(RangeJob& job) {
 
 // -- Fork: what the child keeps of the pool -----------------------------------
 
-// A slot this thread published and hasn't let go of, innermost last: what a
-// fork from inside a call (a poll running Python that forks) leaves the
-// child's one thread holding (child_after_fork). Kept by SharedJob
+// A job this thread has shared and not yet let go of, innermost last: what a
+// fork from inside a call (a poll running Python that forks) fails in the
+// child. Kept by SharedJob
 struct HeldSlot {
-    JobSlot* slot = nullptr;
     RangeJob* job = nullptr;
-    bool closed = false;
-    std::uint32_t epoch = 0;  // what it was published as
     HeldSlot* outer = nullptr;
 };
 inline thread_local HeldSlot* held_slots = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-// the slot and job this thread is inside as a worker, if it is one: what a
-// fork from a body on a worker leaves its child's one thread inside
-inline thread_local JobSlot* joined_slot = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// the job this thread is inside as a worker, if it is one
 inline thread_local RangeJob* joined_job = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // In a forked child, whose one thread is the one that forked: every worker,
-// and every other caller, belonged to the parent. Every slot is freed under a
-// new epoch, but
-//   - one the forking thread published and hasn't closed (it is inside that
-//     call, which goes on) is opened again with it alone counted, so closing
-//     it works;
-//   - one it is inside of as a worker is closed with it alone counted, so its
-//     leave frees it, and that job, whose caller is gone, stops.
-// A job a worker of the parent was inside of lost that worker's items: it
-// stops, and fails (T5). The new epoch ends any wait the forking thread was in
+// and every other caller, belonged to the parent. So every slot is freed
+// under a new epoch, every job the forking thread had shared fails (T5), and
+// the job it was inside as a worker stops. That thread still has those calls
+// on its stack: each sees platform::fork_generation() has moved since it
+// published or joined, and leaves the slots alone (SharedJob, worker_main)
 inline void child_after_fork() {
-    std::uint64_t before[SLOTS];
-    for (std::size_t s = 0; s < SLOTS; s++) {
-        before[s] = pool.slots[s].word.load(std::memory_order_relaxed);
-        pool.slots[s].word.store(SlotWord{before[s]}.freed_by_fork().bits, std::memory_order_relaxed);
-        pool.slots[s].job.store(nullptr, std::memory_order_relaxed);
+    for (JobSlot& slot : pool.slots) {
+        slot.word.store(SlotWord{slot.word.load(std::memory_order_relaxed)}.freed_by_fork().bits,
+                        std::memory_order_relaxed);
+        slot.job.store(nullptr, std::memory_order_relaxed);
     }
-    for (HeldSlot* held = held_slots; held != nullptr; held = held->outer) {
-        const SlotWord word{before[held->slot - pool.slots]};
-        // workers of this very call inside: the caller is counted until it
-        // closes, and a closed slot may hold another caller's job since
-        if (word.epoch() == held->epoch && word.active() > (held->closed ? 0 : 1)) {
-            held->job->forked.store(true, std::memory_order_relaxed);
-            held->job->stopped.store(true, std::memory_order_relaxed);
-        }
-        if (!held->closed) {
-            held->slot->word.store(word.reopened_by_fork().bits, std::memory_order_relaxed);
-            held->slot->job.store(held->job, std::memory_order_relaxed);
-            held->epoch = word.reopened_by_fork().epoch();  // what a second fork compares with
-        }
+    for (const HeldSlot* held = held_slots; held != nullptr; held = held->outer) {
+        held->job->forked.store(true, std::memory_order_relaxed);
+        held->job->stopped.store(true, std::memory_order_relaxed);
     }
-    if (joined_slot != nullptr) {
+    if (joined_job != nullptr) {
         joined_job->stopped.store(true, std::memory_order_relaxed);
-        joined_slot->word.store(SlotWord{before[joined_slot - pool.slots]}.kept_by_fork().bits,
-                                std::memory_order_relaxed);
     }
     pool.live.store(this_thread_index != 0 ? 1 : 0, std::memory_order_relaxed);
     pool.wanted.store(0, std::memory_order_relaxed);
@@ -974,10 +933,13 @@ inline bool workers_gone(const JobSlot& slot, std::uint32_t epoch) {
     return word.active() == 0 || word.epoch() != epoch;
 }
 
-// Wait until no worker is inside the job published as `epoch`, polling for a
-// stop while it does when `poll` (never while unwinding: see SharedJob). It
-// spins first (policy::close_spin_ns), then sleeps
+// Wait until no worker is inside the job published as `epoch`. It spins first
+// (policy::close_spin_ns), then sleeps until the last worker out wakes it.
+// When `poll` (never while unwinding: see SharedJob) and the job has a Stop,
+// the sleep ends every POLL_MS to poll it; otherwise it has no timeout, so a
+// wake that never came would be a hang any test can see, not a stall
 inline void wait_for_workers(JobSlot& slot, RangeJob& job, std::uint32_t epoch, bool poll) {
+    const bool polling = poll && job.stop_by.poll != nullptr;
     const std::int64_t spin_until = platform::monotonic_ns() + static_cast<std::int64_t>(policy::close_spin_ns());
     for (;;) {
         const bool spinning = platform::monotonic_ns() < spin_until;
@@ -1012,9 +974,9 @@ inline void wait_for_workers(JobSlot& slot, RangeJob& job, std::uint32_t epoch, 
             moved = slot.left.load(std::memory_order_acquire) != left;
         }
         if (!moved) {
-            park(slot.left, left, POLL_MS);
+            park(slot.left, left, polling ? POLL_MS : platform::FOREVER);
         }
-        if (poll) {
+        if (polling) {
             poll_stop(job);
         }
     }
@@ -1042,10 +1004,8 @@ public:
     bool publish() {
         slot_ = try_publish(job_);
         if (slot_ != nullptr) {
-            // field by field: GenMC can't run a copy of the padding after `closed`
-            held_.slot = slot_;
+            generation_ = platform::fork_generation();
             held_.job = &job_;
-            held_.epoch = SlotWord{slot_->word.load(std::memory_order_relaxed)}.epoch();
             held_.outer = held_slots;
             held_slots = &held_;
         }
@@ -1055,34 +1015,35 @@ public:
     bool published() const { return slot_ != nullptr; }
 
     // closed, then no worker left inside. A poll that throws while it waits
-    // leaves the slot closed, and the destructor waits out the rest
+    // leaves the slot closed, and the destructor waits out the rest. In a
+    // forked child the slot is no longer this job's, and no worker exists
     void release(bool poll) {
         if (slot_ == nullptr) {
             return;
         }
-        if (!held_.closed) {
-            const SlotWord before = close_job(*slot_);
-            held_.closed = true;
-            epoch_ = before.epoch();
-            if (before.active() == 1) {
-                let_go();
-                return;
+        if (generation_ == platform::fork_generation()) {
+            bool inside = true;  // workers may be
+            if (!closed_) {
+                const SlotWord before = close_job(*slot_);
+                closed_ = true;
+                epoch_ = before.epoch();
+                inside = before.active() != 1;  // none joined, or all have left
+            }
+            if (inside) {
+                wait_for_workers(*slot_, job_, epoch_, poll);
             }
         }
-        wait_for_workers(*slot_, job_, epoch_, poll);
-        let_go();
-    }
-
-private:
-    void let_go() {
         held_slots = held_.outer;
         slot_ = nullptr;
     }
 
+private:
     RangeJob& job_;
     JobSlot* slot_ = nullptr;
     HeldSlot held_;
-    std::uint32_t epoch_ = 0;
+    bool closed_ = false;
+    std::uint32_t epoch_ = 0;       // what the job was published as, read when it closes
+    std::uint32_t generation_ = 0;  // the fork generation it was published in
 };
 
 // -- Waking workers -----------------------------------------------------------
@@ -1223,21 +1184,23 @@ inline void* worker_main(void* /*unused*/) {
     }
     // whatever this worker holds, given back however it ends
     struct Holding {
-        std::uint32_t observed = 0;  // the wake as it last read it
-        JobSlot* slot = nullptr;     // the slot it is inside, if any
+        std::uint32_t observed = 0;    // the wake as it last read it
+        JobSlot* slot = nullptr;       // the slot it is inside, if any
+        std::uint32_t generation = 0;  // the fork generation it joined in
+        // out of its job; in a forked child the slot is no longer that job's
         void leave() {
-            joined_slot = nullptr;
             joined_job = nullptr;
-            leave_job(*slot);
+            if (generation == platform::fork_generation()) {
+                leave_job(*slot);
+            }
             slot = nullptr;
         }
         ~Holding() {
-            const bool ending = slot != nullptr;  // unwinding inside a job, not idle
-            if (ending) {
+            if (slot != nullptr) {  // unwinding inside a job, not idle
                 leave();
             }
             {
-                const TraceStep step(ending ? "WorkerExitEnding" : "WorkerExit");
+                const TraceStep step("WorkerExit");
                 give_thread_index();
                 // out of the count before it reads the wake (pairs with wake_helpers)
                 pool.live.fetch_sub(1, std::memory_order_seq_cst);
@@ -1309,7 +1272,7 @@ inline void* worker_main(void* /*unused*/) {
                 }
                 checked(job != nullptr, "an open slot holds its job");
                 holding.slot = &slot;
-                joined_slot = &slot;
+                holding.generation = platform::fork_generation();
                 joined_job = job;
                 joined = true;
                 ran = policy::Ran{0, 0, static_cast<double>(job->item_cost_16.load(std::memory_order_relaxed)) / 16.0};
@@ -1386,8 +1349,6 @@ inline void run_job(RangeJob& job) {
                 poll_stop(job);  // outside the step's trace lock: a poll may take the GIL
                 const TraceStep traced("CallerDecide");
                 want = policy::helpers_wanted(job.item_cost, mine, items_left(job), cap);
-                checked(want == 0 || job.item_cost == ItemCost::Coarse || mine.ns >= policy::WAKE_COST_NS,
-                        "W1: a call wanted a helper before its caller ran items for C");
                 traced.took(want);
                 step = want > helpers ? CallerStep::Publish : CallerStep::Claim;
                 break;
@@ -1412,8 +1373,8 @@ inline void run_job(RangeJob& job) {
                 if (job.forked.load(std::memory_order_relaxed) && !job.failure) {
                     job.failure = platform::failure<ForkedDuringCall>();  // T5
                 }
-                // stopped at exit before every item was claimed: there is no answer
-                if (!job.failure && job.next.load(std::memory_order_relaxed) < job.count && exit_gate_closed()) {
+                // a claim refused at the exit: there is no answer
+                if (!job.failure && job.refused_at_exit.load(std::memory_order_relaxed)) {
                     job.failure = platform::failure<StoppedAtExit>();
                 }
                 return;

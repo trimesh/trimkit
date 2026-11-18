@@ -40,7 +40,10 @@ struct Plan {
     std::uint32_t uneven = 0;   // every `uneven`-th item costs 100 times more
     std::size_t throw_at = SIZE_MAX;
     std::size_t nest_at = SIZE_MAX;
-    std::size_t pause_at = SIZE_MAX;     // an item that sleeps, so a range stalls
+    std::size_t pause_at = SIZE_MAX;  // an item that sleeps, so a range stalls
+    // whether the call has a Stop at all: without one its caller waits for
+    // its workers with no timeout, so a wake that is lost hangs this input
+    bool polled = false;
     std::uint32_t stop_after_polls = 0;  // 0: never stop
     // 0: never; else the poll throws at this poll, as a thread exiting
     // inside it (CPython's take_gil during finalization) unwinds out of it
@@ -131,8 +134,10 @@ void check(Run& run, const trimkit::parallel::RangeJob& job, bool stoppable) {
     job.count = run.plan->count;
     job.run = run_items;
     job.body = &run;
-    job.stop_by.poll = poll;
-    job.stop_by.context = &run;
+    if (run.plan->polled) {
+        job.stop_by.poll = poll;
+        job.stop_by.context = &run;
+    }
     job.item_cost = run.plan->cost;
     job.min_range = std::max<std::size_t>(1, std::min(run.plan->count, run.plan->min_range));  // as for_each_range
     trimkit::parallel::run_job(job);
@@ -284,47 +289,38 @@ void check_exit_stops_every_job() {
     expect(stopped, "a job started at exit ran anyway");
 }
 
-// B7: a fork marks a held, closed slot's call as failed only if workers of
-// that very call are inside; one another caller published since isn't it.
-// Run before any job, so there are no workers for the handler to forget
-void check_fork_keeps_epochs() {
+// B7: in a forked child every slot is free under a new epoch, whatever it
+// held, and every job the forking thread had shared has failed. Run before
+// any job, so there are no workers for the handler to forget
+void check_fork_wipes_slots() {
     constexpr std::uint64_t EPOCH = trimkit::parallel::SlotWord::EPOCH;
     constexpr std::uint64_t OPEN = trimkit::parallel::SlotWord::OPEN;
     trimkit::parallel::JobSlot& slot = trimkit::parallel::pool.slots[0];
-    const std::uint64_t epoch = 7;
-    trimkit::parallel::RangeJob republished;
-    // closed at epoch 7; another caller has epoch 8 open, a worker inside
-    slot.word.store(((epoch + 1) * EPOCH) | OPEN | 2);
-    trimkit::parallel::HeldSlot held{&slot, &republished, true, epoch, nullptr};
+    trimkit::parallel::RangeJob shared;
+    slot.word.store((7 * EPOCH) | OPEN | 3);  // open at epoch 7, its caller and two workers inside
+    slot.job.store(&shared);
+    trimkit::parallel::HeldSlot held{&shared, nullptr};
     trimkit::parallel::held_slots = &held;
     trimkit::parallel::child_after_fork();
-    expect(!republished.forked.load(), "a fork failed a call whose slot another call had published since");
-    trimkit::parallel::RangeJob inside;
-    // closed at epoch 7, one of its own workers still inside
-    slot.word.store(epoch * EPOCH | 1);
-    held = trimkit::parallel::HeldSlot{&slot, &inside, true, epoch, nullptr};
-    trimkit::parallel::child_after_fork();
     trimkit::parallel::held_slots = nullptr;
-    expect(inside.forked.load(), "a fork left a call that lost a worker's items to answer");
+    expect(shared.forked.load() && shared.stopped.load(), "a fork left a shared call to answer");
+    expect(slot.word.load() == 8 * EPOCH && slot.job.load() == nullptr, "a fork left a slot held");
     slot.word.store(0);
 }
 
 // B6: a body forks on a worker: the child's one thread is that worker, inside
-// a job whose caller is gone. The child counts it live, lets it leave its
-// job (the slot closed with it alone counted), stops that job, and runs a
-// call in full; it exits 0 only if all of that held
+// a job whose caller is gone. The child counts it live, frees every slot,
+// stops that job, and runs a call in full; it exits 0 only if all of that held
 int check_child_of_a_worker(trimkit::parallel::RangeJob* left) {
-    constexpr std::uint64_t ACTIVE = trimkit::parallel::SlotWord::ACTIVE;
-    constexpr std::uint64_t OPEN = trimkit::parallel::SlotWord::OPEN;
     if (trimkit::parallel::pool.live.load() != 1) {
         return 1;
     }
-    std::uint32_t closed_with_one = 0;
     for (const trimkit::parallel::JobSlot& slot : trimkit::parallel::pool.slots) {
-        const std::uint64_t word = slot.word.load();
-        closed_with_one += (word & (OPEN | ACTIVE)) == 1 ? 1 : 0;
+        if (!trimkit::parallel::SlotWord{slot.word.load()}.free()) {
+            return 2;
+        }
     }
-    if (closed_with_one != 1 || !left->stopped.load()) {
+    if (!left->stopped.load()) {
         return 2;
     }
     auto none = [](std::size_t) {};
@@ -361,6 +357,74 @@ void check_fork_from_a_worker() {
            "a child forked from a worker found the pool broken");
 }
 
+// B8: a caller's poll forks while its job is shared (a signal handler that
+// forks). In the child that call fails with ForkedDuringCall, whatever had
+// run, its return leaves every slot free, and the next call runs in full;
+// the parent's call is untouched
+void check_fork_from_a_poll() {
+    struct Forking {
+        std::uint32_t polls = 0;
+        bool child = false;
+        pid_t pid = -1;
+    } forking;
+    auto none = [](std::size_t) {};
+    Spun<decltype(none)> spun(4'000, 5'000, none);
+    trimkit::parallel::RangeJob job;
+    spun.fill(job);
+    job.item_cost = trimkit::parallel::ItemCost::Coarse;  // shared before its first poll
+    job.stop_by.poll = [](void* context) -> bool {
+        auto& state = *static_cast<Forking*>(context);
+        if (++state.polls == 3) {
+            state.pid = fork();
+            state.child = state.pid == 0;
+        }
+        return false;
+    };
+    job.stop_by.context = &forking;
+    trimkit::parallel::run_job(job);
+    if (forking.child) {
+        bool failed = false;
+        try {
+            if (job.failure) {
+                std::rethrow_exception(job.failure);
+            }
+        } catch (const trimkit::parallel::ForkedDuringCall&) {
+            failed = true;
+        } catch (...) {
+        }
+        for (const trimkit::parallel::JobSlot& slot : trimkit::parallel::pool.slots) {
+            failed = failed && trimkit::parallel::SlotWord{slot.word.load()}.free();
+        }
+        Spun<decltype(none)> after(10'000, 1'000, none);
+        trimkit::parallel::RangeJob again;
+        after.fill(again);
+        trimkit::parallel::run_job(again);
+        _exit(failed && after.ran() == after.count && again.failure == nullptr ? 0 : 1);
+    }
+    int status = -1;
+    expect(forking.pid > 0, "the poll never forked");
+    waitpid(forking.pid, &status, 0);
+    expect(WIFEXITED(status) && WEXITSTATUS(status) == 0, "a call forked from its poll answered in the child");
+    expect(spun.ran() == spun.count && job.failure == nullptr, "a fork failed its parent's call");
+}
+
+// Sleeping workers are woken, not left to their timeouts: once every worker
+// has gone to sleep, a call worth sharing wakes some, as the system counts
+void check_sleepers_are_woken() {
+    const timespec asleep{0, 20'000'000};  // far past the spin (policy::spin_ns)
+    nanosleep(&asleep, nullptr);
+    expect(trimkit::parallel::pool.live.load() > 0, "no worker is live to wake");
+    const std::uint64_t woken = trimkit::parallel::counters.woken.load();
+    auto none = [](std::size_t) {};
+    Spun<decltype(none)> spun(64, 200'000, none);
+    trimkit::parallel::RangeJob job;
+    spun.fill(job);
+    job.item_cost = trimkit::parallel::ItemCost::Coarse;
+    trimkit::parallel::run_job(job);
+    expect(spun.ran() == spun.count, "a call didn't run every item");
+    expect(trimkit::parallel::counters.woken.load() > woken, "a call worth sharing woke no sleeping worker");
+}
+
 // The scheduling policy (src/parallel.hpp, namespace policy): pure functions,
 // checked over grids of inputs, W1 and W2 exactly; and a simulation of claim
 // sizing on clocks of 1, 41 and 100 ns ticks, with no stealing, so no claim
@@ -385,9 +449,7 @@ void check_policy() {
                             policy::helpers_wanted(ItemCost::Measured, Ran{ns, items, 0}, left, cap);
                         expect(ns >= WAKE_COST_NS || want == 0, "W1: helpers wanted before the caller ran items for C");
                         const double work_left = ns / static_cast<double>(items) * static_cast<double>(left);
-                        const double formula =
-                            std::min(static_cast<double>(room), std::floor(work_left / (2 * WAKE_COST_NS)));
-                        expect(ns < WAKE_COST_NS || static_cast<double>(want) == formula, "W2: not one helper per 2C");
+                        expect(want <= room, "W2: more helpers than the cap or the items left");
                         expect(static_cast<double>(want) * 2 * WAKE_COST_NS <= std::max(0.0, work_left),
                                "W2: helpers cost more than the work they share");
                         if (nudge == 0.0) {
@@ -405,6 +467,25 @@ void check_policy() {
             expect(policy::helpers_wanted(ItemCost::Measured, Ran{1e9, 0, 0}, left, cap) == 0,
                    "helpers wanted for a caller that ran no items");
         }
+    }
+    // W2 by hand, with C at 5 us, so one helper per 10 us of work left: what the
+    // caller ran, the items left, the cap, and the helpers that is
+    struct Worked {
+        Ran ran;
+        std::size_t left;
+        std::uint32_t cap;
+        std::uint32_t helpers;
+    };
+    static_assert(WAKE_COST_NS == 5'000, "the cases below were worked with C at 5 us");
+    for (const Worked& w : {
+             Worked{Ran{10'000, 10, 0}, 100, 255, 10},  // 1 us an item, 100 left: 100 us
+             Worked{Ran{5'000, 1, 0}, 3, 255, 1},       // 5 us an item, 3 left: 15 us
+             Worked{Ran{5'000, 5, 0}, 4, 7, 0},         // 1 us an item, 4 left: 4 us, not worth one
+             Worked{Ran{1e6, 1, 0}, 1'000, 7, 7},       // a second of work: the cap
+             Worked{Ran{1e6, 1, 0}, 3, 7, 2},           // 3 items left: one is the caller's
+         }) {
+        expect(policy::helpers_wanted(ItemCost::Measured, w.ran, w.left, w.cap) == w.helpers,
+               "W2: not one helper per 2C of the work left");
     }
     expect(policy::spin_ns() <= WAKE_COST_NS, "W3: idle workers spin longer than C");
     expect(!policy::share_at_once(ItemCost::Measured, 0, 7) && policy::share_at_once(ItemCost::Measured, 1, 7) &&
@@ -542,13 +623,15 @@ void check_too_many_items() {
 }
 
 extern "C" int LLVMFuzzerInitialize(int* /*argc*/, char*** /*argv*/) {
-    check_fork_keeps_epochs();                  // first: before any worker exists
+    check_fork_wipes_slots();                   // first: before any worker exists
     trimkit::parallel::install_fork_handler();  // as the module's init does
     check_policy();
     check_throwing_poll_stops();
     check_thread_ending_in_a_body();
     check_exit_stops_every_job();
     check_fork_from_a_worker();
+    check_fork_from_a_poll();
+    check_sleepers_are_woken();
     check_small_calls_wake_no_one();
     check_huge_min_range();
     check_too_many_items();
@@ -579,6 +662,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         if (input.ConsumeBool()) {
             plan.throw_at_poll = input.ConsumeIntegralInRange<std::uint32_t>(1, 64);
         }
+        plan.polled = plan.stop_after_polls != 0 || plan.throw_at_poll != 0;
         if (input.ConsumeBool()) {
             plan.cost = trimkit::parallel::ItemCost::Coarse;
         }

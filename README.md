@@ -152,61 +152,55 @@ Everything below this line is LLM output.
 | every part | [wjakob/nanobind](https://github.com/wjakob/nanobind), [Tessil/robin-map](https://github.com/Tessil/robin-map) | BSD-3-Clause, MIT |
 <!-- api:end -->
 
-Each docstring has the full parameters and returns (`help(trimkit.RayScene.intersect)`).
+`help(trimkit.RayScene.intersect)` prints the full arguments and return values of any function.
 
-Scalar arguments take Python's numbers or numpy's. Every array argument is read in
-place when it is exactly the dtype shown (float64 finite and within ±1e30) and
-C-contiguous, and copied once, as `np.ascontiguousarray` would, in any other layout.
-Another dtype numpy casts safely (float32, int32), or a list, is converted to that
-dtype once with a `UserWarning` naming the argument: the copy is what you would have
-written, and the warning says so. A dtype that would lose values, or anything that
-isn't array-like, is a `TypeError`, and a bad value a `ValueError`, saying what was
-expected. Whatever indexes memory is always copied once and the copy checked: faces,
-into each library's index type, and a query's `instance_index` and `pairs`. Scene
-constructors keep their own copy of their meshes.
-Everything returned is freshly allocated, and the GIL is released while computing.
-Answers are dense when you name the rows (`intersect_any`'s rays, `distances`'
-pairs) and sparse rows of what was found otherwise (hits, touching pairs,
-overlapping boxes), and `decompose` answers a list of `Mesh`, one per hull. Nothing a
-scene answers ever depends on what it was asked before, so threads can share one.
+### Arguments and results
 
-Every class pickles as exactly the arguments its constructor took, by name:
-`Boxes` its `boxes`, `RayScene` its `meshes` and `use_gpu`, and `CollisionScene`
-its `meshes` and which are `convex`. A pickle holds only numpy arrays and Python
-values, never a BVH or a collision model, so loading one (or a `copy.deepcopy`)
-builds those again, taking as long as the constructor did, and answers bit for
-bit what the original does. It loads into any version of trimkit whose
-constructor takes the same names, and a `RayScene` pickled with `use_gpu=True`
-answers on the CPU, with its one warning, where no device is found.
+- **Arrays in.** Each array argument has one expected type, shown in its docstring: 64-bit floats or 64-bit integers. An array of exactly that type, stored as one unbroken block of memory, is read where it is, with no copy.
+- **Safe conversions warn.** A list, or an array of a type that converts without losing anything (32-bit floats or integers), is converted once, with a `UserWarning` that names the argument.
+- **Unsafe ones fail.** A type that would lose values, or something that is not an array, raises `TypeError`. A bad value raises `ValueError` and says what was expected. Floats must be finite and within ±1e30.
+- **Indexes are always copied and checked.** That covers faces, a query's `instance_index` and its `pairs`. Scene constructors keep their own copy of their meshes.
+- **Results are new arrays.** When you name the rows (the rays of `intersect_any`, the pairs of `distances`) you get one answer per row. Otherwise you get one row per thing found: hits, touching pairs, overlapping boxes. `decompose` returns a list of `Mesh`, one per hull.
+- **Python is not blocked.** Python lets only one thread run Python code at a time, through a lock called the GIL. Every function here lets go of that lock while it computes.
+- **Scenes never change.** No answer depends on an earlier question, so threads can share one scene.
 
-`RayScene`, `Boxes` and `CollisionScene` queries spread big batches, and
-`decompose` its hull splits and merge costs, and `parametrize` its meshes, chart
-groups and charts, across the cores they may run on (their affinity, within a
-cgroup's CPU quota), on one pool of workers that exit after 10 s idle (so a
-`fork` within that time gets CPython's multi-threaded warning); the rest run on
-the calling thread. No vendored library starts a thread of its own.
+### Pickling
 
-`RayScene(meshes, use_gpu=True)` traces on a Vulkan device instead: the first
-GPU that computes in double precision, found through the system's Vulkan loader
-at run time (no wheel links or needs Vulkan, and Vulkan 1.0 is enough). It holds
-the same trees and runs a compute shader that makes every decision tinybvh's
-traversal makes, most of them in float32 behind a proven error bound and the
-rest with tinybvh's own float64 operations (`check/verify/gpu.md`), so it answers the
-same bytes the CPU does. Rays go as given: a `(3,)` origin or direction is one
-row for every ray, and an array goes as its dtype: float32 at half the bytes
-of float64, widened on the device. When no such device can be used,
-at construction or later, the scene warns once (a `UserWarning` naming why)
-and the
-CPU answers. `check/tests/golden.json` holds the hashed answers of an exact corpus
-(dyadic coordinates, integer-length directions, lattice meshes) that every
-platform and the device are checked against: the same answers everywhere.
+Pickling is Python's way to save an object or send it to another process. Every class here pickles as the arguments its constructor took, by name: `Boxes` its `boxes`, `RayScene` its `meshes` and `use_gpu`, `CollisionScene` its `meshes` and which are `convex`.
 
-What the device is worth depends on the rays. `python check/bench/scene.py` times a
-real assembly (`check/tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k
-faces) as loaded and pulled apart, so fewer rays hit anything. A batch is one
-camera's rays, one origin for all of them; times are the median over eight
-cameras, in milliseconds a batch, the 32 threads of an i9-14900K against an
-RTX 5070, on an otherwise idle machine (2026-11-17):
+A pickle holds only numpy arrays and plain Python values. The search trees (a BVH is a tree of boxes that lets a query skip most of a mesh) are rebuilt on load, which takes as long as the constructor did, and the loaded scene answers bit for bit what the original does. `copy.deepcopy` works the same way. A pickle loads into any trimkit version whose constructor takes the same names. A `RayScene` pickled with `use_gpu=True` falls back to the CPU, with one warning, on a machine with no usable graphics card.
+
+### Parallelism
+
+Big batches are split across every CPU core by one file, `src/parallel.hpp`. It keeps a *pool*: helper threads that sleep until there is work, then each takes a slice of the batch. We wrote it ourselves because a Python extension has needs the usual libraries don't meet. Python programs often *fork* (copy the whole running process to make a helper process), and the copy must still work. Ctrl-C must stop a long call. And when Python exits, no helper thread may be left touching memory that is gone.
+
+The alternatives each miss one of these. oneTBB (Intel's threading library) says in its own documentation that it does not support fork. OpenMP (threading built into compilers) can hang in a forked copy, and both are large libraries meant to be installed once per machine, not packed into a Python package. Small single-file pools pack easily but have the same fork problem. The price of writing our own is that threading code is easy to get wrong. So ours is checked three ways: a tool that tries every possible thread ordering on the real code (GenMC), a written model of the design checked the same way (TLA+), and bugs planted on purpose that the tests must catch.
+
+| | ours | oneTBB | OpenMP (GCC's) | a single-file pool |
+|---|---|---|---|---|
+| a forked copy still works | yes: a call cut off by the fork fails cleanly | no: "does not support fork()" | no: the copy can hang | usually not |
+| Ctrl-C stops a long call | yes | you add it | you add it | you add it |
+| size | one header, about 1,500 lines | its own library | part of the compiler's runtime | one header |
+
+How it does, on 8 cores, against a plain loop and the best of three pools written by hand (`check/bench/parallel.cpp`, which `uv run scripts bench` runs; microseconds, the best run, 2026-11-18):
+
+| work | plain loop | ours | best by hand |
+|---|---|---|---|
+| tiny: 100 items of 50 ns each | 3 | 4 | 11 |
+| even: 100,000 items of 1 µs each | 90,363 | 11,367 | 11,374 |
+| uneven: 10,000 items of 1 µs, the first eighth 20 times slower | 30,937 | 3,896 | 4,006 |
+
+A tiny call wakes no helper, so it costs what the plain loop costs. `RayScene`, `Boxes` and `CollisionScene` queries use the pool for big batches; `decompose` and `parametrize` use it for their heavy inner steps; everything else runs on the calling thread. The pool uses only the cores the process is allowed: the ones the operating system lets it run on, within a Linux container's CPU limit. Helpers exit after 10 seconds idle. A fork inside those 10 seconds gets CPython's "multi-threaded process" warning. No vendored library starts a thread of its own.
+
+### GPU rays
+
+`RayScene(meshes, use_gpu=True)` traces rays on a graphics card (GPU). It talks to the card through Vulkan, a standard interface to graphics cards. The first card that can compute in 64-bit floats is used. Vulkan is found when the program runs: no wheel needs it installed, and Vulkan 1.0 is enough.
+
+The GPU gives the same bytes as the CPU. It holds the same search trees and makes every decision the CPU code (tinybvh) makes. Most are made in fast 32-bit floats with a proven error bound; the rest are redone in 64-bit (`check/verify/gpu.md` has the proof). `check/tests/golden.json` holds hashed answers for a set of exact inputs, and every platform and the GPU are checked against it.
+
+If no card can be used, at construction or later, the scene warns once (a `UserWarning` saying why) and the CPU answers. Rays are sent as given: a single `(3,)` origin or direction applies to every ray, and 32-bit arrays are sent at half the size and widened on the card.
+
+**Is the GPU worth it?** That depends on the rays. `python check/bench/scene.py` times a real assembly (`check/tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k faces), as loaded and pulled apart so that fewer rays hit. A batch is one camera's rays from one origin. Times are milliseconds per batch, the median over eight cameras, 32 threads of an i9-14900K against an RTX 5070, on an idle machine (2026-11-17):
 
 | rays | pulled apart | hitting | nearest: CPU ms | device ms | ratio | any hit: CPU ms | device ms | ratio | every crossing: CPU ms | device ms | ratio |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -223,20 +217,15 @@ RTX 5070, on an otherwise idle machine (2026-11-17):
 | 4,000,000 | 2x | 11% | 22.82 | 15.81 | 1.4x | 14.78 | 13.39 | 1.1x | 99.02 | 81.04 | 1.2x |
 | 4,000,000 | 5x | 3% | 13.46 | 12.88 | 1.0x | 9.88 | 12.65 | 0.8x | 22.97 | 26.97 | 0.9x |
 
-Three things hold on any machine measured so far.
-A camera's float64 directions are 24 MB a million rays, and moving them to the
-device (about 0.17 ms a megabyte on an RTX 3090, by any route measured, and nearly all
-of a query's time: tracing is a few percent of it) takes about as long as the
-CPU takes to find that most of them miss, so a sparse scene gains least;
-float32 directions go at half that. Every crossing
-runs each ray's crossings one after another on its own lane, so a small batch
-with long rays is slower on the device than on the CPU, and a large one
-faster. And the device's answers are the CPU's, which the bench checks before
-it times anything.
+Three things have held on every machine measured:
 
-The same script times the same assembly as a `CollisionScene`: every pair of
-its 72 instances in one call, as triangle meshes (none of them is closed, so
-none is convex), in milliseconds, the best of five calls:
+- **Moving the rays costs more than tracing them.** A million 64-bit directions are 24 MB. Sending them to the card took about 0.17 ms per megabyte on an RTX 3090, by every route tried, and that is nearly all of a query's time; tracing is a few percent. The CPU can find that most rays miss in about the same time, so a sparse scene gains least. 32-bit directions cost half as much to send.
+- **"Every crossing" favors big batches.** Each ray's crossings are found one after another, so a small batch of long rays is slower on the card and a large one is faster.
+- **The answers match.** The bench checks the card against the CPU before it times anything.
+
+### Collision timings
+
+The same script times the same assembly as a `CollisionScene`: every pair of its 72 instances in one call, as triangle meshes (none is closed, so none is convex). Milliseconds, the best of five calls:
 
 | pulled apart | pairs | touching | `collides` ms | within 1 mm ms | distances within 10 mm ms | every distance ms |
 |---|---|---|---|---|---|---|
@@ -244,19 +233,11 @@ none is convex), in milliseconds, the best of five calls:
 | 2x | 2,556 | 67 | 0.46 | 0.21 | 23.4 | 78 |
 | 5x | 2,556 | 25 | 0.07 | 0.23 | 2.7 | 95 |
 
-`collides` culls by each instance's box, then by each mesh's hierarchy, so
-which of 2,556 pairs touch among 377k placed faces is about half a
-millisecond; a margin asks which come within that distance. `distances`
-measures every pair it is asked about, and `upper_bound` lets it stop at pairs
-farther apart than that, which is what a planner asks.
+`collides` rules pairs out by each instance's box first, then by each mesh's tree of boxes. So finding which of 2,556 pairs touch, among 377k placed faces, takes about half a millisecond. A margin asks which pairs come within that distance. `distances` measures every pair it is asked about; `upper_bound` lets it skip pairs farther apart than that, which is what a motion planner wants.
 
 ### Example
 
-`examples/ur10.py`: a UR10e with a box gripper reaches into a cubby
-for a block. The planner is one function, forward kinematics then one
-`CollisionScene.distances` call over every waypoint of a joint-space spline, handed
-to `scipy.optimize.minimize`, its gradient from the normals and closest points
-`distances` returns.
+`examples/ur10.py`: a UR10e robot arm with a box gripper reaches into a cubby for a block. The planner is one function. It places the arm at every waypoint of a path, makes one `CollisionScene.distances` call for all of them, and hands the result to `scipy.optimize.minimize`. The gradient comes from the normals and closest points that `distances` returns.
 
 ```
 planned in 40 ms: 15 L-BFGS-B evaluations of 14,342 pair distances each, aiming for 27.5 mm over 1 round
@@ -278,15 +259,11 @@ then twenty times as many waypoints checked clear
 | `parametrize` | `xatlas` | 1.1x faster | 6 / 5 |
 | `triangulate` | `mapbox-earcut` | 1.1-1.2x faster: the same library | 20 / 21 |
 
-Measured 2026-11-17 with `check/bench/versus.py` on the same numpy inputs: the best of five
-calls each, on the 32 threads of an otherwise idle i9-14900K, release build without PGO.
-A range is two runs. Peak memory is the most resident memory one call adds, its output
-included, each call in a fresh process.
+Measured 2026-11-17 with `check/bench/versus.py`, on the same numpy inputs: the best of five calls each, on the 32 threads of an idle i9-14900K, with a release build that skips profile-guided optimization. A range is two runs. Peak memory is the most memory one call adds, its output included, each call in a fresh process.
 
 ### Size Comparison
 
-Installed size over `trimesh` + `numpy`, cheapest first, so a shared dependency is
-charged to the smaller package. `coal` is what `collision` vendors.
+Installed size on top of `trimesh` + `numpy`, cheapest first, so a shared dependency is charged to the smaller package. `coal` is the library `collision` vendors.
 
 | on top of `trimesh` + `numpy` | also brings | adds (MiB) | total (MiB) |
 |---|---|---|---|
@@ -303,31 +280,24 @@ charged to the smaller package. `coal` is what `collision` vendors.
 | `coal` | `cmeel`, `cmeel-assimp`, `cmeel-boost`, `cmeel-octomap`, `cmeel-qhull`, `cmeel-zlib`, `eigenpy`, `libcoal` | 274.3 | 576.3 |
 | `trimkit` 0.2.1, instead of all of the above |  | 2.3 | 2.3 |
 
-`coal` was never a trimesh dependency and `scipy`, `pillow` and `networkx` stay, so the
-real saving is per extra, old bindings (Python < 3.15) against trimkit (3.15+):
+`coal` was never a trimesh dependency, and `scipy`, `pillow` and `networkx` stay. So the real saving is per install option, old bindings (Python < 3.15) against trimkit (3.15+):
 
 | `trimesh[...]` | old bindings (MiB) | with trimkit (MiB) | saved (MiB) |
 |---|---|---|---|
 | `trimesh[easy]` | 246.9 | 202.1 | 44.9 |
 | `trimesh[easy,recommend]` | 504.3 | 380.6 | 123.6 |
 
-`check/bench/sizes.py`, 2026-11-17, CPython 3.13.13 `linux-x86_64`, a fresh `uv venv` per
-row with bytecode compiled; the `trimesh` 5.2.1 + `numpy` 2.5.5 baseline is 65.5 MiB.
+Measured by `check/bench/sizes.py`, 2026-11-17, CPython 3.13.13 on `linux-x86_64`, with a fresh `uv venv` per row and bytecode compiled. The `trimesh` 5.2.1 + `numpy` 2.5.5 baseline is 65.5 MiB.
 
 ### Wheels
 
-One `cp312-abi3` wheel per platform serves every CPython from 3.12, so a new CPython
-needs no new release: Linux on glibc (`manylinux_2_28`) and musl (`musllinux_1_2`) on
-x86_64 and aarch64, macOS 11+ on x86_64 and arm64, and Windows on x64, x86 and arm64,
-every platform numpy publishes wheels for. 9 wheels and an sdist.
+A *wheel* is a prebuilt package; an *sdist* is the source package you build yourself. Each wheel here is tagged `cp312-abi3`, which means one build works on CPython 3.12 and every later version. A new Python needs no new release.
 
-Anywhere else the sdist builds with clang 19 or newer and lld: no machine is refused,
-and `-Csystem=eigen,fast_float,robin_map` takes those from the system. That includes
-free-threaded Python, where `uv run scripts sdist` builds and tests it for every release:
-it gets no wheels until nanobind reaches `abi3t` without a second package, as this
-package has no per-version wheels.
-`uv run scripts distro` generates from `trimkit.toml` the `debian/` directory and Fedora
-spec a distribution's maintainer commits, into `build/distro/`.
+There are 9 wheels: Linux for both of its C libraries (glibc as `manylinux_2_28`, musl as `musllinux_1_2`) on x86_64 and aarch64; macOS 11+ on x86_64 and arm64; Windows on x64, x86 and arm64. That is every platform numpy publishes wheels for.
+
+Anywhere else, the sdist builds with clang 19 or newer and the lld linker. No machine is refused. `-Csystem=eigen,fast_float,robin_map` uses the system's copies of those libraries. Free-threaded Python (the build of Python with no GIL) is built and tested from the sdist for every release by `uv run scripts sdist`. It gets wheels once nanobind, the binding library, can make one wheel that covers every free-threaded version.
+
+`uv run scripts distro` writes the `debian/` directory and Fedora spec file a Linux distribution's maintainer needs, into `build/distro/`, from `trimkit.toml`.
 
 ## Development
 
@@ -343,78 +313,42 @@ uv run scripts wheel       # this platform's release wheels
 uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
 ```
 
-`check` runs before pushing, and prints each stage's minutes. CI runs the same
-commands: every push to main runs `.github/workflows/release.yml`, which lints, builds and
-tests the sdist and every wheel with these same commands, then publishes the
-version `pyproject.toml` names (one PyPI already has is left as it is). A push to
-`release/*` does all of it but the upload. Once a week, when main has moved,
-`.github/workflows/fuzz.yml` runs `fuzz` for ten minutes a fuzzer, from the
-seeds in the repository and nothing kept between runs, and fails on a finding. Everything but `lock` and `wheel` runs
-inside a pinned Debian trixie image (`scripts/docker/Dockerfile`), with the sources mounted
-read-only unless the command writes them, so the host needs only Docker and uv.
+Run `check` before pushing; it prints how many minutes each stage took. Everything except `lock` and `wheel` runs inside a pinned Debian container (`scripts/docker/Dockerfile`), so your machine needs only Docker and uv. The sources are mounted read-only unless the command writes them.
 
-`trimkit.toml` is the one hand-edited build file: every upstream (pin, patches,
-and how it compiles, each deviation with its reason), every part of the one
-extension, its wheel-size budget, and the toolchains a release accepts. There is
-no CMake: a wheel is one shared library from a fixed list of sources, so the
-backend (`scripts/backend.py`) has `scripts/builder.py` write that list as one
-ninja file. To see exactly what a build does, read its `build.ninja`.
+CI (the automatic checks on GitHub) runs the same commands:
 
-Every build is LLVM: clang with ThinLTO and PGO, linked by lld with safe
-identical-code folding, or on macOS by Xcode's linker. The builder asks clang for
-its own linker, archiver and `llvm-profdata` and stops unless they are all one
-LLVM, since ThinLTO's bitcode and PGO's profiles are only read by their own.
-`-Cstrict=true`, which the gate and the release use, also stops on a clang newer
-than `[toolchain]` has passed with.
+- **Every push to main** runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, then publishes the version `pyproject.toml` names. A version PyPI already has is left alone.
+- **A push to `release/*`** does all of that except the upload.
+- **Once a week**, if main has moved, `.github/workflows/fuzz.yml` fuzzes for ten minutes per fuzzer. A *fuzzer* feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding.
+
+`trimkit.toml` is the one build file edited by hand. It lists every upstream library (its pinned version, its patches, how it compiles, and the reason for anything unusual), every part of the extension, the wheel-size budget, and the compilers a release accepts. There is no CMake. A wheel is one shared library made from a fixed list of sources, so `scripts/builder.py` writes that list as one file for ninja, a small build tool. To see exactly what a build does, read its `build.ninja`.
+
+Every build uses LLVM, the family of tools that includes the clang compiler and the lld linker (on macOS, Xcode's linker). Two optimizations are on: ThinLTO, which optimizes across source files, and profile-guided optimization (PGO), which runs the code first to learn which paths are hot. Both write files only the same LLVM version can read, so the builder stops unless the compiler, linker and profile tool all match. `-Cstrict=true`, used by the gate and releases, also stops on a clang newer than the ones `[toolchain]` lists as tested.
 
 ## Vendoring
 
-`vendor/` holds what a build needs and nothing else, committed, so nothing is
-downloaded to build, and this keeps building if GitHub goes away. One rule picks
-the files, at the upstream's own paths: what `keep` names in `trimkit.toml`, and
-whatever a preprocessor dependency scan of the C++ compiling it reaches on every
-wheel target, where a reached header brings its same-named `sources`. `check`
-rescans, so it can't drift. It's about 10 MB in a checkout, half of it Eigen's
-headers, and 2.3 MB as an sdist.
+*Vendoring* means copying a library's source into this repository. `vendor/` holds what a build needs and nothing else, committed. Nothing is downloaded to build, so this keeps building if GitHub goes away. It is about 10 MB in a checkout, half of it Eigen's headers, and 2.3 MB in the sdist.
 
-`uv run scripts fetch` re-derives all of it from the pinned commits: `git status
-vendor/` then shows nothing, so anyone can check that `vendor/` is what it says.
-Our changes are edited where they live, in `vendor/`, each between
-`//// TRIMKIT PATCH: fix.name` (or `perf.name`) and `//// TRIMKIT END PATCH`.
-`uv run scripts patch` writes each one's unified diff to `vendor/patches/` (its
-reason, above the diff, kept as written), lists it by sha256, and fetches the
-upstream back from those patches to check `vendor/` comes back byte for byte;
-running it again changes nothing, and `fetch` puts every block back. A change
-outside a block is refused, naming its line, and `check` fails on a block edited
-since its patch was written.
+One rule picks the files, kept at the upstream's own paths: whatever `keep` names in `trimkit.toml`, plus every file the compiler reaches when it builds our code for any wheel target. `check` scans again, so the set can't drift.
+
+- **`uv run scripts fetch`** rebuilds all of `vendor/` from the pinned commits. Afterwards `git status vendor/` shows nothing, so anyone can confirm `vendor/` is what it claims to be.
+- **Our changes** are edited in place, each between `//// TRIMKIT PATCH: fix.name` (or `perf.name`) and `//// TRIMKIT END PATCH`.
+- **`uv run scripts patch`** writes each change as a diff in `vendor/patches/` with its reason on top, records its sha256 fingerprint, and re-fetches the upstream to prove the patches rebuild `vendor/` byte for byte.
+- **Guard rails:** a change outside a marked block is refused, naming its line. `check` fails on a block edited since its patch was written.
 
 ## Supply chain
 
 Every input that reaches a wheel, and what pins it:
 
-- Compiled code: vendored, each upstream pinned by commit and by one `tree_sha256`
-  of everything vendored for it, patches applied, which `check` verifies.
-- Python tools and dependencies: hash-locked in `uv.lock`, with a one-week
-  cooldown (`exclude-newer`); builds install them with `--require-hashes` from
-  requirements exported from the lock, and cibuildwheel itself comes from it.
-- The image: base by digest, Debian packages by snapshot date, uv by digest, and
-  the TSan CPython by sha256. Every check runs from the image's own
-  environment: nothing on the host can steer it.
-- CI: actions pinned by commit; cibuildwheel pins its Linux images by digest and
-  its macOS and Windows Pythons by sha256. `uv run scripts update` moves every
-  pin (upstreams, the lock, actions, base images) with the same cooldown.
+- **Compiled code** is vendored. Each upstream is pinned by commit and by one `tree_sha256` fingerprint of everything vendored for it, patches applied. `check` verifies it.
+- **Python tools and dependencies** are locked by hash in `uv.lock`, and nothing newer than one week is accepted (`exclude-newer`). Builds install them with `--require-hashes`.
+- **The container image** pins its base by digest (a fingerprint of its exact contents), Debian packages by snapshot date, uv by digest, and a CPython built with ThreadSanitizer (a tool that finds two threads touching the same memory unsafely) by sha256. Every check runs from the image, so nothing on your machine can steer it.
+- **CI** pins GitHub actions by commit. cibuildwheel, the tool that builds the wheels, pins its Linux images by digest and its macOS and Windows Pythons by sha256.
 
-Pinned by version or signature only, as nothing finer exists for them: clang and
-lld from the manylinux and musllinux images' own package repositories (signed),
-the macOS and Windows runners' compilers and SDKs, each held to `[toolchain]`;
-cibuildwheel's own pip, build, auditwheel and delocate; and, for someone building
-the sdist with build isolation, ninja from PyPI by version.
+`uv run scripts update` moves every pin, with the same one-week wait.
+
+A few inputs can only be pinned by version or signature, because nothing finer exists: clang and lld from the Linux images' signed package repositories; the macOS and Windows runners' compilers and SDKs (each held to `[toolchain]`); cibuildwheel's own pip, build, auditwheel and delocate; and ninja from PyPI, for someone building the sdist in an isolated environment.
 
 ## Licensing
 
-A wheel's `License-Expression` names everything compiled in, and `check` derives
-it from `trimkit.toml`. All of it is permissive (MIT, ISC, BSD, Apache-2.0,
-BSL-1.0) except Eigen's headers, MPL-2.0: file-level copyleft that binds only
-those files, which are vendored unmodified (`check` refuses a patch to them),
-built with `EIGEN_MPL2_ONLY`, and shipped as source in the sdist. Every license
-ships in the wheel, with a PEP 770 SBOM generated from `trimkit.toml`.
+A wheel's `License-Expression` names every license compiled into it, and `check` derives it from `trimkit.toml`. All are permissive (MIT, ISC, BSD, Apache-2.0, BSL-1.0) except Eigen's headers, which are MPL-2.0. That license asks only that changes to those files be shared. They are vendored unchanged (`check` refuses a patch to them), built with `EIGEN_MPL2_ONLY`, and shipped as source in the sdist. Every license text ships in the wheel, along with a machine-readable list of everything inside it (a software bill of materials, in the PEP 770 format), generated from `trimkit.toml`.

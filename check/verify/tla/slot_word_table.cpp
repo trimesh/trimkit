@@ -12,8 +12,8 @@ using trimkit::parallel::SlotWord;
 
 namespace {
 
-constexpr std::uint32_t EPOCHS = 24;  // more than any model's publishes and forks
-constexpr std::uint64_t ACTIVE = 8;   // more than any model's threads
+constexpr std::uint32_t EPOCHS = 32;  // more than any model's publishes and forks
+constexpr std::uint64_t ACTIVE = 16;  // more than any model's threads
 
 SlotWord word(std::uint32_t epoch, bool open, std::uint64_t active) {
     return SlotWord{(std::uint64_t{epoch} << 32) | (open ? SlotWord::OPEN : 0) | active};
@@ -67,10 +67,8 @@ int main() {
     table("Left", [](SlotWord w) { return w.active() >= (w.open() ? 2 : 1); }, [](SlotWord w) { print(w.left()); });
     table("Closed", [](SlotWord w) { return w.open() && w.active() >= 1; }, [](SlotWord w) { print(w.closed()); });
     // child_after_fork's, on any word, one epoch short of the table's end
-    const auto forkable = [](SlotWord w) { return w.epoch() + 1 < EPOCHS; };
-    table("FreedByFork", forkable, [](SlotWord w) { print(w.freed_by_fork()); });
-    table("ReopenedByFork", forkable, [](SlotWord w) { print(w.reopened_by_fork()); });
-    table("KeptByFork", forkable, [](SlotWord w) { print(w.kept_by_fork()); });
+    table("FreedByFork", [](SlotWord w) { return w.epoch() + 1 < EPOCHS; },
+          [](SlotWord w) { print(w.freed_by_fork()); });
     std::printf("====\n");
     return 0;
 }
