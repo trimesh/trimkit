@@ -14,7 +14,7 @@
 // released for every call inside to take it back, which each can while the
 // handler runs: none is left to lose its thread. A call that releases the
 // GIL after the gate closed keeps it instead, so it never takes it back once
-// the interpreter finalizes (tests/test_threads.py,
+// the interpreter finalizes (check/tests/test_threads.py,
 // test_exit_while_a_daemon_thread_queries, test_forked_child_exits_promptly)
 #pragma once
 

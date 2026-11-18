@@ -2,23 +2,20 @@
 //
 // WHAT IT IS
 //
-// One call runs a function over every index from 0 to n - 1, on every CPU
-// core the process may use. It is the same idea as Rayon's `par_iter` in
-// Rust, OpenMP's `parallel for`, or mapping over chunks with Python's
-// ThreadPoolExecutor: you give it a count and a body, and it hands the body
-// ranges of indexes, [begin, end), until every index has had its turn. Each
-// index is an "item". The body writes each item's output in its own place, so
-// the answer never depends on which thread ran which range.
-//
-// Everything in trimkit that uses more than one core runs through here: ray
-// queries, collisions, contours, convex decomposition (V-HACD) and UV atlases
-// (xatlas). There is one pool of worker threads per process, shared by every
-// call, and nothing else in the extension starts a thread (a lint checks).
+// One call runs a function over every index from 0 to n - 1 (each an
+// "item"), on every CPU core the process may use: the idea of Rayon's
+// `par_iter`, OpenMP's `parallel for`, or ThreadPoolExecutor.map over chunks.
+// The body is handed ranges [begin, end) until every item has had its turn,
+// and writes each item's output in its own place, so the answer never
+// depends on which thread ran which range. Everything in trimkit that uses
+// more than one core runs through here (ray queries, collisions, contours,
+// V-HACD, xatlas), on one pool of worker threads per process, and nothing
+// else in the extension starts a thread (a lint checks).
 //
 // USING IT
 //
-// Bindings call the wrappers in common.hpp, which also release the GIL and
-// check for Ctrl-C:
+// Bindings call common.hpp's wrappers, which also release the GIL and check
+// for Ctrl-C:
 //
 //     trimkit::in_parallel(rays, [&](std::size_t begin, std::size_t end) {
 //         for (std::size_t i = begin; i < end; i++) {
@@ -26,172 +23,129 @@
 //         }
 //     });
 //
-// Underneath them is the one entry point, for_each_range, which returns
-// what failed, if anything did:
-//
-//     auto failure = trimkit::parallel::for_each_range(rays, [&](std::size_t begin, std::size_t end) {
-//         for (std::size_t i = begin; i < end; i++) { hits[i] = trace(origins[i], directions[i]); }
-//     });
-//     if (failure) { std::rethrow_exception(failure); }
-//
-// It can be told more: ItemCost::Coarse when every item is worth waking a
-// thread for (a hull to split), a `min_range` when items are too cheap to
-// claim one at a time, and a Stop to poll for Ctrl-C on the calling thread.
+// Underneath is the one entry point, for_each_range, which returns what
+// failed, if anything did. It can be told ItemCost::Coarse when each item is
+// worth waking a thread for (a hull to split), a `min_range` when items are
+// too cheap to claim one at a time, and a Stop to poll for Ctrl-C.
 //
 // WHY NOT JUST START THREADS
 //
-// Starting a thread per core on every call costs tens of microseconds a call
-// (about 60 on 8 cores), which is more than many calls take. Splitting the
-// items evenly between threads leaves every thread waiting on the slowest
-// when some items cost more than others, as real meshes do. This pool keeps
-// its threads between calls; measures what an item costs instead of
-// guessing; leaves a call too small to share on the calling thread; wakes
-// only as many workers as the work pays for; and hands out smaller ranges
-// near the end, so no thread is left with a long tail. Idle workers sleep,
-// using no CPU, and exit after 10 seconds. bench/parallel.cpp compares it
-// with the serial loop and three pools written by hand, and
-// `uv run scripts bench` fails if it loses to the best of them, or uses much
-// more CPU, in any case it measures.
+// Starting a thread per core costs tens of microseconds a call (about 60 on 8
+// cores), more than many calls take, and an even split leaves every thread
+// waiting on the slowest when items cost unevenly, as real meshes do. This
+// pool keeps its threads, runs a call alone until it has run a wake-up's
+// worth of items, wakes as many helpers as the work left pays for, and hands
+// out smaller ranges near the end (the policy, below the constants). Idle
+// workers sleep, using no CPU, and exit after 10 seconds. `scripts bench`
+// fails if it loses to the serial loop or the best of three pools written by
+// hand (check/bench/parallel.cpp), or uses much more CPU, in any case it measures.
 //
-// The harder part is the promises below: a job living on the caller's stack
-// is handed to other threads, so no thread may touch it after the call
-// returns, no item may run twice, nothing may deadlock and no wake-up may be
-// lost, through exceptions, Ctrl-C, fork() and interpreter exit, on machines
-// that reorder memory. What checks them, every time `uv run scripts check`
-// runs, each failing the run on any break:
+// WHAT CHECKS IT, on every `scripts check`, each failing the run on any break
 //
-//   - verify/genmc: GenMC runs this header itself, built for it (platform.hpp,
-//     TRIMKIT_GENMC), in every execution the C++ memory model allows, for
-//     one call of a few items with its worker: T1 (the body's outputs are
-//     plain data, so a missing happens-before is a reported race), T2, T3,
-//     T4 for a failing body and for a stop, a call as the interpreter exits,
-//     the thread indexes, and Exclusively, ChunkList and the exit gate below.
-//     Each harness must explore at least a recorded number of executions,
-//     and each memory order here weakened one step must make some harness
-//     fail, or be listed in the stage with why it can't (a wake GenMC can't
-//     see lost, as its waits return at once; two jobs). Two jobs at once are
-//     too many executions for it (some 170 million), so two callers,
-//     nesting and a slot's reuse are the model's.
-//   - verify/tla/Scheduler.tla: TLC checks the protocol in every
+// The hard part is a job on the caller's stack handed to other threads: no
+// thread may touch it after the call returns, no item may run twice, nothing
+// may deadlock and no wake-up may be lost, through exceptions, Ctrl-C, fork()
+// and interpreter exit, on machines that reorder memory.
+//   - check/verify/genmc: GenMC runs this header (platform.hpp's TRIMKIT_GENMC) in
+//     every execution the C++ memory model allows, for one call of a few
+//     items with its worker: T1 (a missing happens-before is a race on the
+//     body's plain outputs), T2, T3, T4 for a failing body and a stop, a call
+//     as the interpreter exits, the thread indexes, Exclusively, ChunkList and
+//     the exit gate. Each harness explores at least a recorded number of
+//     executions, and each memory order here weakened one step fails some
+//     harness or is listed with why it can't. Two jobs at once are too many
+//     executions (some 170 million): two callers, nesting and slot reuse are
+//     the model's.
+//   - check/verify/tla/Scheduler.tla: TLC checks the protocol in every
 //     interleaving at small sizes, with every choice the policy makes free:
 //     publish, join, leave, close and wait; the wake, spinning and live
-//     counts, waking some number of workers, idle exit and its replacement;
-//     the thread indexes; up to two forks, from any thread in a body or a
-//     caller's poll; a worker's thread ending in a body; and the
-//     interpreter's exit. Each of its mutations breaks one
+//     counts; idle exit and its replacement; the thread indexes; up to two
+//     forks, from a body or a poll; a thread ending in a body; the
+//     interpreter's exit; and P3, that no call wakes or starts more workers
+//     than it asked for but to replace one it lost, and that a worker roused
+//     for a call sleeps again only once that call has nothing left to hand
+//     out (or stopped, or returned). Each mutation breaks one
 //     guard and must be found as the promise it breaks. Its steps are this
-//     file's (a lint holds CallerStep and WorkerStep to its actions), and its
-//     slot word arithmetic is SlotWord's own, generated from it each run.
-//   - verify/tla/SchedulerTrace.tla: the code held to that model. A traced
-//     build of this header (TRIMKIT_TRACE: every TraceStep below logs which
-//     action of the model it is, and the shared state after it) runs real
-//     calls on the real pool, an idle exit included, and TLC must find that
-//     the model allows every step of every log, from where the last left it.
-//     Three reorderings of this file's steps must each be found doing a step
-//     the model doesn't allow.
-//   - Checked builds (TRIMKIT_CHECKED, every sanitized build and fuzzer):
-//     each transition of a slot asserts the state it found, on this header as
-//     compiled, at real sizes.
-//   - fuzz/parallel.cpp, under AddressSanitizer: any count, cost and number
-//     of callers, with items that throw, nest and sleep; and fixed checks, each
-//     shown to fail before its fix, for a poll that throws, a thread that ends
-//     inside an item, exit, fork from a worker and from a held slot, a
-//     small call waking no one, and a min_range past the count.
-//   - tests/test_threads.py, under ThreadSanitizer too: fork from inside a
-//     call, a forked child's exit, exit during a call, and the workers
-//     following CPU affinity.
-//   - A lint over everything the extension compiles: nothing outside this
-//     header and platform.hpp starts, waits on or sleeps a thread, but for
-//     common.hpp's Ctrl-C poll.
-// The two checkers are exhaustive only at those small sizes; at real sizes,
-// the fuzzer and the sanitizers run what the machine happens to schedule.
-// GenMC's waits return at once (a wait may), so it checks that every wait
-// ends, and TLC, whose sleeps have no timeouts, that no wake is lost.
+//     file's (a lint holds CallerStep, WorkerStep and every TraceStep to its
+//     actions), and its slot arithmetic is SlotWord's, generated each run.
+//   - check/verify/tla/SchedulerTrace.tla: a traced build (TRIMKIT_TRACE: each
+//     TraceStep logs its action and the shared state after it) runs real
+//     calls on the real pool, an idle exit included, and TLC must find the
+//     model allows every step of every log, each wake waking as many as the
+//     system said it did, and P3 holding along it. Three
+//     reorderings of this file's steps must each be rejected.
+//   - Checked builds (TRIMKIT_CHECKED: every sanitized build and fuzzer):
+//     each slot transition asserts the state it found, and each call W1.
+//   - check/fuzz/parallel.cpp, under ASan: any count, cost, ItemCost, min_range and
+//     number of callers, with items that throw, nest and sleep; the policy's
+//     rules over grids of inputs; and fixed checks for a poll that throws, a
+//     thread ending in an item, exit, fork from a worker and a held slot, W1
+//     on real calls, a min_range past the count, and too many items.
+//   - check/tests/test_threads.py, under ThreadSanitizer too: fork inside a call, a
+//     forked child's exit, exit during a call, the workers following
+//     affinity.
+//   - A lint over all the extension compiles: only this header and
+//     platform.hpp start, wait on or sleep a thread, but common.hpp's poll.
+// The checkers are exhaustive only at small sizes; at real sizes the fuzzer
+// and sanitizers run what the machine schedules. GenMC's waits return at once
+// (a wait may), so it checks every wait ends; TLC's sleeps have no timeouts,
+// so it checks no wake is lost.
 //
 // WHAT A CALL PROMISES, however it ends (return, exception, Ctrl-C, fork, exit)
 //
 //   T1 Once for_each_range returns, or an exception unwinds out of it, no other
 //      thread touches the job or the body again, and everything the body
-//      wrote is visible to the caller. So the job, the body and the outputs
-//      can all live on the caller's stack.
-//   T2 Each item runs at most once. If nothing stopped the call, each item
-//      ran exactly once.
-//   T3 It always returns. The calling thread runs items too, so the call
-//      finishes even if no worker ever starts; it waits only for workers
-//      already running one of its ranges, never for one to start or wake.
+//      wrote is visible to the caller: the job, the body and the outputs can
+//      all live on the caller's stack.
+//   T2 Each item runs at most once; if nothing stopped the call, exactly once.
+//   T3 It always returns. The calling thread runs items too, so the call ends
+//      even if no worker ever starts; it waits only for workers already
+//      running one of its ranges, never for one to start or wake.
 //   T4 If the body throws, the job stops handing out ranges, and
 //      for_each_range returns one of the exceptions. A Stop that says stop
-//      (Ctrl-C) stops it the same way.
+//      (Ctrl-C) stops it the same way, but no failure is returned: the caller
+//      knows it asked, and that some items may not have run.
 //   T5 A fork() during a call never gives the child a wrong answer: if a
 //      worker was in the middle of the job, the child's call fails instead.
 //      As the interpreter exits, every job stops, and fails rather than
 //      return part of an answer.
-//   And a call worth less than about two wake-ups of a sleeping thread
-//   (helpers_wanted) wakes no sleeping thread: the calling thread runs it,
-//   with help only from workers still spinning from an earlier call, and it
-//   makes no system call but, at most every CAP_REFRESH_NS, the reads of
-//   which CPUs the process may use, unless the caller must wait for one of
-//   those workers to finish its range.
+//   And the scheduling policy's W1 to W3 and C1, stated with it.
 //
 // WHAT IT DOES NOT PROMISE
 //
 // Which thread runs which range, in what order, how big the ranges are, or
-// how many threads help. These change from call to call. Only the speed
+// how many threads help: these change from call to call, and only the speed
 // depends on them, unless the body lets its answer depend on them.
 //
 // SHARP EDGES: rules for the body
 //
-//   - Items must not wait on each other, or on anything the caller holds. The
-//     caller waits for workers inside its ranges, so an item that waits for
-//     the caller can never finish: a deadlock. The GIL is the one exception
-//     an item may take, and only on the calling thread, to poll for Ctrl-C
-//     (xatlas's progress callback does): every caller releases the GIL before
-//     it waits on the pool, so whoever holds it is never waiting for this
-//     call. Checked builds catch Exclusively taken in a body, and a body
-//     calling back into the pool from Python.
-//   - The body runs on worker threads as well as the caller's. Workers have
-//     8 MB stacks and block every signal. Per-thread scratch must be indexed
-//     by thread_index(), which no two threads of one call share.
-//   - The body must not fork, start threads, longjmp out, or end its thread.
-//     If a thread does end inside the body anyway, the call fails, rather
-//     than return without the items that thread held (run_range).
-//   - A body that throws stops the job early, so some items may never run:
-//     check the failure for_each_range returns before using any output.
+//   - Items must not wait on each other or on anything the caller holds: the
+//     caller waits for workers inside its ranges, so that is a deadlock. The
+//     GIL is the one exception, and only on the calling thread, to poll for
+//     Ctrl-C (xatlas's progress callback): every caller releases it before it
+//     waits on the pool. Checked builds catch Exclusively taken in a body, and
+//     a body calling back into the pool from Python.
+//   - The body runs on worker threads too, with 8 MB stacks and every signal
+//     blocked. Per-thread scratch is indexed by thread_index(), which no two
+//     threads of one call share.
+//   - The body must not fork, start threads, longjmp out, or end its thread;
+//     a thread that ends inside it anyway fails the call (run_range).
+//   - A body that throws stops the job early: check the failure before using
+//     any output.
 //   - A body may call for_each_range itself. At most SLOTS jobs share the
-//     workers at once; a call that finds every slot taken runs on its own
-//     thread.
-//   - `count` must be at most SIZE_MAX / 2 (more fails with TooManyItems).
-//     The Stop's poll runs only on the calling thread, between its ranges.
-//   - Only Linux runs this header's fuzzers, ThreadSanitizer and lints. The
-//     Windows and macOS sleep and wake code builds there, and every wheel
-//     runs the test suite, but none of it is stress tested there.
-//
-// HOW IT WORKS
-//
-//   1. The caller runs a few items itself, to learn what one costs: ranges
-//      of 1, 2, 4, ... items, until one takes PROBE_NS.
-//   2. After each of its ranges it asks how many helpers the work left is
-//      worth (helpers_wanted): each must get at least one wake-up's worth of
-//      work, and how long a wake-up takes, W, is measured as the pool runs.
-//   3. Once that is any, it publishes the job in a free slot and wakes that
-//      many sleeping workers, fewer if some are still spinning from the last
-//      job, as those find it themselves.
-//   4. Everyone, the caller included, takes ranges from one shared counter.
-//      Each thread sizes its next range by what it has measured: small at
-//      first, doubling up to GRAIN_NS, and never more than half an even share
-//      of what is left (claim_items).
-//   5. When the counter runs out, the caller closes the slot, so no new
-//      worker can join, and waits for the workers still inside a range.
-//   6. A worker with nothing to do spins for a moment (a quarter of the work
-//      it just did, at most W), then sleeps, and exits after IDLE_EXIT_MS.
+//     workers at once; a call that finds every slot taken runs alone, and
+//     tries again after each of its ranges.
+//   - `count` is at most MAX_ITEMS, 2^53 (more fails with TooManyItems). The
+//     Stop's poll runs only on the calling thread, between its ranges.
+//   - Only Linux runs the fuzzers, ThreadSanitizer and lints. The Windows and
+//     macOS sleep and wake code builds there, and every wheel runs the tests.
 //
 // FOR REVIEWERS: the slot protocol
 //
-// The state, checked in every interleaving by verify/tla/Scheduler.tla (each
+// The state, checked in every interleaving by check/verify/tla/Scheduler.tla (each
 // transition a function of the same name below, and SlotWord's arithmetic):
 //   JobSlot.word = epoch (32 bits) | OPEN | active (31 bits): active counts
-//   the caller and the workers that joined. A slot is free when OPEN and
-//   active are both clear.
+//   the caller and the workers that joined; free when OPEN and active are 0.
 //   try_publish   free slot: epoch + 1, active 1, store the job, then OPEN
 //   join_job      CAS from the exact word seen (OPEN, that epoch) to active + 1
 //   leave_job     active - 1; the last out of a closed job wakes the caller
@@ -199,18 +153,16 @@
 // A worker touches a job only between a successful join and its leave, a
 // join succeeds only while that job's epoch is open, and a caller returns
 // only after closing and seeing active reach 0: so no worker touches a job
-// after its caller has returned (T1). The word only ever changes by
-// read-modify-writes, so checked builds (TRIMKIT_CHECKED: every sanitized
-// build, and the fuzzers) check each transition's old word as it happens,
-// which holds the whole protocol to its states at real sizes.
+// after its caller has returned (T1). The word changes only by
+// read-modify-writes, so checked builds check each transition's old word as
+// it happens, holding the protocol to its states at real sizes.
 //
 // Threads sleep by waiting on an address (futex, WaitOnAddress, __ulock),
-// which compares the word and sleeps in one step, so no wake-up is lost, and
-// the pool holds no lock a fork could leave held in the child (Exclusively is
-// the extension's own, whose users refuse a device the parent opened): the
-// child frees
-// every slot but those its one thread is still inside (child_after_fork), and
-// starts its own workers when it needs them.
+// which compares and sleeps in one step, so no wake-up is lost, and the pool
+// holds no lock a fork could leave held (Exclusively is the extension's own,
+// whose users refuse a device the parent opened): the child frees every slot
+// but those its one thread is still inside (child_after_fork), and starts its
+// own workers when it needs them.
 #pragma once
 
 #include "platform.hpp"
@@ -228,7 +180,7 @@
 namespace trimkit::parallel {
 
 // The lesser and the greater of two values: <algorithm> is one header GenMC
-// can't compile (verify/genmc), and these are all this file needs of it.
+// can't compile (check/verify/genmc), and these are all this file needs of it.
 // For the same reason every compare-exchange here is the strong one: GenMC
 // models a weak one failing for no reason, which makes any loop retrying it
 // unbounded, and on x86 the two are one instruction
@@ -241,9 +193,7 @@ constexpr T most(T a, T b) {
     return a < b ? b : a;
 }
 
-// =============================================================================
-// The entry point
-// =============================================================================
+// -- The entry point ----------------------------------------------------------
 
 // What the caller knows about what one item costs
 enum class ItemCost : std::uint8_t {
@@ -268,30 +218,12 @@ template <typename Body>
 platform::Failure for_each_range(std::size_t count, const Body& body, ItemCost cost = ItemCost::Measured,
                                  std::size_t min_range = 1, Stop stop = {});
 
-// =============================================================================
-// Constants, each with where its value comes from
-// =============================================================================
+// -- Constants, each with where its value comes from --------------------------
 
-// The policy's (helpers_wanted, claim_items). W, how long waking a sleeping
-// worker takes until it runs an item, is measured as the pool runs; these are
-// fixed
-constexpr double PROBE_NS = 2'000;          // a probe range this long ends the probe: 100 reads of a fast clock,
-                                            // and a tenth of W, so the call decides before help could arrive
-constexpr double MIN_CLAIM_NS = 4'000;      // a thread's first claim in a job: a claim costs about 100 ns
-                                            // when contended, 2.5% of this
-constexpr double GRAIN_NS = 50'000;         // claims double up to this, so they are rare; they shrink near the end
-constexpr double DEFAULT_WAKE_NS = 20'000;  // W before any wake is measured, and once a measure is stale
-constexpr double MIN_WAKE_NS = 5'000;       // a measured W is clamped to this and the next: no wake is cheaper
-constexpr double MAX_WAKE_NS = 200'000;     // than a context switch, and none slower than this is believed
-constexpr std::int64_t STALE_WAKE_NS = 1'000'000'000;  // a W not measured for this long is forgotten
-constexpr std::int64_t CAP_REFRESH_NS = 100'000'000;   // the CPUs this process may use, read at most this often
-
-// The protocol's. A sleeping worker costs no CPU and only the stack pages it
-// touched, so a long wait keeps the pool warm across interactive use, at the
-// cost that Python warns on os.fork() while threads are alive. Under GenMC
-// (platform::MODEL_CHECKING) an idle worker exits at once, so every thread
-// of a checked execution ends, and a caller left waiting shows as a run that
-// never finishes
+// A sleeping worker costs no CPU, so a long idle exit keeps the pool warm
+// across interactive use (Python then warns on os.fork() while threads live).
+// Under GenMC an idle worker exits at once, so every thread of a checked
+// execution ends, and a caller left waiting shows as a run that never ends
 constexpr std::uint32_t IDLE_EXIT_MS = platform::MODEL_CHECKING ? 0 : 10'000;
 constexpr std::uint32_t POLL_MS = 50;  // a waiting caller polls for Ctrl-C this often
 // jobs shared at once; a caller finding none runs alone. Two under GenMC, as
@@ -299,10 +231,113 @@ constexpr std::uint32_t POLL_MS = 50;  // a waiting caller polls for Ctrl-C this
 constexpr std::size_t SLOTS = platform::MODEL_CHECKING ? 2 : 4;
 constexpr std::size_t WORKER_STACK = std::size_t{8} << 20;  // a main thread's stack: musl's 128 KB has overflowed
 constexpr std::uint32_t MAX_THREAD_SLOTS = 1024;            // thread indexes there can be (thread_slots)
+constexpr std::int64_t CAP_REFRESH_NS = 100'000'000;        // the CPUs this process may use, read at most this often
+// the most items one call takes: each thread in a job (at most MAX_THREAD_SLOTS)
+// may move `next` on by up to `count` after it last saw items left, so this
+// keeps `next` from wrapping (claim_range), at 2^53 items on 64 bits
+constexpr std::size_t MAX_ITEMS = SIZE_MAX / (2 * std::size_t{MAX_THREAD_SLOTS});
 
-// =============================================================================
-// Checked and counted builds
-// =============================================================================
+// -- The scheduling policy: every choice the pool makes, as pure functions ----
+
+// When a call wakes helpers and how many, how long an idle thread spins, and
+// how big a claim is: functions of plain values, no clock and no atomic. The
+// protocol below measures, asks, and acts, and never trusts an answer for T1
+// to T5 (check/verify/tla leaves every one of these choices free). C, WAKE_COST_NS,
+// is the CPU one wake costs: a system call and two context switches, 4 to 6 us
+// measured on x86, which `scripts bench` reports on each machine. Nothing
+// predicts when a woken worker arrives: one that comes late finds the counter
+// empty and leaves.
+//   W1 A Measured call wakes no one until its caller has run items for C; till
+//      then only workers still spinning from an earlier call help.
+//   W2 Then it wants one helper per 2C of the work left, at the mean cost of
+//      what its caller ran, at most the cap and the items left but its own. A
+//      helper costs C to wake and at most C spinning after (W3), so helpers
+//      cost at most the work they share, and a call at most cap x 2C (a dear
+//      or stalled first range can overstate the work). Decided after each of
+//      the caller's ranges, from what is left then. Coarse wants every helper
+//      the items can use, at once.
+//   W3 An idle thread spins at most C, then sleeps: spin-then-block.
+//   C1 A claim is at least min_range and 1, and at most that or half an even
+//      share of what is left: guided self-scheduling, so the last claims are
+//      short. Within those it aims to take as long as its thread has already
+//      run the job, MIN_CLAIM_NS to MAX_CLAIM_NS, at its last range's cost an
+//      item. With no stealing, a claim too big would idle the helpers: a range
+//      shorter than TIMED_NS is counted as TIMED_NS, which only ever makes the
+//      next claim smaller than its aim.
+// The cap is the CPUs this process may use (affinity, narrowed by any cgroup
+// quota) less the caller, read at most every CAP_REFRESH_NS (worker_cap). P3
+// (check/verify/tla) holds the protocol to waking no more than this asks
+namespace policy {
+
+constexpr double WAKE_COST_NS = 5'000;   // C
+constexpr double TIMED_NS = 2'000;       // the shortest range timed as itself: 100 reads of a fast clock
+constexpr double MIN_CLAIM_NS = 4'000;   // a contended claim costs about 100 ns, 2.5% of this
+constexpr double MAX_CLAIM_NS = 50'000;  // claims grow to this, so they are rare
+
+// What one thread has run of one job: its ranges' time and items, and its
+// last range's time per item (0: none yet), an overstatement when it was short
+struct Ran {
+    double ns = 0;
+    std::size_t items = 0;
+    double item_ns = 0;
+};
+
+// What a thread has run after one more range of `items` that took `took_ns`.
+// `most` puts the constant first, so NaN gives TIMED_NS, and a time below 0
+// adds none
+constexpr Ran after_range(Ran ran, double took_ns, std::size_t items) {
+    return Ran{ran.ns + most(0.0, took_ns), ran.items + items, most(TIMED_NS, took_ns) / static_cast<double>(items)};
+}
+
+// How many items the thread's next claim takes (C1)
+constexpr std::size_t claim_items(Ran ran, std::size_t left, std::uint32_t sharing, std::size_t min_range) {
+    const std::size_t share = most<std::size_t>(1, left / (2 * std::size_t{most(1U, sharing)}));
+    std::size_t take = 1;
+    if (ran.item_ns > 0) {
+        const double by_time = least(MAX_CLAIM_NS, most(MIN_CLAIM_NS, ran.ns)) / ran.item_ns;
+        take = by_time >= static_cast<double>(share) ? share : most<std::size_t>(1, static_cast<std::size_t>(by_time));
+    }
+    return most(take, min_range);
+}
+
+// How many helpers a call wants now, its caller having run `caller` (W1, W2)
+constexpr std::uint32_t helpers_wanted(ItemCost cost, Ran caller, std::size_t left, std::uint32_t cap) {
+    const auto room = static_cast<std::uint32_t>(least<std::size_t>(cap, left > 0 ? left - 1 : 0));
+    if (cost == ItemCost::Coarse || room == 0) {
+        return room;
+    }
+    if (!(caller.ns >= WAKE_COST_NS) || caller.items == 0) {
+        return 0;  // and NaN
+    }
+    const double work_left = caller.ns / static_cast<double>(caller.items) * static_cast<double>(left);
+    return static_cast<std::uint32_t>(least(static_cast<double>(room), work_left / (2 * WAKE_COST_NS)));
+}
+
+// Whether a call shares its job before running anything: Coarse, or workers
+// already spinning, which join for no wake (wanting none, by W1)
+constexpr bool share_at_once(ItemCost cost, std::uint32_t spinning, std::uint32_t cap) {
+    return cap > 0 && (cost == ItemCost::Coarse || spinning > 0);
+}
+
+// How long an idle worker spins before it sleeps (W3), and a caller before it
+// sleeps waiting on workers inside their last claims, two first claims long.
+// None under GenMC, whose clock stands still while a thread waits
+constexpr double spin_ns() { return platform::MODEL_CHECKING ? 0.0 : WAKE_COST_NS; }
+constexpr double close_spin_ns() { return platform::MODEL_CHECKING ? 0.0 : 2 * MIN_CLAIM_NS; }
+
+static_assert(helpers_wanted(ItemCost::Measured, Ran{WAKE_COST_NS - 1, 1'000, 1e9}, 1'000'000, 255) == 0, "W1");
+static_assert(helpers_wanted(ItemCost::Measured, Ran{WAKE_COST_NS, 10, 0}, 41, 255) == 2, "W2: 20.5 us left, 2C each");
+static_assert(helpers_wanted(ItemCost::Measured, Ran{1e12, 1, 0}, 2, 255) == 1, "W2: no more than the items left");
+static_assert(helpers_wanted(ItemCost::Coarse, Ran{}, 5, 3) == 3 && helpers_wanted(ItemCost::Coarse, Ran{}, 5, 9) == 4);
+static_assert(spin_ns() <= WAKE_COST_NS, "W3");
+static_assert(claim_items(Ran{}, 0, 1, 1) == 1 && claim_items(Ran{}, 100, 1, 7) == 7, "C1: never empty, min_range");
+static_assert(claim_items(Ran{0, 0, 1e-3}, 1'000, 4, 1) == 125, "C1: half an even share");
+static_assert(after_range(Ran{}, 10, 4).item_ns == TIMED_NS / 4, "a short range overstates its cost");
+static_assert(!share_at_once(ItemCost::Measured, 0, 7) && !share_at_once(ItemCost::Coarse, 1, 0));
+
+}  // namespace policy
+
+// -- Checked and counted builds -----------------------------------------------
 
 // Checked builds (TRIMKIT_CHECKED: every sanitized build, and the fuzzers)
 // check what the pool and its callers promise each other at each step, and a
@@ -322,8 +357,7 @@ inline void checked(bool kept, const char* promise) {
 }
 
 // Counted builds (TRIMKIT_PARALLEL_COUNTERS: the benchmark and the fuzzer)
-// count what the pool did, so a bound such as "a small call wakes no one"
-// can be checked, and the benchmark can say what each call cost. Free elsewhere
+// count what the pool did, for W1 on real calls and what each call cost
 #if defined(TRIMKIT_PARALLEL_COUNTERS)
 constexpr bool COUNTED = true;
 #else
@@ -335,13 +369,15 @@ struct PoolCounters {
     std::atomic<std::uint64_t> wakes{0};      // calls that woke sleeping workers
     std::atomic<std::uint64_t> sleeps{0};     // sleeps on a word, by callers and workers
     std::atomic<std::uint64_t> spawns{0};     // worker threads started
+    std::atomic<std::uint64_t> woken{0};      // sleeping workers woken, as the system counts them
+    std::atomic<std::uint64_t> spin_ns{0};    // time idle workers spent spinning before they slept or saw a wake
 };
 inline PoolCounters counters;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // One more of `counter`, in a counted build
-inline void count(std::atomic<std::uint64_t>& counter) {
+inline void count(std::atomic<std::uint64_t>& counter, std::uint64_t by = 1) {
     if constexpr (COUNTED) {
-        counter.fetch_add(1, std::memory_order_relaxed);
+        counter.fetch_add(by, std::memory_order_relaxed);
     }
 }
 
@@ -350,9 +386,7 @@ inline void count(std::atomic<std::uint64_t>& counter) {
 inline thread_local std::uint32_t bodies_running = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 inline thread_local bool holding_exclusively = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// =============================================================================
-// What a call fails with when the pool, not its body, ends it
-// =============================================================================
+// -- What a call fails with when the pool, not its body, ends it --------------
 
 struct StoppedAtExit : std::exception {
     const char* what() const noexcept override { return "the interpreter is exiting: this call was stopped"; }
@@ -369,9 +403,7 @@ struct TooManyItems : std::exception {
     const char* what() const noexcept override { return "too many items for one call"; }
 };
 
-// =============================================================================
-// The state: a job, its slot word, the slots, the pool
-// =============================================================================
+// -- The state: a job, its slot word, the slots, the pool ---------------------
 
 // One call: its items and body, and what the threads sharing it agree on. It
 // lives on the caller's stack, and only threads counted in its slot touch it
@@ -389,9 +421,6 @@ struct RangeJob {
     // joins starts from both, then measures its own ranges
     std::atomic<std::uint64_t> item_cost_16{0};
     std::atomic<std::uint32_t> sharing{1};
-    // when the caller last woke sleeping workers for it (0: it hasn't, or one
-    // already took the measure): the first to join measures W
-    std::atomic<std::int64_t> woke_at{0};
     std::atomic<bool> stopped{false};  // a failure, a poll, a fork or the exit: no more ranges
     std::atomic<bool> failure_claimed{false};
     platform::Failure failure;  // the first, read by the caller once the job is closed
@@ -400,12 +429,9 @@ struct RangeJob {
     std::atomic<bool> forked{false};
 };
 
-// One slot's word: epoch (32 bits) | OPEN | active (31 bits). `active` counts
-// the caller and the workers inside its job; the epoch numbers each job the
-// slot has held. Every transition is one read-modify-write by the delta below
-// (but the fork's, on the child's one thread), so the word's history is one
-// total order, and each transition is one of these functions: what the model
-// checks (verify/tla, from a table this generates) and checked builds assert
+// One slot's word (FOR REVIEWERS, at the top). Each transition is one
+// read-modify-write by a delta below (but the fork's, on the child's one
+// thread): the functions the model checks, from a table this generates
 struct SlotWord {
     static constexpr std::uint64_t OPEN = std::uint64_t{1} << 31;
     static constexpr std::uint64_t ACTIVE = OPEN - 1;
@@ -465,8 +491,6 @@ struct WorkerPool {
     std::atomic<std::uint32_t> wanted{0};            // how many workers the last wake wanted
     std::atomic<std::uint32_t> cap{0};               // the most workers: CPUs this process may use, less 1
     std::atomic<std::int64_t> cap_read_at{0};        // when `cap` was last read from the system (0: never)
-    std::atomic<std::uint32_t> wake_ns{static_cast<std::uint32_t>(DEFAULT_WAKE_NS)};  // W, as measured
-    std::atomic<std::int64_t> wake_measured_at{0};
 };
 inline WorkerPool pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -477,22 +501,12 @@ inline void park(std::atomic<std::uint32_t>& word, std::uint32_t expected, std::
     platform::wait_while_equal(word, expected, timeout_ms);
 }
 
-// =============================================================================
-// Traced builds: each step of the protocol, logged for the model to replay
-// =============================================================================
+// -- Traced builds: each step of the protocol, logged for the model to replay ---
 
-// Traced builds (TRIMKIT_TRACE: verify/tla/trace.cpp alone) log every step of
-// the protocol below as the action of the model it is (verify/tla/Scheduler.tla,
-// each TraceStep's name), with the shared state just after it. A step holds
-// one lock from its start to its end, so the log is one order the steps took,
-// each an atomic step; `uv run scripts model` then checks that the model allows
-// every step of the log in turn, from where the last one left it
-// (verify/tla/SchedulerTrace.tla). Anywhere else a step is its code alone
-#if defined(TRIMKIT_TRACE)
-constexpr bool TRACED = true;
-#else
-constexpr bool TRACED = false;
-#endif
+// Traced builds (TRIMKIT_TRACE: check/verify/tla/trace.cpp alone) log each step
+// below as its model action, with the shared state after it. A step holds one
+// lock from start to end, so the log is one order the steps took, each atomic,
+// which check/verify/tla/SchedulerTrace.tla replays. Anywhere else a step is nothing
 
 // One step as logged: its thread, its action, what it took (a range, a count),
 // and every slot word and `left`, the wake, spinning and live counts after it
@@ -507,7 +521,7 @@ struct TraceRecord {
     std::uint32_t live = 0;
 };
 
-// The log, which verify/tla/trace.cpp provides, and the lock each step holds
+// The log, which check/verify/tla/trace.cpp provides, and the lock each step holds
 struct TraceLog {
     TraceRecord* records = nullptr;
     std::size_t capacity = 0;
@@ -582,9 +596,7 @@ public:
 };
 #endif
 
-// =============================================================================
-// The exit gate: no call is left part way when the interpreter exits
-// =============================================================================
+// -- The exit gate: no call is left part way when the interpreter exits -------
 
 // Calls that might still be running as the interpreter exits count themselves
 // in (gil.hpp's GilReleased: every call that lets Python run beside it). At
@@ -594,7 +606,7 @@ public:
 // closed it waits for every call inside to leave. A call counts itself in
 // before it reads whether the gate is closed, and the closer closes it before
 // it reads the count, both sequentially consistent, so either the call sees
-// the gate closed or the closer sees the call (verify/genmc, exit_gate)
+// the gate closed or the closer sees the call (check/verify/genmc, exit_gate)
 struct ExitGate {
     std::atomic<bool> closed{false};
     std::atomic<std::uint32_t> inside{0};
@@ -639,56 +651,7 @@ inline void wait_for_exit_gate() {
     }
 }
 
-// =============================================================================
-// The policy: pure functions of what has been measured
-// =============================================================================
-
-// How many helpers `left_ns` of work pays for, given W = `wake_ns`: each must
-// get at least a wake's worth of work, so want = (L - W) / W, none below 2W.
-// Under that the caller finishes alone sooner than anyone could be woken
-inline std::uint32_t helpers_wanted(double left_ns, double wake_ns, std::uint32_t cap) {
-    if (left_ns < 2.0 * wake_ns) {
-        return 0;
-    }
-    return static_cast<std::uint32_t>(least<double>(cap, (left_ns - wake_ns) / wake_ns));
-}
-
-// How many items one claim takes: about `claim_ns` of work at `item_ns` an
-// item, but never more than half an even share of what is left among the
-// `sharing` threads (guided self-scheduling: the last claims shrink, so no
-// thread is left with a long tail), never fewer than `min_range`, and never
-// none. Before anything is measured (`item_ns` 0), `min_range`, then timed
-inline std::size_t claim_items(double claim_ns, double item_ns, std::size_t left, std::uint32_t sharing,
-                               std::size_t min_range = 1) {
-    const std::size_t share = most<std::size_t>(1, left / (2 * std::size_t{most(1U, sharing)}));
-    std::size_t take = 1;
-    if (item_ns > 0.0) {
-        const double by_time = claim_ns / item_ns;
-        take = by_time >= static_cast<double>(share) ? share : most<std::size_t>(1, static_cast<std::size_t>(by_time));
-    }
-    return most(take, min_range);
-}
-
-// One thread's view of a job's cost: an item's measured cost, and how long
-// its next claim aims to take, which doubles from MIN_CLAIM_NS to GRAIN_NS
-struct RangeCost {
-    double item_ns = 0.0;
-    double claim_ns = MIN_CLAIM_NS;
-
-    // A range of `items` took `took_ns`. Far from the estimate, either way,
-    // and the estimate is replaced at once (a front-loaded job's costs change
-    // 20 times over); near it, it drifts
-    void measured(double took_ns, std::size_t items) {
-        const double each = most(1.0, took_ns / static_cast<double>(items));
-        item_ns =
-            item_ns <= 0.0 || each > 4.0 * item_ns || each < item_ns / 4.0 ? each : ((3.0 * item_ns) + each) / 4.0;
-        claim_ns = least(GRAIN_NS, 2.0 * claim_ns);
-    }
-};
-
-// =============================================================================
-// Thread indexes: per-thread scratch for a library that keeps it (xatlas)
-// =============================================================================
+// -- Thread indexes: per-thread scratch for a library that keeps it (xatlas) ---
 
 // Every thread running the items of any one job has its own index below
 // thread_slots(): a caller's is 0 (a worker that calls for_each_range from a
@@ -748,30 +711,34 @@ inline std::uint32_t worker_cap() {
     return cap;
 }
 
-// =============================================================================
-// Running items, and how a job stops
-// =============================================================================
+// -- Running items, and how a job stops ---------------------------------------
 
 // The items not yet handed out (an estimate while others claim)
 inline std::size_t items_left(const RangeJob& job) {
     return job.count - least(job.count, job.next.load(std::memory_order_relaxed));
 }
 
-// The next range of `take` items (fewer at the end) into [*begin, *end): false
-// once none are left or the job has stopped. Never empty, so every claim moves
-// `next` on and the job ends (T2, T3). `next` passes `count` only by the takes
-// in flight, one a thread, so with `count` at most SIZE_MAX / 2 it never wraps
-inline bool claim_range(RangeJob& job, std::size_t take, std::size_t* begin, std::size_t* end) {
+// The next range, sized by the policy for a thread that has run `ran` of the
+// job (C1), into [*begin, *end), as the model's step `action`: false once none
+// are left or the job has stopped. Never empty, whatever the policy says, so
+// every claim moves `next` on and the job ends (T2, T3). `next` passes `count`
+// only by the takes in flight, one a thread, so with `count` at most MAX_ITEMS
+// it never wraps
+inline bool claim_range(RangeJob& job, const policy::Ran& ran, const char* action, std::size_t* begin,
+                        std::size_t* end) {
+    const std::size_t take = most<std::size_t>(
+        1, policy::claim_items(ran, items_left(job), job.sharing.load(std::memory_order_relaxed), job.min_range));
+    const TraceStep step(action);
     if (job.stopped.load(std::memory_order_relaxed) || exit_gate_closed() ||
         job.next.load(std::memory_order_relaxed) >= job.count) {
         return false;
     }
-    take = most<std::size_t>(1, take);
     *begin = job.next.fetch_add(take, std::memory_order_relaxed);  // atomicity alone: each item claimed once (T2)
     if (*begin >= job.count) {
         return false;
     }
     *end = *begin + least(take, job.count - *begin);
+    step.took(*begin + 1, *end + 1);  // the model numbers items from 1
     return true;
 }
 
@@ -783,9 +750,10 @@ inline void fail_job(RangeJob& job, platform::Failure failure) {
     job.stopped.store(true, std::memory_order_relaxed);
 }
 
-// Items [begin, end) run on this thread. What they throw fails the job; a
-// thread ending inside them fails it too, as their items never run
-inline void run_range(RangeJob& job, std::size_t begin, std::size_t end) {
+// Items [begin, end) run on this thread, timed: what it has run after them.
+// What they throw fails the job; a thread ending inside them fails it too, as
+// their items never run
+inline policy::Ran run_range(RangeJob& job, const policy::Ran& ran, std::size_t begin, std::size_t end) {
     struct Running {
         Running() {
             if constexpr (CHECKED) {
@@ -800,11 +768,14 @@ inline void run_range(RangeJob& job, std::size_t begin, std::size_t end) {
         Running(const Running&) = delete;
         Running& operator=(const Running&) = delete;
     } const running;
+    const std::int64_t start = platform::monotonic_ns();
     platform::Failure failure = platform::run_catching(
         [&] { job.run(job.body, begin, end); }, [&] { fail_job(job, platform::failure<ThreadEndedDuringCall>()); });
+    const auto took = static_cast<double>(platform::monotonic_ns() - start);
     if (failure) {
         fail_job(job, std::move(failure));
     }
+    return policy::after_range(ran, took, end - begin);
 }
 
 // The caller only: a poll that says stop stops the job (T4). Once it has
@@ -816,9 +787,7 @@ inline void poll_stop(RangeJob& job) {
     }
 }
 
-// =============================================================================
-// Fork: what the child keeps of the pool
-// =============================================================================
+// -- Fork: what the child keeps of the pool -----------------------------------
 
 // A slot this thread published and hasn't let go of, innermost last: what a
 // fork from inside a call (a poll running Python that forks) leaves the
@@ -892,9 +861,7 @@ inline void child_after_fork() {
 // Registered once, by the module's init (src/trimkit.cpp, through common.hpp)
 inline void install_fork_handler() { platform::on_fork_child(child_after_fork); }
 
-// =============================================================================
-// Slot transitions: each one read-modify-write of a slot word
-// =============================================================================
+// -- Slot transitions: each one read-modify-write of a slot word --------------
 
 // A free slot holding `job`, published, with its caller counted; or none when
 // every slot is busy, and the caller runs alone
@@ -983,7 +950,7 @@ inline SlotWord close_job(JobSlot& slot) {
 // No worker is left in the job published as `epoch`: none active, or the slot
 // published again since, which it can only be once free. Without the epoch a
 // caller that looked late would wait on the next caller's job
-// (verify/tla, mutation wait_ignores_epoch)
+// (check/verify/tla, mutation wait_ignores_epoch)
 inline bool workers_gone(const JobSlot& slot, std::uint32_t epoch) {
     // acquire: pairs with leave_job's release (T1)
     const SlotWord word{slot.word.load(std::memory_order_acquire)};
@@ -991,14 +958,10 @@ inline bool workers_gone(const JobSlot& slot, std::uint32_t epoch) {
 }
 
 // Wait until no worker is inside the job published as `epoch`, polling for a
-// stop while it does when `poll` (never while unwinding: see SharedJob). Its
-// workers are each inside their last claim, which near the end of a job is
-// short (claim_items), so it spins through two first claims, then sleeps
+// stop while it does when `poll` (never while unwinding: see SharedJob). It
+// spins first (policy::close_spin_ns), then sleeps
 inline void wait_for_workers(JobSlot& slot, RangeJob& job, std::uint32_t epoch, bool poll) {
-    // no spin under GenMC, whose clock stands still here: it would spin for
-    // ever, and never check the way to the sleep
-    const double spin_ns = platform::MODEL_CHECKING ? 0.0 : 2.0 * MIN_CLAIM_NS;
-    const std::int64_t spin_until = platform::monotonic_ns() + static_cast<std::int64_t>(spin_ns);
+    const std::int64_t spin_until = platform::monotonic_ns() + static_cast<std::int64_t>(policy::close_spin_ns());
     for (;;) {
         const bool spinning = platform::monotonic_ns() < spin_until;
         {
@@ -1105,9 +1068,7 @@ private:
     std::uint32_t epoch_ = 0;
 };
 
-// =============================================================================
-// Waking: workers, and W
-// =============================================================================
+// -- Waking workers -----------------------------------------------------------
 
 inline void* worker_main(void* unused);
 
@@ -1123,15 +1084,15 @@ inline bool spawn_worker() {
             break;
         }
     }
-    count(counters.spawns);
     if (!platform::start_detached_thread(worker_main, WORKER_STACK)) {
         pool.live.fetch_sub(1, std::memory_order_relaxed);
         return false;
     }
+    count(counters.spawns);
     return true;
 }
 
-// `more` more helpers for `job`, which wants `want` in all. The wake is bumped
+// `more` more helpers for a job that wants `want` in all. The wake is bumped
 // first, so a worker scanning or spinning sees the job; then only as many
 // sleepers are woken as spinning workers won't cover. Both counts are read
 // after the bump, sequentially consistent, and each worker leaves its count
@@ -1139,7 +1100,7 @@ inline bool spawn_worker() {
 // here as spinning sees the bump, and one counted live never exits without
 // starting its replacement. Too few live, and one is started here, which
 // starts the next: the caller pays for one thread start at most
-inline void wake_helpers(RangeJob& job, std::uint32_t want, std::uint32_t more) {
+inline void wake_helpers(std::uint32_t want, std::uint32_t more) {
     {
         const TraceStep step("CallerWake");
         pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
@@ -1158,66 +1119,22 @@ inline void wake_helpers(RangeJob& job, std::uint32_t want, std::uint32_t more) 
     }
     const TraceStep step("CallerWakeSome");
     if (more > spinning) {
-        job.woke_at.store(platform::monotonic_ns(), std::memory_order_relaxed);  // the first to join measures W
         count(counters.wakes);
-        step.took(platform::wake_some(pool.wake, more - spinning));
+        const std::uint32_t woken = platform::wake_some(pool.wake, more - spinning);
+        count(counters.woken, woken);
+        step.took(woken);
     }
 }
 
-// W as measured; forgotten when stale, as a busy machine's wakes are slow and
-// the pool then wakes no one, so would never measure it again
-inline double wake_ns() {
-    const std::int64_t measured_at = pool.wake_measured_at.load(std::memory_order_relaxed);
-    if (measured_at == 0 || platform::monotonic_ns() - measured_at > STALE_WAKE_NS) {
-        return DEFAULT_WAKE_NS;
-    }
-    return pool.wake_ns.load(std::memory_order_relaxed);
-}
-
-// A woken worker's measure of W, `took_ns`: an eighth of the way to it
-inline void measured_wake(double took_ns) {
-    const double clamped = least(MAX_WAKE_NS, most(MIN_WAKE_NS, took_ns));
-    const double was = pool.wake_measured_at.load(std::memory_order_relaxed) == 0
-                           ? DEFAULT_WAKE_NS
-                           : pool.wake_ns.load(std::memory_order_relaxed);
-    pool.wake_ns.store(static_cast<std::uint32_t>(((7.0 * was) + clamped) / 8.0), std::memory_order_relaxed);
-    pool.wake_measured_at.store(platform::monotonic_ns(), std::memory_order_relaxed);
-}
-
-// =============================================================================
-// The worker
-// =============================================================================
-
-// How a worker waits for work, and what it learned from its last wait
-struct WorkerWait {
-    std::int64_t busy_ns = 0;  // the time its ranges took since its last wait: work done, not time joined
-    std::int64_t idle_ns = 0;  // how long its last wait was
-    bool slept = false;        // whether its last wait slept, so its next join measures W
-};
+// -- The worker ---------------------------------------------------------------
 
 // Wait for the wake to move past `observed`: false once the worker has slept
-// IDLE_EXIT_MS with nothing to do. It spins first, but for at most a quarter
-// of the work it just did (and never past W, what a sleep and a wake cost),
-// so spinning adds at most a quarter to the CPU the pool's work takes, which
-// a neighbour could otherwise have had. When its last wait was shorter than a
-// wake, calls are coming back to back and the next is all but sure: then up
-// to the work it did, and 4W. Counted in `spinning` while it spins, and out of
-// it before it sleeps (pairs with wake_helpers)
-inline bool park_worker(std::uint32_t observed, WorkerWait* wait) {
-    const double w = wake_ns();
-    const auto worked = static_cast<double>(wait->busy_ns);
-    double budget = least(w, worked / 4.0);
-    if (static_cast<double>(wait->idle_ns) < w) {
-        budget = least(4.0 * w, worked);  // calls back to back
-    }
-    if (platform::MODEL_CHECKING) {
-        // none under GenMC: its clock stands still while a worker waits, and
-        // an idle worker exits at once there anyway (IDLE_EXIT_MS)
-        budget = 0.0;
-    }
+// IDLE_EXIT_MS with nothing to do. It spins first (policy::spin_ns, W3),
+// counted in `spinning` while it does, and out of it before it sleeps (pairs
+// with wake_helpers)
+inline bool park_worker(std::uint32_t observed) {
     const std::int64_t start = platform::monotonic_ns();
-    const auto spin_until = start + static_cast<std::int64_t>(budget);
-    wait->slept = false;
+    const auto spin_until = start + static_cast<std::int64_t>(policy::spin_ns());
     {
         const TraceStep step("WorkerPark");
         pool.spinning.fetch_add(1, std::memory_order_seq_cst);
@@ -1239,8 +1156,10 @@ inline bool park_worker(std::uint32_t observed, WorkerWait* wait) {
         const TraceStep step(saw ? "WorkerParkSpinSaw" : "WorkerParkSpinDone");
         pool.spinning.fetch_sub(1, std::memory_order_seq_cst);  // out of the count before the wake is compared
     }
+    if constexpr (COUNTED) {
+        count(counters.spin_ns, static_cast<std::uint64_t>(platform::monotonic_ns() - start));
+    }
     if (saw) {
-        wait->idle_ns = platform::monotonic_ns() - start;
         return true;
     }
     const std::int64_t idle_until = platform::monotonic_ns() + (std::int64_t{IDLE_EXIT_MS} * 1'000'000);
@@ -1255,16 +1174,14 @@ inline bool park_worker(std::uint32_t observed, WorkerWait* wait) {
             moved = pool.wake.load(std::memory_order_seq_cst) != observed;
         }
         if (moved) {
-            wait->idle_ns = now - start;
             return true;
         }
-        wait->slept = true;
         park(pool.wake, observed, static_cast<std::uint32_t>(((idle_until - now) / 1'000'000) + 1));
     }
 }
 
 // The steps of a worker's life, each case of worker_main's switch, and each a
-// group of actions of the model (verify/tla/Scheduler.tla: Worker<Step>...)
+// group of actions of the model (check/verify/tla/Scheduler.tla: Worker<Step>...)
 enum class WorkerStep : std::uint8_t {
     Start,  // started: the next of a spawn chain started, if the wake wants more
     Scan,   // read the wake, then look at each slot for an open job not already drained
@@ -1317,13 +1234,11 @@ inline void* worker_main(void* /*unused*/) {
     // the epoch each slot last held when this worker found nothing left in
     // it: a drained job whose caller hasn't closed it yet isn't joined again
     std::uint32_t drained[SLOTS] = {};
-    WorkerWait wait;
-    std::int64_t worked_ns = 0;
     std::size_t at = 0;   // the slot it is looking at
     bool joined = false;  // whether it joined any job since it last read the wake
     std::uint64_t seen = 0;
     RangeJob* job = nullptr;
-    RangeCost cost;
+    policy::Ran ran;
     std::size_t begin = 0;
     std::size_t end = 0;
     WorkerStep step = WorkerStep::Start;
@@ -1380,37 +1295,17 @@ inline void* worker_main(void* /*unused*/) {
                 joined_slot = &slot;
                 joined_job = job;
                 joined = true;
-                if (wait.slept) {
-                    // woken for this job: how long that took is W
-                    const std::int64_t woke_at = job->woke_at.exchange(0, std::memory_order_relaxed);
-                    if (woke_at != 0) {
-                        measured_wake(static_cast<double>(platform::monotonic_ns() - woke_at));
-                    }
-                    wait.slept = false;
-                }
-                cost = RangeCost{static_cast<double>(job->item_cost_16.load(std::memory_order_relaxed)) / 16.0};
+                ran = policy::Ran{0, 0, static_cast<double>(job->item_cost_16.load(std::memory_order_relaxed)) / 16.0};
                 step = WorkerStep::Claim;
                 break;
             }
-            case WorkerStep::Claim: {
-                const std::size_t take = claim_items(cost.claim_ns, cost.item_ns, items_left(*job),
-                                                     job->sharing.load(std::memory_order_relaxed), job->min_range);
-                const TraceStep traced("WorkerClaim");
-                step = claim_range(*job, take, &begin, &end) ? WorkerStep::Run : WorkerStep::Leave;
-                if (step == WorkerStep::Run) {
-                    traced.took(begin + 1, end + 1);  // the model numbers items from 1
-                }
+            case WorkerStep::Claim:
+                step = claim_range(*job, ran, "WorkerClaim", &begin, &end) ? WorkerStep::Run : WorkerStep::Leave;
                 break;
-            }
-            case WorkerStep::Run: {
-                const std::int64_t started = platform::monotonic_ns();
-                run_range(*job, begin, end);
-                const std::int64_t took = platform::monotonic_ns() - started;
-                worked_ns += took;
-                cost.measured(static_cast<double>(took), end - begin);
+            case WorkerStep::Run:
+                ran = run_range(*job, ran, begin, end);
                 step = WorkerStep::Claim;
                 break;
-            }
             case WorkerStep::Leave: {
                 drained[at] = SlotWord{seen}.epoch();
                 holding.leave();
@@ -1419,28 +1314,23 @@ inline void* worker_main(void* /*unused*/) {
                 step = WorkerStep::Scan;
                 break;
             }
-            case WorkerStep::Park: {
-                wait.busy_ns = worked_ns;
-                worked_ns = 0;
-                step = park_worker(holding.observed, &wait) ? WorkerStep::Scan : WorkerStep::Exit;
+            case WorkerStep::Park:
+                step = park_worker(holding.observed) ? WorkerStep::Scan : WorkerStep::Exit;
                 break;
-            }
             case WorkerStep::Exit:
                 return nullptr;  // `holding` gives back its index and its count
         }
     }
 }
 
-// =============================================================================
-// The caller
-// =============================================================================
+// -- The caller ---------------------------------------------------------------
 
 // The steps of a call, each case of run_job's switch, and each a group of
-// actions of the model (verify/tla/Scheduler.tla: Caller<Step>...)
+// actions of the model (check/verify/tla/Scheduler.tla: Caller<Step>...)
 enum class CallerStep : std::uint8_t {
-    Claim,    // the next range: a probe range of 1, 2, 4, ... items, then sized by its measure
+    Claim,    // the next range, sized by the policy (C1)
     Run,      // that range, timed
-    Decide,   // how many helpers the work left is worth (helpers_wanted)
+    Decide,   // the stop's poll, then how many helpers the work wants (W1, W2)
     Publish,  // the job into a free slot, if it isn't yet
     Wake,     // that many helpers, fewer if some are spinning
     Close,    // no more claims: the slot closed, and every worker inside waited for
@@ -1450,86 +1340,37 @@ enum class CallerStep : std::uint8_t {
 // no thread is inside the job; `job.failure` is then the caller's to report
 inline void run_job(RangeJob& job) {
     // so `next` never wraps (claim_range): more items than this is no real job
-    if (job.count > SIZE_MAX / 2) {
+    if (job.count > MAX_ITEMS) {
         fail_job(job, platform::failure<TooManyItems>());
         return;
     }
     SharedJob shared(job);
     const std::uint32_t cap = job.count > 1 ? worker_cap() : 0;
-    const double wake = wake_ns();
-    const bool coarse = job.item_cost == ItemCost::Coarse;
+    policy::Ran mine;  // what this thread has run of the job
     std::uint32_t helpers = 0;
     std::uint32_t want = 0;
-    RangeCost cost;
-    // probing (Measured jobs): ranges of 1, 2, 4, ... items until one takes
-    // PROBE_NS. An item then costs the lesser of the last two ranges' time an
-    // item, and one item alone never ends the probe: a stall (a page fault, a
-    // preemption) only ever makes a range slower, so one stalled range can't
-    // make a small call look big enough to wake anyone for
-    bool probing = !coarse;
-    std::size_t probe = job.min_range;
-    std::size_t probed_items = 0;
-    double last_each = 0.0;
     std::size_t begin = 0;
     std::size_t end = 0;
-    // Coarse items are published at once, to wake as many workers as they can
-    // use, each item worth a wake by construction. A Measured job with workers
-    // already spinning is too, wanting none: they join for nothing, as the wake
-    // is only bumped and no one sleeping is woken
-    if (coarse) {
-        want = static_cast<std::uint32_t>(least<std::size_t>(cap, job.count - 1));
-    }
     CallerStep step = CallerStep::Claim;
-    if (cap > 0 && (coarse || pool.spinning.load(std::memory_order_relaxed) > 0)) {
+    if (policy::share_at_once(job.item_cost, pool.spinning.load(std::memory_order_relaxed), cap)) {
+        want = policy::helpers_wanted(job.item_cost, mine, job.count, cap);  // Coarse: all at once; else none (W1)
         step = CallerStep::Publish;
     }
     for (;;) {
         switch (step) {
-            case CallerStep::Claim: {
-                const std::size_t take =
-                    probing ? probe
-                            : claim_items(cost.claim_ns, cost.item_ns, items_left(job), helpers + 1, job.min_range);
-                const TraceStep traced("CallerClaim");
-                step = claim_range(job, take, &begin, &end) ? CallerStep::Run : CallerStep::Close;
-                if (step == CallerStep::Run) {
-                    traced.took(begin + 1, end + 1);  // the model numbers items from 1
-                }
+            case CallerStep::Claim:
+                step = claim_range(job, mine, "CallerClaim", &begin, &end) ? CallerStep::Run : CallerStep::Close;
                 break;
-            }
-            case CallerStep::Run: {
-                const std::int64_t start = platform::monotonic_ns();
-                run_range(job, begin, end);
-                const auto took = static_cast<double>(platform::monotonic_ns() - start);
-                poll_stop(job);
+            case CallerStep::Run:
+                mine = run_range(job, mine, begin, end);
                 step = CallerStep::Decide;
-                if (!probing) {
-                    cost.measured(took, end - begin);
-                    break;
-                }
-                probed_items += end - begin;
-                const double each = took / static_cast<double>(end - begin);
-                if (took < PROBE_NS || probed_items == job.min_range) {
-                    // too short to judge, or its first range alone: one more range,
-                    // twice as long unless this one already took PROBE_NS
-                    probe = took < PROBE_NS ? least(job.count, probe * 2) : probe;
-                    last_each = each;
-                    break;
-                }
-                cost.item_ns = most(1.0, least(each, last_each));
-                probing = false;
                 break;
-            }
             case CallerStep::Decide: {
+                poll_stop(job);  // outside the step's trace lock: a poll may take the GIL
                 const TraceStep traced("CallerDecide");
-                // what is left is worth how many helpers: decided after every range
-                // once the probe has measured an item, so a job that turns out long
-                // gets help as soon as it would pay
-                if (!probing) {
-                    want = helpers_wanted(static_cast<double>(items_left(job)) * cost.item_ns, wake, cap);
-                }
-                if (shared.published()) {
-                    job.item_cost_16.store(static_cast<std::uint64_t>(cost.item_ns * 16.0), std::memory_order_relaxed);
-                }
+                want = policy::helpers_wanted(job.item_cost, mine, items_left(job), cap);
+                checked(want == 0 || job.item_cost == ItemCost::Coarse || mine.ns >= policy::WAKE_COST_NS,
+                        "W1: a call wanted a helper before its caller ran items for C");
                 traced.took(want);
                 step = want > helpers ? CallerStep::Publish : CallerStep::Claim;
                 break;
@@ -1542,9 +1383,9 @@ inline void run_job(RangeJob& job) {
                 break;
             case CallerStep::Wake:
                 // want may be none: a warm publish, which only bumps the wake
-                job.item_cost_16.store(static_cast<std::uint64_t>(cost.item_ns * 16.0), std::memory_order_relaxed);
+                job.item_cost_16.store(static_cast<std::uint64_t>(mine.item_ns * 16.0), std::memory_order_relaxed);
                 job.sharing.store(want + 1, std::memory_order_relaxed);
-                wake_helpers(job, want, want - helpers);
+                wake_helpers(want, want - helpers);
                 helpers = want;
                 step = CallerStep::Claim;
                 break;
@@ -1566,7 +1407,7 @@ inline void run_job(RangeJob& job) {
 
 // `body(begin, end)` over every index in [0, count), on this thread and any
 // workers the work is worth: see the top of this file for what it promises.
-// Returns the first failure, if anything failed or stopped it
+// Returns the first failure, if anything failed (not a Stop's stop: T4)
 template <typename Body>
 platform::Failure for_each_range(std::size_t count, const Body& body, ItemCost cost, std::size_t min_range, Stop stop) {
     RangeJob job;
@@ -1584,9 +1425,7 @@ platform::Failure for_each_range(std::size_t count, const Body& body, ItemCost c
     return std::move(job.failure);
 }
 
-// =============================================================================
-// Two more things the extension shares between threads
-// =============================================================================
+// -- Two more things the extension shares between threads ---------------------
 
 // One holder at a time of `word`, for what takes exactly one (a device's
 // queue, src/vulkan/scene.hpp, which states the rule its users keep): a

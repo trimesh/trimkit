@@ -3,7 +3,7 @@
 // IsOccludedOctant, their TLAS variants and BVHBase::TriHit, Woop's watertight
 // test), at close to f32 speed: every decision of tinybvh's traversal is first
 // attempted in f32 behind a rigorous error bound (a floating-point filter,
-// docs/trace.md), and only an undecided one runs tinybvh's own f64 operations,
+// check/verify/gpu.md), and only an undecided one runs tinybvh's own f64 operations,
 // mirrored operation for operation with `precise` (no fused multiply-add, as
 // the CPU build with -ffp-contract=off). The exact distance of the accepted
 // hit is computed once, after the traversal; until then it is held as a
@@ -12,7 +12,7 @@
 // from just past the one before, exactly as src/bvh.cpp decides it on the
 // CPU. Bindings 4, 5 and 10 are the f32 images of the nodes and triangles
 // that src/vulkan/vulkan.hpp's `node_images` and src/vulkan/scene.hpp's `triangle32` build. Comments on each
-// filtered decision name the docs/trace.md section deriving its bound.
+// filtered decision name the check/verify/gpu.md section deriving its bound.
 // Compiled by `uv run scripts generate` into src/vulkan/spirv.hpp;
 // src/vulkan/vulkan.hpp dispatches it.
 #version 460
@@ -43,7 +43,7 @@ struct Node32 {
 // corners in tinybvh's i0, i1, i2 order rounded to nearest, `radius` the largest
 // f64 coordinate magnitude of the three rounded up, the face index, the normal
 // (p1 - p0) x (p2 - p0) in f64 rounded to nearest with `nu` bounding its error
-// against the exact normal (docs/trace.md 5.2). 64 bytes
+// against the exact normal (check/verify/gpu.md 5.2). 64 bytes
 struct Tri32 {
     vec3 p0;
     float radius;
@@ -117,7 +117,7 @@ const uint INTERIOR = 0x80000000u;
 const uint TIE_MASK = 0x3fu;
 const int REJECT = 0, ACCEPT = 1, AMBIGUOUS = 2;
 
-// The f32 model (docs/trace.md 2): round to nearest with unit roundoff u = 2^-24, products
+// The f32 model (check/verify/gpu.md 2): round to nearest with unit roundoff u = 2^-24, products
 // possibly fused with the following add, denormal inputs and results flushed to zero.
 // 2u = 2^-23 and 2^-120 in place of u and the flush floor 2^-126 carry the headroom
 // that covers second-order terms and the rounding of a bound's own arithmetic (2.3)
@@ -286,7 +286,7 @@ Ray carried_ray(uint i, const Ray ray, uint mesh_index) {
 
 // The current best hit. Resolved: t is tinybvh's exact distance and t32 its f32 rounding.
 // Pending: the face of `mesh`, reached through `instance`, is certified accepted
-// by tinybvh's test and its exact distance lies within hit_bound of t32 (docs/trace.md 5); it is
+// by tinybvh's test and its exact distance lies within hit_bound of t32 (check/verify/gpu.md 5); it is
 // computed only when a decision needs it or the traversal ends. Distances are in the world
 // ray's units in every frame (the carried direction is not normalised), so one interval
 // serves across instances.
@@ -368,7 +368,7 @@ void child_test_exact(bool top, uint c1, uint c2, const Ray ray, double limit, o
     swap = d1 > d2;
 }
 
-// Both children of one node tested in f32 with the certificate (docs/trace.md 3): true when every
+// Both children of one node tested in f32 with the certificate (check/verify/gpu.md 3): true when every
 // decision (each child's hit, and when both hit, the order) carries a proof; false sends the
 // pair to child_test_exact. `tie_mask` is the parent's: which f64 coordinates its children share.
 bool child_test(bool top, uint c1, uint c2, uint tie_mask, const Ray ray, const Best best, out bool hit1, out bool hit2, out bool swap) {
@@ -464,7 +464,7 @@ bool triangle_hit_exact(const Ray ray, uint corner_base, uint vertex_base, uint 
     return true;
 }
 
-// Woop's test in f32 with certificates (docs/trace.md 4 and 5): REJECT when tinybvh's f64 test
+// Woop's test in f32 with certificates (check/verify/gpu.md 4 and 5): REJECT when tinybvh's f64 test
 // certainly rejects the face, ACCEPT when it certainly accepts it with t32 within `bound` of
 // tinybvh's distance (and so below the current best), AMBIGUOUS otherwise
 int classify_triangle(const Ray ray, const Tri32 tri, const Best best, out float t32, out float bound) {

@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from builder import ROOT, TOML, Upstream, load, tracked_under
+from builder import CHECK, DOCKER, ROOT, TOML, Upstream, load, tracked_under
 
 VENDOR = ROOT / "vendor"
 # our changes to upstream code, as unified diffs: `vendor/patches/NAME.patch`,
@@ -176,8 +176,8 @@ def _closure_inputs(pin: Upstream) -> tuple[list[Path], list[str]]:
     for part in manifest.parts.values():
         if pin.name not in {u.name for u in part.upstreams}:
             continue
-        roots += [part.source, *(ROOT / "fuzz" / f"{h}.cpp" for h in part.fuzz)]
-        roots += [ROOT / "fuzz" / f"{part.seeds}.cpp"] if part.seeds else []
+        roots += [part.source, *(CHECK / "fuzz" / f"{h}.cpp" for h in part.fuzz)]
+        roots += [CHECK / "fuzz" / f"{part.seeds}.cpp"] if part.seeds else []
         for upstream in part.upstreams:
             if upstream.name != pin.name:
                 roots += upstream.compiled
@@ -877,7 +877,7 @@ def outdated() -> None:
 # own cooldown (`exclude-newer`), so a hijacked release has time to be pulled
 COOLDOWN = timedelta(days=7)
 WORKFLOWS = ROOT / ".github" / "workflows"
-DOCKERFILE = ROOT / "docker" / "Dockerfile"
+DOCKERFILE = DOCKER / "Dockerfile"
 USES = re.compile(r"(uses: )([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # (v[\w.-]+)")
 RELEASE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 BASE = re.compile(r"^FROM ([\w.-]+):([\w.-]+)@(sha256:[0-9a-f]{64})$", re.MULTILINE)

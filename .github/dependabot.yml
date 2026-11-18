@@ -15,7 +15,7 @@ updates:
     cooldown:
       default-days: 7
   - package-ecosystem: docker
-    directory: /docker
+    directory: /scripts/docker
     schedule:
       interval: weekly
     cooldown:

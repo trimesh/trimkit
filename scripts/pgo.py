@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path
 
 from backend import DEFAULT_BUILD_DIR
-from builder import ROOT, Config, Platform, Tools, load
+from builder import CHECK, ROOT, Config, Platform, Tools, load
 
 
 def run(*args: str, cwd: Path = ROOT) -> None:
@@ -46,9 +46,8 @@ def main() -> None:
     run(*pip, "--no-build-isolation", "--no-deps", "-C", "strict=true", "-C", "pgo=generate", ".")
     # from elsewhere, so the tests import the installed copy, not `src/`
     with tempfile.TemporaryDirectory() as elsewhere:
-        run(
-            sys.executable, "-m", "pytest", "-q", "-m", "not timing", str(ROOT / "tests"), cwd=Path(elsewhere)
-        )
+        tests = str(CHECK / "tests")
+        run(sys.executable, "-m", "pytest", "-q", "-m", "not timing", tests, cwd=Path(elsewhere))
     raw = sorted(str(p) for p in config.profiles.glob("*.profraw"))
     if not raw:
         sys.exit(f"the training wrote no profiles to {config.profiles}")

@@ -1,4 +1,4 @@
-# Our C++ only: src/, fuzz/ and vendor/svgpath (`uv run scripts format`, checked by
+# Our C++ only: src/, check/fuzz/ and vendor/svgpath (`uv run scripts format`, checked by
 # `static`). The clang-format is the pinned image's, so everyone formats alike.
 Language: Cpp
 Standard: c++17

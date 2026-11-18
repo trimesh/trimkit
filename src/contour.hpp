@@ -211,7 +211,7 @@ static constexpr CubeCaseTable build_cube_case_table() {
             // the cell across the face could draw the same line and leave an
             // edge in four triangles: fan around the first crossing whose
             // lines all pass through the inside of the cube. Every loop has
-            // one, as tests/test_contour.py checks through every pair of cells.
+            // one, as check/tests/test_contour.py checks through every pair of cells.
             int apex = 0;
             for (int candidate = length - 1; candidate >= 0; candidate--) {
                 bool through = true;

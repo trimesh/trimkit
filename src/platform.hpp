@@ -12,7 +12,7 @@
 //   macOS     __ulock (what libc++'s own std::atomic::wait is built on)
 //   other     a millisecond nap in place of a sleep on a word
 //   GenMC     TRIMKIT_GENMC: the model checker GenMC runs the pool's own code
-//             (verify/genmc), so here a sleep is GenMC's blocking assume, the
+//             (check/verify/genmc), so here a sleep is GenMC's blocking assume, the
 //             clock jumps, there are two CPUs, a body fails by a flag rather
 //             than a C++ exception (GenMC runs none), and idle workers exit at
 //             once, so every thread of a checked execution ends and a caller
@@ -50,12 +50,12 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <unistd.h>  // sysconf
 #if defined(__linux__)
 #include "cgroup.hpp"
 
 #include <linux/futex.h>
 #include <sys/syscall.h>
-#include <unistd.h>
 #elif defined(__APPLE__)
 // what libc++'s std::atomic::wait is built on, since macOS 10.12
 extern "C" int __ulock_wait(std::uint32_t operation, void* address, std::uint64_t value, std::uint32_t timeout_us);
@@ -80,8 +80,8 @@ constexpr bool MODEL_CHECKING = false;
 
 #if defined(TRIMKIT_GENMC)
 // Under GenMC, the time is this thread's own, and moves on a millisecond for
-// each range of items it runs (run_catching) and at no other step: so the
-// pool's probe still ends, and a loop that waits for a word, reading the clock
+// each range of items it runs (run_catching) and at no other step: so a
+// call's time reaches C after one range, and a loop that waits for a word, reading the clock
 // but writing nothing, is a spin loop GenMC explores until the word changes
 inline thread_local std::int64_t genmc_now = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 #endif
@@ -268,12 +268,45 @@ inline bool start_detached_thread(void* (*entry)(void*), std::size_t stack_bytes
 #endif
 }
 
+#if defined(__linux__) && !defined(TRIMKIT_GENMC)
+// How many CPUs a sysfs CPU list names ("0-3,8,10-11": 7), or 0 for none
+inline std::uint32_t count_cpu_list(const char* list) {
+    std::uint32_t count = 0;
+    const char* at = list;
+    while (*at >= '0' && *at <= '9') {
+        char* end = nullptr;
+        const unsigned long first = std::strtoul(at, &end, 10);
+        unsigned long last = first;
+        if (*end == '-') {
+            last = std::strtoul(end + 1, &end, 10);
+        }
+        count += last >= first ? static_cast<std::uint32_t>(last - first + 1) : 0;
+        at = *end == ',' ? end + 1 : end;
+    }
+    return count;
+}
+#endif
+
 // The CPUs the machine has online, which affinity and quotas only narrow:
-// fixed while the process runs, read once. Not hardware_concurrency on
-// POSIX, which musl answers from the affinity at the time
+// fixed while the process runs, read once. Not sysconf or
+// hardware_concurrency on Linux, which musl answers from the affinity at the
+// time: a process whose first call ran pinned to one CPU had room for no
+// worker ever after (the musllinux wheels' test_workers_follow_affinity)
 inline std::uint32_t cpus_online() {
 #if defined(TRIMKIT_GENMC)
     return 2;
+#elif defined(__linux__)
+    static const std::uint32_t ONLINE = [] {
+        char text[1024];
+        cgroup::read_text("/sys/devices/system/cpu/online", text, sizeof(text));
+        const std::uint32_t listed = count_cpu_list(text);
+        if (listed > 0) {
+            return listed;
+        }
+        const long configured = sysconf(_SC_NPROCESSORS_ONLN);  // no sysfs: a container may hide it
+        return configured < 1 ? 1U : static_cast<std::uint32_t>(configured);
+    }();
+    return ONLINE;
 #elif defined(__unix__) || defined(__APPLE__)
     static const long ONLINE = sysconf(_SC_NPROCESSORS_ONLN);
     return ONLINE < 1 ? 1 : static_cast<std::uint32_t>(ONLINE);
@@ -429,7 +462,7 @@ Failure failure() {
 // unwinds it) calls `ending()` and goes on ending, as glibc aborts an unwind
 // that is caught and not thrown again
 template <typename Run, typename Ending>
-Failure run_catching(const Run& run, const Ending& ending) {
+Failure run_catching(const Run& run, [[maybe_unused]] const Ending& ending) {  // libstdc++'s alone
     try {
         run();
         return nullptr;

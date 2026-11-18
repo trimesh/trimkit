@@ -33,6 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# what checks the code (tests, fuzz, bench, verify), and the images it all runs in
+CHECK = ROOT / "check"
+DOCKER = ROOT / "scripts" / "docker"
 TOML = ROOT / "trimkit.toml"
 # the one symbol the Linux extension exports, its init function
 EXPORTS = ROOT / "src" / "extension.map"
@@ -430,7 +433,7 @@ class Config:
     strict: bool = False
     sanitize: str = ""  # clang's -fsanitize= list, for every object
     pgo: str = ""  # profile-guided: "generate" instruments, "use" reads profiles/merged.profdata
-    fuzz: bool = False  # also the libFuzzer harnesses in fuzz/, sanitized
+    fuzz: bool = False  # also the libFuzzer harnesses in check/fuzz/, sanitized
     # for distributions, never our wheels: debug information, unstripped,
     # optimized all the same; and the upstreams, by name, comma-separated, to
     # build against the system's copy rather than vendor/'s
@@ -940,7 +943,7 @@ def plan(manifest: Manifest, target: Target) -> str:
             linked = [archives[u.name] for u in part.upstreams if u.name in archives]
             values = [*common.compile, *ours.compile, *includes(part.upstreams), *defines(part.upstreams)]
             for program, source_name, extra in programs:
-                source = ROOT / "fuzz" / f"{source_name}.cpp"
+                source = CHECK / "fuzz" / f"{source_name}.cpp"
                 obj = edge("compile", object_for(source), [str(source)], values)
                 built.append(
                     edge("link", platform.executable(program), [obj, *linked], [*common.link, *extra])
@@ -990,13 +993,13 @@ def check() -> None:
     """
     manifest = load()
     errors = []
-    # every C++ file in fuzz/ is a harness or seed writer some part names,
+    # every C++ file in check/fuzz/ is a harness or seed writer some part names,
     # so none can sit there unbuilt
     named = set(manifest.harnesses) | {m.seeds for m in manifest.parts.values() if m.seeds}
-    present = {p.stem for p in tracked_under(ROOT / "fuzz") if p.suffix == ".cpp"}
+    present = {p.stem for p in tracked_under(CHECK / "fuzz") if p.suffix == ".cpp"}
     if present != named:
         errors.append(
-            f"fuzz/*.cpp {sorted(present)} don't match trimkit.toml's fuzz and seeds {sorted(named)}"
+            f"check/fuzz/*.cpp {sorted(present)} don't match trimkit.toml's fuzz and seeds {sorted(named)}"
         )
     # what a build compiles is exactly what git tracks
     for upstream in manifest.upstreams.values():
@@ -1051,4 +1054,4 @@ def check() -> None:
             errors.append(f"{upstream.name}: its system header {upstream.system} isn't under its `include`")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"ok: fuzz/ and sources match trimkit.toml, and {count} plans hold together")
+    print(f"ok: check/fuzz/ and sources match trimkit.toml, and {count} plans hold together")

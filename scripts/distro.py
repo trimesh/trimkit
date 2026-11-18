@@ -128,7 +128,7 @@ def debian(out: Path) -> Path:
         f"export PYBUILD_BUILD_ARGS={settings}\n"
         "# the tests, against the built package, without the wall-clock bounds a\n"
         "# loaded build machine can miss\n"
-        "export PYBUILD_BEFORE_TEST=cp -r {dir}/tests {build_dir}\n"
+        "export PYBUILD_BEFORE_TEST=cp -r {dir}/check/tests {build_dir}\n"
         'export PYBUILD_TEST_ARGS=-m "not timing" {build_dir}/tests\n'
         "export PYBUILD_AFTER_TEST=rm -r {build_dir}/tests\n"
         "\n"
@@ -147,7 +147,7 @@ def debian(out: Path) -> Path:
         f" -- {maintainer}  {email.utils.format_datetime(released())}\n"
     )
     (debian_dir / "tests" / "control").write_text(
-        'Test-Command: cp -r tests "$AUTOPKGTEST_TMP" && cd "$AUTOPKGTEST_TMP" && '
+        'Test-Command: cp -r check/tests "$AUTOPKGTEST_TMP" && cd "$AUTOPKGTEST_TMP" && '
         'python3 -m pytest -m "not timing" tests\n'
         "Depends: @, python3-pytest, python3-hypothesis, python3-lark, python3-svg.path\n"
         "Restrictions: allow-stderr\n"
@@ -244,7 +244,7 @@ def fedora(out: Path) -> Path:
         "",
         "%check",
         "# without the wall-clock bounds a loaded build machine can miss",
-        '%pytest -m "not timing" tests',
+        '%pytest -m "not timing" check/tests',
         "",
         f"%files -n python3-{name} -f %{{pyproject_files}}",
         "%doc README.md",

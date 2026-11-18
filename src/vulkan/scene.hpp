@@ -89,7 +89,7 @@ Span bytes_of(const std::vector<T>& values) {
 }
 
 // The f32 image of one triangle for the device's filter (src/vulkan/trace.comp,
-// docs/trace.md 4.1, 5.2): the corners, a radius never below any coordinate's
+// check/verify/gpu.md 4.1, 5.2): the corners, a radius never below any coordinate's
 // magnitude, the f64 normal and `nu`, a bound on that normal's distance from
 // the exact one: the edges' roundings, the products' and difference's, the
 // result's and the f32 conversion's, inflated by 2^-20 for this arithmetic's own

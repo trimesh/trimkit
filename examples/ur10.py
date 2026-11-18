@@ -110,7 +110,8 @@ class PlannableScene:
         pairs = (self.pairs + self.mesh_count * np.arange(count, dtype=np.int64)[:, None, None]).reshape(
             -1, 2
         )
-        return self.scene.distances(matrices, index, pairs=pairs, upper_bound=upper_bound)
+        found = self.scene.distances(matrices, index, pairs=pairs, upper_bound=upper_bound)
+        return found.distances, found.points, found.normals
 
     def plan(self, guess: np.ndarray, *, clearance: float, smoothing: float, waypoint_count: int) -> Plan:
         """

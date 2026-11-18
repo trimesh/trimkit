@@ -1,6 +1,6 @@
 # trimkit
  
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature, stable implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, etc. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project. Install with:
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature, stable implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, etc. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project, and it saves 100MiB+ for every `trimesh[easy,recomend]` install. Install with:
 
 ```
 pip install trimkit
@@ -191,41 +191,41 @@ GPU that computes in double precision, found through the system's Vulkan loader
 at run time (no wheel links or needs Vulkan, and Vulkan 1.0 is enough). It holds
 the same trees and runs a compute shader that makes every decision tinybvh's
 traversal makes, most of them in float32 behind a proven error bound and the
-rest with tinybvh's own float64 operations (`docs/trace.md`), so it answers the
+rest with tinybvh's own float64 operations (`check/verify/gpu.md`), so it answers the
 same bytes the CPU does. Rays go as given: a `(3,)` origin or direction is one
 row for every ray, and an array goes as its dtype: float32 at half the bytes
 of float64, widened on the device. When no such device can be used,
 at construction or later, the scene warns once (a `UserWarning` naming why)
 and the
-CPU answers. `tests/golden.json` holds the hashed answers of an exact corpus
+CPU answers. `check/tests/golden.json` holds the hashed answers of an exact corpus
 (dyadic coordinates, integer-length directions, lattice meshes) that every
 platform and the device are checked against: the same answers everywhere.
 
-What the device is worth depends on the rays. `python bench/scene.py` times a
-real assembly (`tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k
+What the device is worth depends on the rays. `python check/bench/scene.py` times a
+real assembly (`check/tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k
 faces) as loaded and pulled apart, so fewer rays hit anything. A batch is one
 camera's rays, one origin for all of them; times are the median over eight
-cameras, in milliseconds a batch, twenty CPU threads against an RTX 3090:
+cameras, in milliseconds a batch, the 32 threads of an i9-14900K against an
+RTX 5070, on an otherwise idle machine (2026-11-17):
 
 | rays | pulled apart | hitting | nearest: CPU ms | device ms | ratio | any hit: CPU ms | device ms | ratio | every crossing: CPU ms | device ms | ratio |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 10,000 | 1x | 12% | 1.13 | 0.65 | 1.7x | 0.72 | 0.27 | 2.7x | 4.35 | 13.73 | 0.3x |
-| 10,000 | 2x | 11% | 1.01 | 0.59 | 1.7x | 0.65 | 0.30 | 2.1x | 5.11 | 6.83 | 0.7x |
-| 10,000 | 5x | 3% | 0.60 | 0.44 | 1.4x | 0.42 | 0.24 | 1.7x | 0.50 | 1.43 | 0.4x |
-| 99,856 | 1x | 12% | 2.05 | 1.22 | 1.7x | 1.30 | 0.76 | 1.7x | 16.40 | 18.99 | 0.9x |
-| 99,856 | 2x | 11% | 1.79 | 1.22 | 1.5x | 1.03 | 0.92 | 1.1x | 6.89 | 10.22 | 0.7x |
-| 99,856 | 5x | 3% | 1.05 | 1.12 | 0.9x | 0.74 | 0.89 | 0.8x | 1.92 | 3.01 | 0.6x |
-| 1,000,000 | 1x | 12% | 15.42 | 5.81 | 2.7x | 15.50 | 5.17 | 3.0x | 102.86 | 54.31 | 1.9x |
-| 1,000,000 | 2x | 11% | 12.84 | 5.87 | 2.2x | 7.91 | 4.74 | 1.7x | 46.61 | 27.28 | 1.7x |
-| 1,000,000 | 5x | 3% | 7.16 | 5.06 | 1.4x | 5.16 | 4.82 | 1.1x | 12.47 | 10.46 | 1.2x |
-| 4,000,000 | 1x | 12% | 61.71 | 55.58 | 1.1x | 45.36 | 19.69 | 2.3x | 446.58 | 142.95 | 3.1x |
-| 4,000,000 | 2x | 11% | 46.27 | 23.26 | 2.0x | 32.19 | 20.23 | 1.6x | 191.07 | 86.65 | 2.2x |
-| 4,000,000 | 5x | 3% | 34.02 | 20.78 | 1.6x | 24.05 | 20.71 | 1.2x | 49.97 | 34.44 | 1.5x |
+| 10,000 | 1x | 12% | 0.24 | 0.55 | 0.4x | 0.13 | 0.25 | 0.5x | 1.29 | 11.53 | 0.1x |
+| 10,000 | 2x | 11% | 0.17 | 0.43 | 0.4x | 0.09 | 0.28 | 0.3x | 0.73 | 5.59 | 0.1x |
+| 10,000 | 5x | 3% | 0.11 | 0.31 | 0.4x | 0.08 | 0.21 | 0.4x | 0.19 | 1.04 | 0.2x |
+| 99,856 | 1x | 12% | 1.15 | 0.82 | 1.4x | 0.87 | 0.51 | 1.7x | 7.72 | 13.17 | 0.6x |
+| 99,856 | 2x | 11% | 0.98 | 0.71 | 1.4x | 0.74 | 0.63 | 1.2x | 7.70 | 8.62 | 0.9x |
+| 99,856 | 5x | 3% | 0.53 | 0.65 | 0.8x | 0.35 | 0.45 | 0.8x | 1.47 | 2.15 | 0.7x |
+| 1,000,000 | 1x | 12% | 8.37 | 4.43 | 1.9x | 5.13 | 3.50 | 1.5x | 53.66 | 48.95 | 1.1x |
+| 1,000,000 | 2x | 11% | 6.26 | 3.98 | 1.6x | 3.93 | 3.54 | 1.1x | 27.49 | 28.10 | 1.0x |
+| 1,000,000 | 5x | 3% | 3.77 | 3.56 | 1.1x | 2.79 | 3.33 | 0.8x | 6.78 | 8.22 | 0.8x |
+| 4,000,000 | 1x | 12% | 31.25 | 17.80 | 1.8x | 18.88 | 13.16 | 1.4x | 211.01 | 154.86 | 1.4x |
+| 4,000,000 | 2x | 11% | 22.82 | 15.81 | 1.4x | 14.78 | 13.39 | 1.1x | 99.02 | 81.04 | 1.2x |
+| 4,000,000 | 5x | 3% | 13.46 | 12.88 | 1.0x | 9.88 | 12.65 | 0.8x | 22.97 | 26.97 | 0.9x |
 
-That run shared the machine with other work (a load of about 10 on its twenty
-threads). Three things hold either way.
+Three things hold on any machine measured so far.
 A camera's float64 directions are 24 MB a million rays, and moving them to the
-device (about 0.17 ms a megabyte here, by any route measured, and nearly all
+device (about 0.17 ms a megabyte on an RTX 3090, by any route measured, and nearly all
 of a query's time: tracing is a few percent of it) takes about as long as the
 CPU takes to find that most of them miss, so a sparse scene gains least;
 float32 directions go at half that. Every crossing
@@ -240,9 +240,9 @@ none is convex), in milliseconds, the best of five calls:
 
 | pulled apart | pairs | touching | `collides` ms | within 1 mm ms | distances within 10 mm ms | every distance ms |
 |---|---|---|---|---|---|---|
-| 1x | 2,556 | 119 | 0.55 | 0.56 | 29.9 | 97 |
-| 2x | 2,556 | 67 | 0.38 | 0.31 | 36.1 | 147 |
-| 5x | 2,556 | 25 | 0.17 | 0.34 | 4.8 | 151 |
+| 1x | 2,556 | 119 | 0.48 | 0.48 | 28.8 | 59 |
+| 2x | 2,556 | 67 | 0.46 | 0.21 | 23.4 | 78 |
+| 5x | 2,556 | 25 | 0.07 | 0.23 | 2.7 | 95 |
 
 `collides` culls by each instance's box, then by each mesh's hierarchy, so
 which of 2,556 pairs touch among 377k placed faces is about half a
@@ -259,29 +259,60 @@ to `scipy.optimize.minimize`, its gradient from the normals and closest points
 `distances` returns.
 
 ```
-planned in 92 ms, 59 evaluations of 101 waypoints
-least clearance over 2001 waypoints: 18.4 mm
+planned in 40 ms: 15 L-BFGS-B evaluations of 14,342 pair distances each, aiming for 27.5 mm over 1 round
+then twenty times as many waypoints checked clear
 ```
 
 ### Against what trimesh used before
 
 | `trimkit.` | replaces | measured against it | peak memory (MiB), old / trimkit |
 |---|---|---|---|
-| `contour` | `scikit-image` | 44x faster on a 14M-voxel bool volume, 17x on a 28M-voxel float64 field | 159 / 49, 160 / 74 |
-| `exchange.svg_parse`, `exchange.svg_string` | `svg.path` | 56x faster parsing 60k commands | 19 / 11 |
-| `Boxes` | `rtree` | 8-10x faster: build 100k boxes, query 20k | 19 / 21 |
-| `CollisionScene` | `python-fcl` | 6x faster: every touching pair of 200 spheres, through trimesh's `CollisionManager`; convex distances more accurate | under 1 / under 1 |
-| `exchange.draco_encode`, `exchange.draco_decode` | `DracoPy` | 3.6x faster encoding, 1.7x decoding | 9 / 6, 5 / 5 |
-| `RayScene` | `embreex` | 3-3.6x faster on 1M rays, in float64 and watertight | 105 / 59 |
-| `simplify` | `fast-simplification` | 2.9x faster, and thread safe | 30 / 10 |
-| `parametrize` | `xatlas` | 1.3x faster | 6 / 6 |
-| `decompose` | `vhacdx` | the same speed: the same library | 379 / 466: V-HACD's work runs on every core at once, each with its own working set (381 / 365 on one core) |
-| `triangulate` | `mapbox-earcut` | the same speed: the same library | 19 / 22 |
+| `exchange.svg_parse`, `exchange.svg_string` | `svg.path` | 63-64x faster parsing 60k commands | 19 / 13 |
+| `contour` | `scikit-image` | 44x faster on a 14M-voxel bool volume, 12x on a 28M-voxel float64 field | 160 / 49, 159 / 74 |
+| `Boxes` | `rtree` | 10-11x faster: build 100k boxes, query 20k | 19 / 21 |
+| `RayScene` | `embreex` | 6.3-6.4x faster on 1M rays, in float64 and watertight | 105 / 57 |
+| `CollisionScene` | `python-fcl` | 4x faster: every touching pair of 200 spheres, through trimesh's `CollisionManager`; convex distances more accurate | under 1 / under 1 |
+| `exchange.draco_encode`, `exchange.draco_decode` | `DracoPy` | 3.4x faster encoding, 1.5-1.6x decoding | 9 / 5, 5 / 6 |
+| `simplify` | `fast-simplification` | 2.6x faster, and thread safe | 31 / 10 |
+| `decompose` | `vhacdx` | 1.2x faster: the same library | 380 / 469: V-HACD's work runs on every core at once, each with its own working set |
+| `parametrize` | `xatlas` | 1.1x faster | 6 / 5 |
+| `triangulate` | `mapbox-earcut` | 1.1-1.2x faster: the same library | 20 / 21 |
 
-Measured 2026-11-06 with `bench/versus.py` on the same numpy inputs: best of several
-runs on 8 cores of a busy machine, release build without PGO. A range is two runs.
-`contour` and peak memory measured 2026-11-15 on 32 cores: peak memory is the most
-resident memory one call adds, its output included, each call in a fresh process.
+Measured 2026-11-17 with `check/bench/versus.py` on the same numpy inputs: the best of five
+calls each, on the 32 threads of an otherwise idle i9-14900K, release build without PGO.
+A range is two runs. Peak memory is the most resident memory one call adds, its output
+included, each call in a fresh process.
+
+### Size Comparison
+
+Installed size over `trimesh` + `numpy`, cheapest first, so a shared dependency is
+charged to the smaller package. `coal` is what `collision` vendors.
+
+| on top of `trimesh` + `numpy` | also brings | adds (MiB) | total (MiB) |
+|---|---|---|---|
+| `svg.path` |  | 0.1 | 0.1 |
+| `mapbox-earcut` |  | 0.2 | 0.3 |
+| `xatlas` |  | 0.6 | 0.8 |
+| `fast-simplification` |  | 0.7 | 1.5 |
+| `vhacdx` |  | 0.7 | 2.3 |
+| `rtree` |  | 1.8 | 4.1 |
+| `DracoPy` |  | 7.5 | 11.6 |
+| `python-fcl` | `cython` | 41.8 | 53.4 |
+| `embreex` |  | 44.3 | 97.7 |
+| `scikit-image` | `imageio`, `lazy-loader`, `networkx`, `packaging`, `pillow`, `scipy`, `tifffile` | 204.2 | 301.9 |
+| `coal` | `cmeel`, `cmeel-assimp`, `cmeel-boost`, `cmeel-octomap`, `cmeel-qhull`, `cmeel-zlib`, `eigenpy`, `libcoal` | 274.3 | 576.3 |
+| `trimkit` 0.2.1, instead of all of the above |  | 2.3 | 2.3 |
+
+`coal` was never a trimesh dependency and `scipy`, `pillow` and `networkx` stay, so the
+real saving is per extra, old bindings (Python < 3.15) against trimkit (3.15+):
+
+| `trimesh[...]` | old bindings (MiB) | with trimkit (MiB) | saved (MiB) |
+|---|---|---|---|
+| `trimesh[easy]` | 246.9 | 202.1 | 44.9 |
+| `trimesh[easy,recommend]` | 504.3 | 380.6 | 123.6 |
+
+`check/bench/sizes.py`, 2026-11-17, CPython 3.13.13 `linux-x86_64`, a fresh `uv venv` per
+row with bytecode compiled; the `trimesh` 5.2.1 + `numpy` 2.5.5 baseline is 65.5 MiB.
 
 ### Wheels
 
@@ -304,9 +335,10 @@ spec a distribution's maintainer commits, into `build/distro/`.
 uv run scripts check       # the gate: lint, build, tests, static checks, sanitizers, fuzzers
 uv run scripts lint        # the fast deterministic checks, nothing compiled
 uv run scripts fuzz        # every fuzzer, native then Atheris (--seconds each)
+uv run scripts bench       # the thread pool against hand-written pools, 144 cells (--quick: the short ones, seconds)
 uv run scripts update      # every upstream and dependency to its newest
 uv run scripts format      # our C++, as scripts/clang-format.yaml says
-uv run scripts generate    # regenerate the shaders' SPIR-V, the stubs, this README's generated block and tests/golden.json
+uv run scripts generate    # regenerate the shaders' SPIR-V, the stubs, this README's generated block and check/tests/golden.json
 uv run scripts wheel       # this platform's release wheels
 uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
 ```
@@ -318,7 +350,7 @@ version `pyproject.toml` names (one PyPI already has is left as it is). A push t
 `release/*` does all of it but the upload. Once a week, when main has moved,
 `.github/workflows/fuzz.yml` runs `fuzz` for ten minutes a fuzzer, from the
 seeds in the repository and nothing kept between runs, and fails on a finding. Everything but `lock` and `wheel` runs
-inside a pinned Debian trixie image (`docker/Dockerfile`), with the sources mounted
+inside a pinned Debian trixie image (`scripts/docker/Dockerfile`), with the sources mounted
 read-only unless the command writes them, so the host needs only Docker and uv.
 
 `trimkit.toml` is the one hand-edited build file: every upstream (pin, patches,

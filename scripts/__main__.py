@@ -11,12 +11,14 @@ The one way to build, test and check this package, locally and in CI alike:
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
   uv run scripts genmc       model check src/parallel.hpp itself with GenMC,
                              and that each memory order it weakens is caught
-  uv run scripts model       check the pool's protocol (verify/tla) with TLC,
+  uv run scripts model       check the pool's protocol (check/verify/tla) with TLC,
                              and that each mutation of it is caught
+  uv run scripts bench       the pool against hand-written pools on 8 cores,
+                             144 cells (--quick: the short calls, in seconds)
   uv run scripts distro      Debian and Fedora packaging (--run: build,
                              test and lint them), when packaging changes
   uv run scripts generate    regenerate the shaders' SPIR-V, the stubs, the
-                             README API summary and tests/golden.json
+                             README API summary and check/tests/golden.json
   uv run scripts patch       write vendor/patches/ from the blocks in vendor/
   uv run scripts update      move every upstream and dependency to its newest
   uv run scripts format      format our C++ with the pinned clang-format
@@ -32,7 +34,7 @@ CI runs these same commands. A push to main runs `lint`, `static`, `sdist` and
 `wheel` exactly as they run here, then publishes, the one CI-only step, as it
 needs GitHub's token for PyPI; once a week, when main has moved, CI runs
 `fuzz` for longer. `check` is the gate, run before pushing. Everything but `lock` and `wheel` re-runs
-itself inside the image built from docker/Dockerfile, with the repository
+itself inside the image built from scripts/docker/Dockerfile, with the repository
 mounted read-only at /src (writable for `generate`) and builds under
 `build/docker/`, so it behaves the same on every machine and needs only
 Docker and uv on the host.
@@ -71,6 +73,8 @@ import licenses
 import vendor
 
 ROOT = builder.ROOT
+CHECK = builder.CHECK
+DOCKER = builder.DOCKER
 MANIFEST = builder.load()
 # the Python every build but `tsan` uses, the oldest the stable ABI targets
 PYTHON = "3.12"
@@ -220,7 +224,7 @@ def export(path: Path, *groups: str) -> Path:
 
 def test_files() -> list[Path]:
     # the tracked test modules: an untracked scratch test never runs
-    return [p for p in builder.tracked_under(ROOT / "tests") if p.name.startswith("test_")]
+    return [p for p in builder.tracked_under(CHECK / "tests") if p.name.startswith("test_")]
 
 
 def cmd_build(args) -> None:
@@ -235,7 +239,7 @@ def cmd_test(args) -> None:
     build = dev(args.root)
     # the image has a Vulkan device (Mesa's CPU one), so the device tests run
     build.pytest("--device-required", *test_files())
-    run(build.python, ROOT / "tests" / "memory_limit.py", cwd=ROOT / "tests")
+    run(build.python, CHECK / "tests" / "memory_limit.py", cwd=CHECK / "tests")
 
 
 def cmd_asan(args) -> None:
@@ -297,7 +301,7 @@ def cmd_tsan(args) -> None:
     # long enough under TSan's instrumentation), which TSan can't model and by
     # default kills the child for; glibc supports it, and the fork test needs it
     options = f"suppressions={suppressions} halt_on_error=1 die_after_fork=0"
-    build.pytest("-s", "tests/test_threads.py", env={"TSAN_OPTIONS": options})
+    build.pytest("-s", "check/tests/test_threads.py", env={"TSAN_OPTIONS": options})
 
 
 def harness(directory: Path, corpus: Path, findings: Path, name: str, options: list[str]) -> str:
@@ -391,7 +395,7 @@ def replay_32bit(root: Path, corpus: Path, findings: Path) -> bool:
                 tool("clang++"), "-m32", "-msse2", "-mfpmath=sse",
                 "-std=c++17", "-O1", "-g", "-D_GLIBCXX_ASSERTIONS",
                 "-fsanitize=fuzzer,address,undefined", "-fno-sanitize-recover=all",
-                *includes, *defines, ROOT / "fuzz" / f"{name}.cpp", "-o", directory / f"fuzz_{name}",
+                *includes, *defines, CHECK / "fuzz" / f"{name}.cpp", "-o", directory / f"fuzz_{name}",
             )  # fmt: skip
             report = harness(directory, corpus, findings, name, ["-runs=0"])
             print(report.replace(f"{name}:", f"{name} (32-bit):"), flush=True)
@@ -414,7 +418,7 @@ def atheris(args) -> None:
     # mappings collide often enough to crash a third of plain `import numpy`s
     run(
         build.python,
-        ROOT / "fuzz" / "atheris_bindings.py",
+        CHECK / "fuzz" / "atheris_bindings.py",
         f"-max_total_time={args.seconds}",
         "-timeout=20",
         f"-artifact_prefix={findings}/",
@@ -453,7 +457,7 @@ def cmd_cppcheck(args) -> None:
 
 def cpp_files() -> list[Path]:
     # all of our C++, whichever directory it lives in
-    directories = [*MANIFEST.directories, ROOT / "fuzz"]
+    directories = [*MANIFEST.directories, CHECK / "fuzz"]
     return [p for d in directories for p in builder.tracked_under(d) if p.suffix in (".cpp", ".hpp")]
 
 
@@ -531,11 +535,11 @@ def cmd_sdist(args) -> None:
     archive = sdist(args.root)
     (tree,) = (archive.parent / "unpacked").iterdir()
     build = Build(args.root, "sdist-test").install(PYTHON, source=archive, strict=True)
-    build.pytest(tree / "tests", cwd=tree)
+    build.pytest(tree / "check" / "tests", cwd=tree)
     # and on free-threaded Python, which gets no wheels: this is how it installs.
     # Wall-clock bounds aside, as they measure the GIL it doesn't have
     free = Build(args.root, "sdist-free-threaded").install(FREE_THREADED_PYTHON, source=archive, strict=True)
-    free.pytest("-m", "not timing", tree / "tests", cwd=tree)
+    free.pytest("-m", "not timing", tree / "check" / "tests", cwd=tree)
 
 
 def cmd_licenses(args) -> None:
@@ -746,13 +750,13 @@ def cmd_audit(args) -> None:
 
 def check_model_steps() -> None:
     """
-    The model (verify/tla/Scheduler.tla) and the code name the same steps:
+    The model (check/verify/tla/Scheduler.tla) and the code name the same steps:
     each CallerStep and WorkerStep of src/parallel.hpp has an action named
     Caller<Step> or Worker<Step> (or <Step><Part>, an atomic part of it), and
     each such action is part of a step the code has.
     """
     header = (ROOT / "src" / "parallel.hpp").read_text()
-    spec = (ROOT / "verify" / "tla" / "Scheduler.tla").read_text()
+    spec = (CHECK / "verify" / "tla" / "Scheduler.tla").read_text()
     problems = []
     for side in ("Caller", "Worker"):
         enum = re.search(rf"enum class {side}Step : std::uint8_t \{{(.*?)\}};", header, re.S)
@@ -879,10 +883,10 @@ def cmd_threads(args) -> None:
 
 
 # the pool against the best of what people write by hand, in every cell of
-# bench/parallel.cpp: no slower than this times the best of them, plus this,
+# check/bench/parallel.cpp: no slower than this times the best of them, plus this,
 # plus the tail no dynamic schedule can promise to beat, which the pool states
 # as its bound: the cell's costliest single item and one first claim
-# (src/parallel.hpp, MIN_CLAIM_NS)
+# (src/parallel.hpp, policy::MIN_CLAIM_NS)
 POOL_AGAINST_HAND = 1.10
 POOL_SLACK_US = 20.0
 POOL_TAIL_CLAIM_US = 4.0
@@ -909,10 +913,30 @@ def _bench_misses(cell: dict) -> list[str]:
     return reasons
 
 
+# the longest serial time a cell's wake-up cost is read from (_wake_cost_us)
+WAKE_COST_CELL_US = 1_000.0
+# the most serial work a cell may be: all of them, or with `--quick` the short ones
+BENCH_SERIAL_NS = 2e9
+BENCH_QUICK_SERIAL_NS = 2e7
+
+
+def _wake_cost_us(cell: dict) -> str:
+    # what a wake-up cost here, against the C the pool's policy takes it to
+    # (src/parallel.hpp, policy::WAKE_COST_NS): the CPU the pool took beyond
+    # the serial loop's and its workers' spinning, for each worker it woke or
+    # started, the work running slower on a core just woken included. Read
+    # only where the work is short enough that its own CPU's noise, a few
+    # percent, can't swamp a few wakes'
+    roused = cell["woken"] + cell["spawns"]
+    if roused == 0 or cell["serial"] > WAKE_COST_CELL_US:
+        return "-"
+    return f"{(cell['pool_cpu'] - cell['serial_cpu'] - cell['spin_us']) / roused:.1f}"
+
+
 def cmd_bench(args) -> None:
     """
     src/parallel.hpp against a serial loop and three pools written by hand
-    (bench/parallel.cpp), with 1 and 4 callers, alone and with a noisy
+    (check/bench/parallel.cpp), with 1 and 4 callers, alone and with a noisy
     neighbour, on `--cores` cores. In every cell the pool must be within
     POOL_AGAINST_HAND of the best hand-written way plus POOL_SLACK_US and the
     costliest item, never slower than the serial loop by more than that, and
@@ -920,6 +944,8 @@ def cmd_bench(args) -> None:
     POOL_CPU_SLACK_US. A cell that misses is measured twice more, and misses
     only if it does every time: a busy machine slows a round, not every round.
     Prints each cell, then fails naming every cell that missed, and why.
+    `--quick` measures only the cells of at most BENCH_QUICK_SERIAL_NS of
+    serial work: the short calls, where scheduling costs show.
     """
     binary = args.root / "bench" / "parallel"
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -929,17 +955,18 @@ def cmd_bench(args) -> None:
         "-O2",
         "-DNDEBUG",
         "-pthread",
-        ROOT / "bench" / "parallel.cpp",
+        CHECK / "bench" / "parallel.cpp",
         "-o",
         binary,
     )
     threads = str(len(os.sched_getaffinity(0)))
+    most = f"{BENCH_QUICK_SERIAL_NS if args.quick else BENCH_SERIAL_NS:.0f}"
     missed = []
+    costs: list[str] = []
     for callers in ("1", "4"):
         for noise in ("0", threads):
-            cells = [
-                json.loads(line) for line in run(binary, threads, callers, noise, capture=True).splitlines()
-            ]
+            measured = run(binary, threads, callers, noise, most, capture=True)
+            cells = [json.loads(line) for line in measured.splitlines()]
             for index, first in enumerate(cells):
                 best = first
                 for _ in range(2):
@@ -947,7 +974,7 @@ def cmd_bench(args) -> None:
                         break
                     only = f"{best['items']},{best['item_ns']:.0f},{best['skew_index']}"
                     again = json.loads(
-                        run(binary, threads, callers, noise, only, capture=True).splitlines()[-1]
+                        run(binary, threads, callers, noise, most, only, capture=True).splitlines()[-1]
                     )
                     best = min(
                         best, again, key=lambda c: len(_bench_misses(c)) + c["pool"] / (c["serial"] + 1)
@@ -956,7 +983,8 @@ def cmd_bench(args) -> None:
             print(
                 f"\n{threads} threads, {callers} callers, noise {noise}\n"
                 f"{'items':>8} {'item ns':>8} {'skew':>15} {'serial':>10} {'pool':>10} {'best hand':>10} "
-                f"{'pool/best':>9} {'cpu/hand cpu':>12} {'threads':>7} {'wakes':>5} {'sleeps':>6}"
+                f"{'pool/best':>9} {'cpu/hand cpu':>12} {'threads':>7} {'woken':>5} {'spin us':>7} "
+                f"{'us/wake':>7}"
             )
             for cell in cells:
                 hand = min(cell["spawn"], cell["cv_static"], cell["cv_chunks"])
@@ -964,8 +992,8 @@ def cmd_bench(args) -> None:
                 print(
                     f"{cell['items']:>8} {cell['item_ns']:>8.0f} {cell['skew']:>15} {cell['serial']:>10.0f} "
                     f"{cell['pool']:>10.0f} {hand:>10.0f} {cell['pool'] / hand:>9.2f} "
-                    f"{cell['pool_cpu'] / hand_cpu:>12.2f} {cell['pool_threads']:>7} {cell['wakes']:>5} "
-                    f"{cell['sleeps']:>6}"
+                    f"{cell['pool_cpu'] / hand_cpu:>12.2f} {cell['pool_threads']:>7} {cell['woken']:>5} "
+                    f"{cell['spin_us']:>7.0f} {_wake_cost_us(cell):>7}"
                 )
                 reasons = _bench_misses(cell)
                 if reasons:
@@ -973,20 +1001,29 @@ def cmd_bench(args) -> None:
                         f"{cell['items']} items of {cell['item_ns']:.0f} ns, {cell['skew']}, "
                         f"{callers} callers, noise {noise}: " + "; ".join(reasons)
                     )
+            costs.extend(c for c in map(_wake_cost_us, cells) if c != "-")
+    if costs:
+        ordered = sorted(float(c) for c in costs)
+        print(
+            f"\nwhat a wake-up cost, beyond the spinning, in the {len(ordered)} cells under "
+            f"{WAKE_COST_CELL_US:.0f} us serial that woke workers: median "
+            f"{ordered[len(ordered) // 2]:.1f} us, p90 {ordered[len(ordered) * 9 // 10]:.1f} us, "
+            f"against the policy's C of {cells[-1]['wake_cost_us']:.1f} us"
+        )
     if missed:
         sys.exit(f"the pool missed the gate in {len(missed)} cells:\n  " + "\n  ".join(missed))
     print("ok: the pool is within the gate in every cell")
 
 
-# GenMC (docker/Dockerfile.verify) runs src/parallel.hpp itself, built for its
+# GenMC (scripts/docker/Dockerfile.verify) runs src/parallel.hpp itself, built for its
 # backend (src/platform.hpp, TRIMKIT_GENMC), in every execution the C++
 # memory model allows (RC11), and reports an assertion, a data race, a use
-# after free, or a wait that can never end. Each harness in verify/genmc must
+# after free, or a wait that can never end. Each harness in check/verify/genmc must
 # explore at least its floor of executions, about half what it does now, so
 # one that stops sharing work (and passes for want of anything to check)
 # fails too. One call at a time, with its worker: two jobs at once (two
 # callers, a nested call, or one caller's two calls) GenMC estimates at some
-# 170 million executions, so those are verify/tla's, the fuzzer's and TSan's
+# 170 million executions, so those are check/verify/tla's, the fuzzer's and TSan's
 GENMC_HARNESSES = {
     "visibility": 40,
     "early_worker": 32000,
@@ -1004,8 +1041,8 @@ GENMC_SECONDS = 1200
 # the line's code, so a moved or edited line is looked at again
 _LOST_WAKE = (
     "keeps a wake from being lost (the wake, spinning and live counts' pairings): GenMC's waits return at"
-    " once, so a lost wake can't show there; verify/tla checks the pairings (P1, P2), which these orders make"
-    " sequentially consistent"
+    " once, so a lost wake can't show there; check/verify/tla checks the pairings (P1, P2), which these"
+    " orders make sequentially consistent"
 )
 _LEFT = (
     "orders a worker's leave before its bump of `left`, so a caller that sees the bump sees the leave and"
@@ -1014,11 +1051,11 @@ _LEFT = (
 )
 _TWO_HOLDERS = (
     "orders one holder of a thread index before the next, which are two workers' lifetimes: no harness of one"
-    " call reaches that (verify/tla's S3 checks the holders; TSan the scratch)"
+    " call reaches that (check/verify/tla's S3 checks the holders; TSan the scratch)"
 )
 _TWO_JOBS = (
     "orders the last job's last leave before the next reservation of its slot: two jobs, which GenMC can't"
-    " reach here (some 170 million executions); verify/tla models the reuse"
+    " reach here (some 170 million executions); check/verify/tla models the reuse"
 )
 GENMC_MUTANTS_SURVIVING: dict[str, str] = {
     "if ((held_indexes[index / 64].fetch_or(bit, std::memory_order_acquire) & bit) == 0) {  [acquire -> relaxed]": _TWO_HOLDERS,  # noqa: E501
@@ -1055,7 +1092,7 @@ def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
                 "-ffp-contract=off",
                 "-DTRIMKIT_GENMC",
                 f"-I{root}",
-                str(ROOT / "verify" / "genmc" / f"{harness}.cpp"),
+                str(CHECK / "verify" / "genmc" / f"{harness}.cpp"),
             ],
             capture_output=True,
             text=True,
@@ -1100,13 +1137,13 @@ def _weakened(source: str) -> list[tuple[str, str]]:
 
 def cmd_genmc(args) -> None:
     """
-    Every harness in verify/genmc on src/parallel.hpp as it is, then on each
+    Every harness in check/verify/genmc on src/parallel.hpp as it is, then on each
     mutant of it, one memory order weakened by one step: each mutant must
     fail some harness, unless GENMC_MUTANTS_SURVIVING says why it may not.
     """
-    found = sorted(p.stem for p in (ROOT / "verify" / "genmc").glob("*.cpp"))
+    found = sorted(p.stem for p in (CHECK / "verify" / "genmc").glob("*.cpp"))
     if found != sorted(GENMC_HARNESSES):
-        sys.exit(f"verify/genmc has {found}, GENMC_HARNESSES lists {sorted(GENMC_HARNESSES)}")
+        sys.exit(f"check/verify/genmc has {found}, GENMC_HARNESSES lists {sorted(GENMC_HARNESSES)}")
     workers = len(os.sched_getaffinity(0))
     failed = []
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
@@ -1154,7 +1191,7 @@ def cmd_genmc(args) -> None:
         )
 
 
-# verify/tla/Scheduler.tla, the pool's protocol, checked by TLC in every
+# check/verify/tla/Scheduler.tla, the pool's protocol, checked by TLC in every
 # interleaving of each scenario: its constants over MODEL_BASE's, and the
 # fewest distinct states it must reach, so a scenario that stops exploring
 # fails. Then each mutation breaks one guard of the C++ in the model, and TLC
@@ -1194,13 +1231,15 @@ MODEL_MUTATIONS = {
     "fork_keeps_slots": ("L1", {"Calls": 1, "Fork": True}),
     "fork_keeps_held_epoch": ("R", {"Calls": 1, "Cap": 2, "Fork": True}),
     "claims_ignore_exit": ("X", {"Calls": 1, "AtExit": True}),
+    "spawn_chain_ignores_wanted": ("P3", {"Calls": 1, "Cap": 2}),
+    "spawn_ignores_live": ("P3", {"Cap": 2}),
 }
-MODEL_PROPERTIES = ["S1", "S2", "S3", "P1", "P2", "R", "X", "E"]
+MODEL_PROPERTIES = ["S1", "S2", "S3", "P1", "P2", "P3", "R", "X", "E"]
 # no run of TLC takes this long but one that can't end: a model whose state
 # space has no bound (a mutation that bumps the wake for ever) fails here
 MODEL_SECONDS = 3600
-# The code held to the model (verify/tla/SchedulerTrace.tla): a traced build of
-# src/parallel.hpp (verify/tla/trace.cpp) runs real calls on the real pool,
+# The code held to the model (check/verify/tla/SchedulerTrace.tla): a traced build of
+# src/parallel.hpp (check/verify/tla/trace.cpp) runs real calls on the real pool,
 # round after round, at the container's own cores, and TLC must find that the
 # model allows every step of each log. Then each of these reorderings of the
 # C++ (one step moved, or dropped) must make some round's log one the model
@@ -1317,7 +1356,7 @@ def _traces(spec: Path, src: Path, name: str) -> list[tuple[Path, dict]]:
     here = spec / f"trace_{name}"
     here.mkdir()
     driver = here / "trace"
-    run(tool("clang++"), "-std=c++20", "-O1", "-pthread", f"-I{src}", ROOT / "verify" / "tla" / "trace.cpp",
+    run(tool("clang++"), "-std=c++20", "-O1", "-pthread", f"-I{src}", CHECK / "verify" / "tla" / "trace.cpp",
         "-o", driver)  # fmt: skip
     logs = []
     for round_ in range(TRACE_ROUNDS):
@@ -1343,7 +1382,7 @@ def _replay(spec: Path, log: Path, constants: dict) -> tuple[bool, int, int]:
     (here / "replay.cfg").write_text(
         "SPECIFICATION TraceSpec\nCONSTANTS\n"
         + "\n".join(lines)
-        + '\n    Mutation = "none"\nINVARIANT Unmatched\n'
+        + '\n    Mutation = "none"\nINVARIANTS Unmatched P3\n'
     )
     done = subprocess.run(
         [tool("java"), "-Xss64m", "-XX:+UseParallelGC", "-cp", "/opt/tla2tools.jar", "tlc2.TLC", "-deadlock",
@@ -1361,18 +1400,18 @@ def _replay(spec: Path, log: Path, constants: dict) -> tuple[bool, int, int]:
 
 def cmd_model(args) -> None:
     """
-    TLC on verify/tla/Scheduler.tla, its slot word arithmetic generated from
-    the C++ first (verify/tla/slot_word_table.cpp): every scenario must pass
+    TLC on check/verify/tla/Scheduler.tla, its slot word arithmetic generated from
+    the C++ first (check/verify/tla/slot_word_table.cpp): every scenario must pass
     and reach its floor of states, and every mutation must break the property
     it names.
     """
     spec = args.root / "model"
     shutil.rmtree(spec, ignore_errors=True)
     spec.mkdir(parents=True)
-    shutil.copy(ROOT / "verify" / "tla" / "Scheduler.tla", spec)
-    shutil.copy(ROOT / "verify" / "tla" / "SchedulerTrace.tla", spec)
+    shutil.copy(CHECK / "verify" / "tla" / "Scheduler.tla", spec)
+    shutil.copy(CHECK / "verify" / "tla" / "SchedulerTrace.tla", spec)
     table = spec / "slot_word_table"
-    run(tool("clang++"), "-std=c++20", "-O1", ROOT / "verify" / "tla" / "slot_word_table.cpp", "-o", table)
+    run(tool("clang++"), "-std=c++20", "-O1", CHECK / "verify" / "tla" / "slot_word_table.cpp", "-o", table)
     (spec / "SlotWordTable.tla").write_text(run(table, capture=True))
     failed = []
     traced = _traces(spec, ROOT / "src", "code")
@@ -1422,7 +1461,9 @@ def cmd_model(args) -> None:
             print(
                 f"  {verdict}  the code's trace {log.parent.name:<26} {records:>6} steps, {matched} matched"
             )
-            if not accepted:
+            if not accepted and "Invariant P3 is violated" in (log.parent / "tlc.log").read_text():
+                failed.append(f"the code's trace breaks P3: {log}, at record {matched}")
+            elif not accepted:
                 failed.append(f"the code took a step the model doesn't allow: {log}, record {matched + 1}")
         print("  steps traced: " + ", ".join(f"{a} {n}" for a, n in sorted(actions.items())), flush=True)
         for name, runs in mutant_replays.items():
@@ -1553,7 +1594,8 @@ def cmd_update(args) -> None:
     vendor.update_base_image()
     cmd_lock(args)
     stubs(args.root, write=True)
-    run(tool("git"), "-C", ROOT, "diff", "--stat", "--", "trimkit.toml", "uv.lock", ".github", "docker")
+    pins = ["trimkit.toml", "uv.lock", ".github", "scripts/docker"]
+    run(tool("git"), "-C", ROOT, "diff", "--stat", "--", *pins)
     # an upstream whose patch no longer applies stays at its pin, for a person
     # to rebase the patch or drop it: everything else has moved
     for reason in held:
@@ -1622,7 +1664,7 @@ def cmd_generate(args) -> None:
     # and the golden answers every platform is checked against
     shader(write=True)
     stubs(args.root, write=True)
-    run(dev(args.root).python, ROOT / "tests" / "test_golden.py", "--write", cwd=ROOT / "tests")
+    run(dev(args.root).python, CHECK / "tests" / "test_golden.py", "--write", cwd=CHECK / "tests")
 
 
 # what `check` runs, in order: every stage runs even after one fails
@@ -1679,10 +1721,10 @@ WRITES_SOURCES = {"generate", "fetch", "patch", "update", "format"}
 
 def cmd_image(args) -> None:
     # docker's layer cache makes this quick unless the Dockerfile or lock changed
-    run(tool("docker"), "build", "-q", "-f", ROOT / "docker" / "Dockerfile", "-t", IMAGE, ROOT, capture=True)
+    run(tool("docker"), "build", "-q", "-f", DOCKER / "Dockerfile", "-t", IMAGE, ROOT, capture=True)
     if getattr(args, "command", None) in VERIFIES:
-        verify = ROOT / "docker" / "Dockerfile.verify"
-        run(tool("docker"), "build", "-q", "-f", verify, "-t", VERIFY_IMAGE, ROOT / "docker", capture=True)
+        verify = DOCKER / "Dockerfile.verify"
+        run(tool("docker"), "build", "-q", "-f", verify, "-t", VERIFY_IMAGE, DOCKER, capture=True)
 
 
 def in_image(args) -> None:
@@ -1699,7 +1741,7 @@ def in_image(args) -> None:
     if args.command == "patch":
         forwarded += args.names
     if args.command == "bench":
-        forwarded += ["--cores", str(args.cores)]
+        forwarded += ["--cores", str(args.cores), *(["--quick"] if args.quick else [])]
     builds = ROOT / "build" / "docker"
     builds.mkdir(parents=True, exist_ok=True)
     access = "rw" if args.command in WRITES_SOURCES else "ro"
@@ -1753,9 +1795,9 @@ def main() -> None:
         "check": "the gate: lint, tests, static checks, sanitizers and fuzzers",
         "lint": "the fast deterministic checks, nothing compiled",
         "genmc": "model check src/parallel.hpp itself with GenMC, and its weakened memory orders",
-        "model": "check the pool's protocol in verify/tla with TLC, and that each mutation is caught",
+        "model": "check the pool's protocol in check/verify/tla with TLC, and that each mutation is caught",
         "fuzz": "every fuzzer, native then Atheris, --seconds each",
-        "generate": "regenerate the shaders' SPIR-V, the stubs, the README API summary and tests/golden.json",
+        "generate": "regenerate the shaders' SPIR-V, the stubs, the README API summary and golden.json",
         "patch": "write vendor/patches/ from the //// TRIMKIT PATCH blocks in vendor/",
         "update": "move every upstream and dependency to its newest",
         "format": "format our C++ with the pinned clang-format",
@@ -1775,6 +1817,11 @@ def main() -> None:
             if name == "cmd_bench":
                 command.add_argument(
                     "--cores", type=int, default=BENCH_CORES, help="the last this many cores"
+                )
+                command.add_argument(
+                    "--quick",
+                    action="store_true",
+                    help="only cells of at most 20 ms serial: seconds, not 30 minutes",
                 )
             if name == "cmd_fetch":
                 command.add_argument("--latest", action="store_true", help="move each pin to its ref's HEAD")

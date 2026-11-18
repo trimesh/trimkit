@@ -37,8 +37,8 @@
 # [part.NAME], a part of the one extension: src/NAME.cpp, whose bind_NAME adds
 # its functions and classes to the flat module:
 #   upstreams          what it compiles in
-#   fuzz               libFuzzer harnesses fuzz/HARNESS.cpp built against it
-#   seeds              a program fuzz/SEEDS.cpp writing seeds for harness NAME
+#   fuzz               libFuzzer harnesses check/fuzz/HARNESS.cpp built against it
+#   seeds              a program check/fuzz/SEEDS.cpp writing seeds for harness NAME
 #
 # [extension], the one extension, the package `trimkit` itself:
 #   budget             the most bytes it may be stripped in a wheel, about

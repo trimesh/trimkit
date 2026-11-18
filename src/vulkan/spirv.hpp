@@ -1,7 +1,7 @@
 // The shaders as SPIR-V, written by `uv run scripts generate`: what
 // src/vulkan/vulkan.hpp hands the device. Never edited by hand.
 // src/vulkan/layout.comp (sha256 d35da2e5acf46f5a81cec74466ab98c70b43e491fa0cbbc10a324e7cc0513fe0)
-// src/vulkan/trace.comp (sha256 51f1d1ecb8b0723632e628373315b770de0f9fb83de9f40e531b194d3ea7c481)
+// src/vulkan/trace.comp (sha256 cae27fa6876917eea63f0ce6fe69780b243d9c4ed408c9f594f9540e44e44a4d)
 // clang-format off
 #pragma once
 

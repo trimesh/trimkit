@@ -506,7 +506,7 @@ inline Instances read_instances(const InstanceViews& views, std::size_t mesh_cou
 // again (a compile error without it). Never an acceleration structure, which
 // is rebuilt: a pickle holds only arrays and Python values, named, so it loads
 // into any build whose constructor takes the same names.
-// tests/test_invariants.py round-trips every class the package binds
+// check/tests/test_invariants.py round-trips every class the package binds
 template <typename T>
 nb::class_<T> picklable_class(nb::module_& m, const char* name, const char* doc) {
     static_assert(std::is_same_v<decltype(std::declval<const T&>().constructor_arguments()), nb::dict>,

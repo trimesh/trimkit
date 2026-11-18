@@ -116,7 +116,7 @@ constexpr std::uint32_t TRACE_BINDINGS = SCENE_BUFFERS + TOP_BUFFERS + CHUNK_BUF
 constexpr std::uint32_t LAYOUT_BINDINGS = 10;
 constexpr std::uint32_t SETS = 2;  // descriptor sets per chunk in flight: one per shader
 
-// A node as the shader's f32 filter reads it (docs/trace.md 3): the f64 box
+// A node as the shader's f32 filter reads it (check/verify/gpu.md 3): the f64 box
 // rounded to nearest, and for an interior node bit 31 with a mask of which of
 // its two children's six f64 coordinates are exactly equal (the filter's
 // tie-break); for a leaf, its count
@@ -128,7 +128,7 @@ struct Node32 {
 };
 constexpr std::uint32_t INTERIOR = 0x80000000U;
 
-// The triangle in a leaf slot as the filter reads it (docs/trace.md 4, 5):
+// The triangle in a leaf slot as the filter reads it (check/verify/gpu.md 4, 5):
 // corners in tinybvh's order as f32, the largest coordinate magnitude rounded
 // up, the face, the f64 normal as f32 and a bound on how far that is from
 // the exact normal
@@ -167,7 +167,7 @@ struct Tree {
     std::uint32_t depth;
 };
 
-// The f32 images of a tree's nodes (docs/trace.md 3: each box rounded to
+// The f32 images of a tree's nodes (check/verify/gpu.md 3: each box rounded to
 // nearest, and for an interior node which of its children's coordinates tie
 // exactly, which decides their order), written by walking the tree from its
 // root as the shader will. Nothing is followed before it is checked: a child

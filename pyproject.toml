@@ -91,7 +91,7 @@ config-settings = { strict = "true", pgo = "use" }
 before-test = "uv pip install --require-hashes --no-deps -r {project}/requirements.txt"
 # wall-clock bounds are the local gate's: a busy runner mustn't block a release on one
 # (double quotes: cmd.exe, on Windows, doesn't know single ones)
-test-command = 'pytest {project}/tests -q -m "not timing"'
+test-command = 'pytest {project}/check/tests -q -m "not timing"'
 # metadata, then check_wheel.py: abi3audit, licenses, naming and sizes, with
 # both tools installed by hash rather than cibuildwheel's own abi3audit
 audit-requires = ["--require-hashes", "--no-deps", "-r", "audit.txt"]
@@ -124,14 +124,14 @@ repair-wheel-command = ""
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0", UV_NO_CONFIG = "1" }
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["check/tests"]
 # no cache directory: tests run from a read-only source tree in the image
 addopts = "-ra --strict-markers --strict-config -p no:cacheprovider"
 # wall-clock measurements: everywhere but PGO training and the sanitizers,
 # whose instrumented builds are slower and measure themselves, not the code
 markers = [
     "timing: asserts a wall-clock bound or measures how long the GIL is held",
-    "device: needs a Vulkan device computing in double precision, else skips (see tests/conftest.py)",
+    "device: needs a Vulkan device computing in double precision, else skips (see check/tests/conftest.py)",
 ]
 xfail_strict = true
 filterwarnings = ["error"]
@@ -151,10 +151,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # magic numbers, lazy imports and long functions in tests, benchmarks and scripts
-"tests/*" = ["PLR2004", "PLC0415", "PLR0913"]
-"tests/test_threads.py" = ["F821"] # `del scene` after the closures that use it
-"tests/svg_reference.py" = ["PLR2004", "B023", "PLR0912", "PLR0915"] # closures run within their iteration
-"bench/*" = ["PLR2004", "PLC0415", "PLR0912", "PLR0913", "PLR0915", "S607"] # `git` and `uv` from PATH
+"check/tests/*" = ["PLR2004", "PLC0415", "PLR0913"]
+"check/tests/test_threads.py" = ["F821"] # `del scene` after the closures that use it
+"check/tests/svg_reference.py" = ["PLR2004", "B023", "PLR0912", "PLR0915"] # closures run within their iteration
+"check/bench/*" = ["PLR2004", "PLC0415", "PLR0912", "PLR0913", "PLR0915", "S607"] # `git` and `uv` from PATH
 "scripts/*" = ["PLR0912", "PLR0913", "PLR0915", "PLC0415", "PLR2004"]
-"fuzz/*" = ["PLR2004", "PLC0415", "PLR0912", "PLR0915"]
+"check/fuzz/*" = ["PLR2004", "PLC0415", "PLR0912", "PLR0915"]
 "examples/*" = ["PLR2004"]
