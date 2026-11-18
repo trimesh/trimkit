@@ -1,7 +1,8 @@
 """
 The one way to build, test and check this package, locally and in CI alike:
 
-  uv run scripts check       the gate: every stage below, then ASan, TSan
+  uv run scripts check       the gate: lint, test, static, ASan, TSan, fuzz,
+                             bench --quick, genmc and model
   uv run scripts lint        the fast deterministic checks, nothing compiled:
                              vendor, doors, lock, formatting, ruff, zizmor,
                              licenses, shaders and cppcheck
@@ -10,9 +11,11 @@ The one way to build, test and check this package, locally and in CI alike:
                              sdist, stubs and the wheel audit
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
   uv run scripts genmc       model check src/parallel.hpp itself with GenMC,
-                             and that each memory order it weakens is caught
+                             and that each bug planted in it and each memory
+                             order weakened is caught
   uv run scripts model       check the pool's protocol (check/verify/tla) with TLC,
-                             and that each mutation of it is caught
+                             that each mutation of it is caught, and that
+                             traced runs of the code are ones it allows
   uv run scripts bench       the pool against hand-written pools on 8 cores,
                              144 cells (--quick: the short calls, in seconds)
   uv run scripts distro      Debian and Fedora packaging (--run: build,
@@ -1053,6 +1056,10 @@ def cmd_bench(args) -> None:
                         f"{callers} callers, noise {noise}: " + "; ".join(reasons)
                     )
             costs.extend(c for c in map(_wake_cost_us, cells) if c != "-")
+            # a wheel's caller looks again each second for workers whose wake
+            # was lost (src/parallel.hpp, RECHECK_MS): that it never had to
+            if cells and cells[-1]["rechecks"]:
+                missed.append(f"{callers} callers, noise {noise}: {cells[-1]['rechecks']} wakes were lost")
     if costs:
         ordered = sorted(float(c) for c in costs)
         print(
@@ -1191,9 +1198,10 @@ def _weakened(source: str) -> list[tuple[str, str]]:
 
 def cmd_genmc(args) -> None:
     """
-    Every harness in check/verify/genmc on src/parallel.hpp as it is, then on each
-    mutant of it, one memory order weakened by one step: each mutant must
-    fail some harness, unless GENMC_MUTANTS_SURVIVING says why it may not.
+    Every harness in check/verify/genmc on src/parallel.hpp as it is; then on each
+    bug planted for GenMC (CODE_MUTANTS), which must fail some harness; then
+    on each mutant of it with one memory order weakened by one step, which
+    must fail some harness unless GENMC_MUTANTS_SURVIVING says why it may not.
     """
     found = sorted(p.stem for p in (CHECK / "verify" / "genmc").glob("*.cpp"))
     if found != sorted(GENMC_HARNESSES):

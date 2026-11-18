@@ -17,7 +17,7 @@
 // microseconds (this process's alone, read once its threads have settled, so
 // a pool's spinning after the work counts against it), how many threads ran
 // the pool's items and what the pool did for them (publishes, wakes, sleeps,
-// spawns, workers woken and time spent spinning: built with
+// spawns, workers woken, time spent spinning and wakes lost: built with
 // TRIMKIT_PARALLEL_COUNTERS), and the costliest single item, which no dynamic
 // schedule can promise to beat at the end of a job, and C, what the pool's
 // policy takes a wake-up to cost (src/parallel.hpp, policy::WAKE_COST_NS),
@@ -386,14 +386,16 @@ int main(int argc, char** argv) {
                     "\"spawn\": %.1f, \"cv_static\": %.1f, \"cv_chunks\": %.1f, \"serial_cpu\": %.1f, "
                     "\"pool_cpu\": %.1f, \"spawn_cpu\": %.1f, \"cv_static_cpu\": %.1f, \"cv_chunks_cpu\": %.1f, "
                     "\"pool_threads\": %d, \"publishes\": %llu, \"wakes\": %llu, \"sleeps\": %llu, "
-                    "\"spawns\": %llu, \"woken\": %llu, \"spin_us\": %.1f, \"wake_cost_us\": %.1f}\n",
+                    "\"spawns\": %llu, \"woken\": %llu, \"spin_us\": %.1f, \"wake_cost_us\": %.1f, "
+                    "\"rechecks\": %llu}\n",
                     count, item_ns, SKEW_NAMES[skew], skew, threads, callers, noise, shape.costliest() / 1000,
                     cell.wall_us[0], cell.wall_us[POOL], cell.wall_us[2], cell.wall_us[3], cell.wall_us[4],
                     cell.cpu_us[0], cell.cpu_us[POOL], cell.cpu_us[2], cell.cpu_us[3], cell.cpu_us[4],
                     cell.pool_threads, static_cast<unsigned long long>(cell.publishes),
                     static_cast<unsigned long long>(cell.wakes), static_cast<unsigned long long>(cell.sleeps),
                     static_cast<unsigned long long>(cell.spawns), static_cast<unsigned long long>(cell.woken),
-                    static_cast<double>(cell.spin_ns) / 1000, trimkit::parallel::policy::WAKE_COST_NS / 1000);
+                    static_cast<double>(cell.spin_ns) / 1000, trimkit::parallel::policy::WAKE_COST_NS / 1000,
+                    static_cast<unsigned long long>(trimkit::parallel::counters.rechecks.load()));  // so far
                 std::fflush(stdout);
             }
         }

@@ -12,7 +12,7 @@
 //   macOS     __ulock (what libc++'s own std::atomic::wait is built on)
 //   other     a millisecond nap in place of a sleep on a word
 //   GenMC     TRIMKIT_GENMC: the model checker GenMC runs the pool's own code
-//             (check/verify/genmc), so here a sleep is GenMC's blocking assume, the
+//             (check/verify/genmc), so here a sleep returns at once, the
 //             clock jumps, there are two CPUs, a body fails by a flag rather
 //             than a C++ exception (GenMC runs none), and idle workers exit at
 //             once, so every thread of a checked execution ends and a caller

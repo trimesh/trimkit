@@ -57,7 +57,8 @@
 //     step: the model is held to the code, not only the code to the model.
 //   - check/fuzz/parallel.cpp, under AddressSanitizer: real threads at real
 //     sizes, with items that throw, nest and sleep, forks, and the exit. A
-//     caller with no Stop waits with no timeout, so a lost wake is a hang.
+//     caller with no Stop waits there with no timeout, so a lost wake is a
+//     hang (a wheel's looks again each second: RECHECK_MS).
 //   - check/tests/test_threads.py, under ThreadSanitizer too.
 //   - `scripts bench`: speed, against a serial loop and pools written by hand.
 // Each of the first three is also run on bugs planted in this file, one at a
@@ -361,6 +362,7 @@ struct PoolCounters {
     std::atomic<std::uint64_t> spawns{0};     // worker threads started
     std::atomic<std::uint64_t> woken{0};      // sleeping workers woken, as the system counts them
     std::atomic<std::uint64_t> spin_ns{0};    // time idle workers spent spinning before they slept or saw a wake
+    std::atomic<std::uint64_t> rechecks{0};   // callers that slept RECHECK_MS through their last worker's leave
 };
 inline PoolCounters counters;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -480,6 +482,14 @@ struct WorkerPool {
     std::atomic<std::int64_t> cap_read_at{0};        // when `cap` was last read from the system (0: never)
 };
 inline WorkerPool pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// How long a caller with no Stop sleeps, waiting for its workers, before it
+// looks again. The last worker out wakes it, so this never comes: checked
+// builds have none, and a wake that is lost hangs the fuzzer, which is how
+// one is caught. A wheel looks again each second, so a bug no check caught
+// costs a stall there and not a call that never returns; counted builds
+// count each time that happened (`scripts bench` fails on one)
+constexpr std::uint32_t RECHECK_MS = CHECKED ? platform::FOREVER : 1000;
 
 // Sleep while `word` holds `expected`, for at most `timeout_ms`, counted. It
 // may return early, so the caller reads the word again
@@ -936,8 +946,8 @@ inline bool workers_gone(const JobSlot& slot, std::uint32_t epoch) {
 // Wait until no worker is inside the job published as `epoch`. It spins first
 // (policy::close_spin_ns), then sleeps until the last worker out wakes it.
 // When `poll` (never while unwinding: see SharedJob) and the job has a Stop,
-// the sleep ends every POLL_MS to poll it; otherwise it has no timeout, so a
-// wake that never came would be a hang any test can see, not a stall
+// the sleep ends every POLL_MS to poll it; otherwise it ends only at
+// RECHECK_MS, which in a checked build is never
 inline void wait_for_workers(JobSlot& slot, RangeJob& job, std::uint32_t epoch, bool poll) {
     const bool polling = poll && job.stop_by.poll != nullptr;
     const std::int64_t spin_until = platform::monotonic_ns() + static_cast<std::int64_t>(policy::close_spin_ns());
@@ -974,7 +984,15 @@ inline void wait_for_workers(JobSlot& slot, RangeJob& job, std::uint32_t epoch, 
             moved = slot.left.load(std::memory_order_acquire) != left;
         }
         if (!moved) {
-            park(slot.left, left, polling ? POLL_MS : platform::FOREVER);
+            const std::int64_t slept_from = COUNTED ? platform::monotonic_ns() : 0;
+            park(slot.left, left, polling ? POLL_MS : RECHECK_MS);
+            if constexpr (COUNTED) {
+                // the whole of it slept, and no worker left inside: its wake was lost
+                const std::int64_t slept = platform::monotonic_ns() - slept_from;
+                if (!polling && slept >= std::int64_t{RECHECK_MS} * 1'000'000 && workers_gone(slot, epoch)) {
+                    count(counters.rechecks);
+                }
+            }
         }
         if (polling) {
             poll_stop(job);
