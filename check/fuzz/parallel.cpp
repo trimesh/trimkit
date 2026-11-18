@@ -517,11 +517,16 @@ void check_huge_min_range() {
 }
 
 // More than MAX_ITEMS fails at once with TooManyItems, running nothing: so
-// `next` can't wrap (claim_range)
+// `next` can't wrap (claim_range). Where size_t is 32 bits no count is more,
+// so every count runs: the largest stops at its first range's throw
 void check_too_many_items() {
     std::atomic<int> ran{0};
-    const auto failure = trimkit::parallel::for_each_range(trimkit::parallel::MAX_ITEMS + 1,
-                                                           [&](std::size_t, std::size_t) { ran.fetch_add(1); });
+    const bool narrow = sizeof(std::size_t) < sizeof(std::uint64_t);
+    const std::size_t count = narrow ? SIZE_MAX : static_cast<std::size_t>(trimkit::parallel::MAX_ITEMS + 1);
+    const auto failure = trimkit::parallel::for_each_range(count, [&](std::size_t, std::size_t) {
+        ran.fetch_add(1);
+        throw std::runtime_error("first range");
+    });
     bool too_many = false;
     try {
         std::rethrow_exception(failure);
@@ -529,7 +534,11 @@ void check_too_many_items() {
         too_many = true;
     } catch (...) {
     }
-    expect(too_many && ran.load() == 0, "a call of more than MAX_ITEMS ran, or failed some other way");
+    if (narrow) {
+        expect(!too_many && ran.load() > 0, "a 32-bit call of SIZE_MAX items was refused");
+    } else {
+        expect(too_many && ran.load() == 0, "a call of more than MAX_ITEMS ran, or failed some other way");
+    }
 }
 
 extern "C" int LLVMFuzzerInitialize(int* /*argc*/, char*** /*argv*/) {

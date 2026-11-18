@@ -135,8 +135,9 @@
 //   - A body may call for_each_range itself. At most SLOTS jobs share the
 //     workers at once; a call that finds every slot taken runs alone, and
 //     tries again after each of its ranges.
-//   - `count` is at most MAX_ITEMS, 2^53 (more fails with TooManyItems). The
-//     Stop's poll runs only on the calling thread, between its ranges.
+//   - `count` is at most MAX_ITEMS, 2^53, on 64 bits (more fails with
+//     TooManyItems); on 32 bits any count. The Stop's poll runs only on the
+//     calling thread, between its ranges.
 //   - Only Linux runs the fuzzers, ThreadSanitizer and lints. The Windows and
 //     macOS sleep and wake code builds there, and every wheel runs the tests.
 //
@@ -234,8 +235,13 @@ constexpr std::uint32_t MAX_THREAD_SLOTS = 1024;            // thread indexes th
 constexpr std::int64_t CAP_REFRESH_NS = 100'000'000;        // the CPUs this process may use, read at most this often
 // the most items one call takes: each thread in a job (at most MAX_THREAD_SLOTS)
 // may move `next` on by up to `count` after it last saw items left, so this
-// keeps `next` from wrapping (claim_range), at 2^53 items on 64 bits
-constexpr std::size_t MAX_ITEMS = SIZE_MAX / (2 * std::size_t{MAX_THREAD_SLOTS});
+// keeps `next`, 64 bits everywhere, from wrapping (claim_range): 2^53 items,
+// more than a 32-bit size_t holds
+constexpr std::uint64_t MAX_ITEMS = UINT64_MAX / (2 * std::uint64_t{MAX_THREAD_SLOTS});
+static_assert(SIZE_MAX <= MAX_ITEMS || sizeof(std::size_t) == sizeof(std::uint64_t));
+// a call, not `count > MAX_ITEMS`: where size_t is 32 bits that is always false,
+// which compilers warn of
+constexpr bool too_many_items(std::uint64_t count) { return count > MAX_ITEMS; }
 
 // -- The scheduling policy: every choice the pool makes, as pure functions ----
 
@@ -413,9 +419,9 @@ struct RangeJob {
     void (*run)(const void* body, std::size_t begin, std::size_t end) = nullptr;
     const void* body = nullptr;
     ItemCost item_cost = ItemCost::Measured;
-    std::size_t min_range = 1;         // no claim is smaller, but the last
-    Stop stop_by;                      // polled on the caller only
-    std::atomic<std::size_t> next{0};  // the first item not yet handed out
+    std::size_t min_range = 1;           // no claim is smaller, but the last
+    Stop stop_by;                        // polled on the caller only
+    std::atomic<std::uint64_t> next{0};  // the first item not yet handed out
     // what the caller measured an item to cost, in sixteenths of a ns (0: not
     // yet), and how many threads it means to share the job: a worker that
     // joins starts from both, then measures its own ranges
@@ -715,28 +721,33 @@ inline std::uint32_t worker_cap() {
 
 // The items not yet handed out (an estimate while others claim)
 inline std::size_t items_left(const RangeJob& job) {
-    return job.count - least(job.count, job.next.load(std::memory_order_relaxed));
+    return job.count -
+           static_cast<std::size_t>(least<std::uint64_t>(job.count, job.next.load(std::memory_order_relaxed)));
 }
 
 // The next range, sized by the policy for a thread that has run `ran` of the
 // job (C1), into [*begin, *end), as the model's step `action`: false once none
 // are left or the job has stopped. Never empty, whatever the policy says, so
 // every claim moves `next` on and the job ends (T2, T3). `next` passes `count`
-// only by the takes in flight, one a thread, so with `count` at most MAX_ITEMS
-// it never wraps
+// only by the takes in flight, one a thread and none more than `count`, so with
+// `count` at most MAX_ITEMS it never wraps
 inline bool claim_range(RangeJob& job, const policy::Ran& ran, const char* action, std::size_t* begin,
                         std::size_t* end) {
-    const std::size_t take = most<std::size_t>(
-        1, policy::claim_items(ran, items_left(job), job.sharing.load(std::memory_order_relaxed), job.min_range));
+    const std::size_t take = least(
+        job.count,
+        most<std::size_t>(
+            1, policy::claim_items(ran, items_left(job), job.sharing.load(std::memory_order_relaxed), job.min_range)));
     const TraceStep step(action);
     if (job.stopped.load(std::memory_order_relaxed) || exit_gate_closed() ||
         job.next.load(std::memory_order_relaxed) >= job.count) {
         return false;
     }
-    *begin = job.next.fetch_add(take, std::memory_order_relaxed);  // atomicity alone: each item claimed once (T2)
-    if (*begin >= job.count) {
+    const std::uint64_t first =
+        job.next.fetch_add(take, std::memory_order_relaxed);  // atomicity alone: each item claimed once (T2)
+    if (first >= job.count) {
         return false;
     }
+    *begin = static_cast<std::size_t>(first);
     *end = *begin + least(take, job.count - *begin);
     step.took(*begin + 1, *end + 1);  // the model numbers items from 1
     return true;
@@ -1340,7 +1351,7 @@ enum class CallerStep : std::uint8_t {
 // no thread is inside the job; `job.failure` is then the caller's to report
 inline void run_job(RangeJob& job) {
     // so `next` never wraps (claim_range): more items than this is no real job
-    if (job.count > MAX_ITEMS) {
+    if (too_many_items(job.count)) {
         fail_job(job, platform::failure<TooManyItems>());
         return;
     }

@@ -233,7 +233,9 @@ def test_fork_from_inside_a_query():
 
     script = textwrap.dedent(
         """
-        import os, signal, sys, time
+        import faulthandler, os, signal, sys, time
+        # a child that crashes says where, on the stderr it shares
+        faulthandler.enable()
         import numpy as np
         sys.path.insert(0, sys.argv[1])
         from helpers import sphere
@@ -263,7 +265,10 @@ def test_fork_from_inside_a_query():
             # the parent: its answer is the answer, and the child exited cleanly
             assert outcome == "same", outcome
             _, status = os.wait()
-            sys.exit(0 if status == 0 else 3)
+            if status != 0:
+                # how it ended: an exit code, or minus the signal that killed it
+                sys.exit(f"the child ended with {os.waitstatus_to_exitcode(status)}")
+            sys.exit(0)
         os.write(1, f"{outcome} {same(query())}".encode())
         os._exit(0)
         """
