@@ -117,6 +117,12 @@
 // how many threads help: these change from call to call, and only the speed
 // depends on them, unless the body lets its answer depend on them.
 //
+// That a child forked during a call can go on: POSIX lets a child of a
+// threaded process only exec or exit, as the others may have been inside
+// malloc. Linux lets it run on, and only there are its call's failure and its
+// later calls tested; macOS's malloc may abort it as that call unwinds. T5
+// holds either way: it never gets a wrong answer.
+//
 // SHARP EDGES: rules for the body
 //
 //   - Items must not wait on each other or on anything the caller holds: the

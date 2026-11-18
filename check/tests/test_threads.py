@@ -101,7 +101,15 @@ def test_scheduler_stress():
         assert all(pool.map(mixed, range(16)))
 
 
-@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork")
+# A child forked while a call runs may only exec or exit, as POSIX says of a
+# child of a threaded process (src/parallel.hpp, what it does not promise):
+# Linux lets it run on, so only there is what it does next tested
+runs_on_after_fork = pytest.mark.skipif(
+    sys.platform != "linux", reason="a child forked during a call may only exec or exit (POSIX)"
+)
+
+
+@runs_on_after_fork
 def test_fork_while_threads_swap_placements():
     # threads keep swapping one scene's remembered placement while the main
     # thread forks again and again: every child queries that same scene and
@@ -221,7 +229,7 @@ def test_exit_while_a_daemon_thread_queries():
         assert exited - float(done.stdout.split()[-1]) < 3.0, "the exit waited on the daemon's query"
 
 
-@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork")
+@runs_on_after_fork
 def test_fork_from_inside_a_query():
     # a signal handler runs while a query polls for Ctrl-C, inside the pool
     # with its workers mid-range, and forks: in the child those workers are
@@ -244,9 +252,11 @@ def test_fork_from_inside_a_query():
         expected = query()
         # how long a warm query takes: the first starts the workers and faults
         # its pages in, so a fraction of it can land after a warm one returned
-        tic = time.perf_counter()
-        query()
-        took = time.perf_counter() - tic
+        took = float("inf")
+        for _ in range(3):
+            tic = time.perf_counter()
+            query()
+            took = min(took, time.perf_counter() - tic)
         forked, child = [], []
 
         def fork(signum, frame):
@@ -256,8 +266,8 @@ def test_fork_from_inside_a_query():
                     child.append(True)
 
         signal.signal(signal.SIGALRM, fork)
-        # the first fork at this fraction of the query, past its first poll; the
-        # timer repeats, so one lands inside the query whatever this run's speed
+        # the first fork at this fraction of the fastest query, with its workers
+        # inside; the timer repeats, so one lands inside a faster one too
         signal.setitimer(signal.ITIMER_REAL, float(sys.argv[2]) * took, took / 20)
         try:
             outcome = "same" if same(query()) else "different"
