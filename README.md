@@ -1,6 +1,6 @@
 # trimkit
  
-`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package for the stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature, stable implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, marching cubes, and ray checks. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project, and it saves 100MiB+ for every `trimesh[easy,recommend]` install. Install with:
+`trimkit` is an experimental packaging effort to make a single MIT-compatible `abi3` package bundling a subset of stable, lightweight C/C++ [trimesh](https://github.com/mikedh/trimesh) dependencies. This is *not* a mesh library: it is a single "kit" for functional questions a mesh library might ask. It provides bindings to mature, stable implementations of iterative algorithms that are not vectorizable and untenably slow in Python, like quadric edge collapse, collisions, marching cubes, and ray checks. Hopefully it is easier to maintain and lock down than the previous one-Python-package-per-project, and it saves 100MiB+ for every `trimesh[easy,recommend]` install. Install with:
 
 ```
 pip install trimkit
