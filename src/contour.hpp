@@ -313,15 +313,19 @@ static const char* read_voxels(const VoxelInput& input, const Parallel& parallel
         parallel(blocks, [&](std::size_t first_block, std::size_t last_block) {
             for (std::size_t block = first_block; block < last_block; block++) {
                 for (std::size_t i = block * ROW_BLOCK; i < std::min(count, (block + 1) * ROW_BLOCK); i++) {
+                    // read once, with the GIL released: what is checked is what is kept
                     const std::int64_t* row = input.rows + (width * i);
+                    const std::int64_t x = row[0];
+                    const std::int64_t y = row[1];
+                    const std::int64_t z = row[2];
                     const std::int64_t length = width == 4 ? row[3] : 1;
                     const double weight = input.row_weights != nullptr ? input.row_weights[i] : 1.0;
                     const char* problem = nullptr;
                     if (length < 1) {
                         problem = "runs must have a length of at least 1";
-                    } else if (row[0] <= -INDEX_LIMIT || row[0] >= INDEX_LIMIT || row[1] <= -INDEX_LIMIT ||
-                               row[1] >= INDEX_LIMIT || row[2] <= -INDEX_LIMIT || row[2] >= INDEX_LIMIT ||
-                               length > INDEX_LIMIT || row[2] > INDEX_LIMIT - length) {
+                    } else if (x <= -INDEX_LIMIT || x >= INDEX_LIMIT || y <= -INDEX_LIMIT || y >= INDEX_LIMIT ||
+                               z <= -INDEX_LIMIT || z >= INDEX_LIMIT || length > INDEX_LIMIT ||
+                               z > INDEX_LIMIT - length) {
                         problem = "voxels must be within 2^52 of zero";
                     } else if (!(std::abs(weight) <= WEIGHT_LIMIT)) {
                         problem = "weights must be finite and within 1e30 of zero";
@@ -330,8 +334,7 @@ static const char* read_voxels(const VoxelInput& input, const Parallel& parallel
                         block_problems[block] = problem;
                         break;
                     }
-                    (*runs)[i] =
-                        VoxelRun(row[0], row[1], row[2], row[2] + length, weight, static_cast<std::int64_t>(i));
+                    (*runs)[i] = VoxelRun(x, y, z, z + length, weight, static_cast<std::int64_t>(i));
                 }
             }
         });

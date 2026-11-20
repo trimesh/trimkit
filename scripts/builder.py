@@ -610,11 +610,22 @@ HARDENING = {
     # msvc target this names what both become; ThinLTO carries it in the bitcode
     "windows": Flags((*SECTIONS, "-Xclang", "-cfguard"), ("-Wl,/guard:cf", "-Wl,/OPT:REF")),
 }
-# x86's control-flow enforcement: branch targets, and Windows' shadow stacks
+# x86's control-flow enforcement: branch targets, and Windows' shadow stacks.
+# Not -fzero-call-used-regs=used-gpr: measured 1.5-4% slower on the
+# call-heavy paths (SVG parsing, collides, simplify), 0.5% on long ones
 HARDENING_X86 = {
     "linux": Flags(("-fcf-protection",)),
     "macos": Flags(("-fcf-protection",)),
     "windows": Flags(link=("-Wl,/CETCOMPAT",)),
+}
+# arm64's: return addresses signed (PAC) and branch targets marked (BTI), as
+# hint instructions older cores skip. Signing works without the ELF note
+# BTI needs, which the release images' unmarked crt objects drop (and
+# check_wheel.py knows): Apple's arm64e ABI isn't open to us, so Linux only
+HARDENING_ARM64 = {
+    "linux": Flags(("-mbranch-protection=standard",)),
+    "macos": NONE,
+    "windows": NONE,
 }
 
 # what ships carries no symbol table, unless a build wants its reports readable
@@ -739,11 +750,16 @@ def instrumentation(config: Config) -> Flags:
                 f"-fsanitize={config.sanitizers}", "-fno-sanitize-recover=all", "-fno-sanitize-trap=all",
                 "-fno-omit-frame-pointer",
                 # bounds-checked standard containers in every library: too slow
-                # for release (V-HACD is 3-5% slower) but what analysis wants
+                # for release (V-HACD 3-5% slower, coal's convex distances 8%,
+                # draco 2-5%) but what analysis wants
                 "-D_GLIBCXX_ASSERTIONS", "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
             ),
             (f"-fsanitize={config.sanitizers}",),
         )  # fmt: skip
+    if "address" in config.sanitizers:
+        # and past a vector's size inside its capacity, which ASan alone can't
+        # see: libstdc++ marks the slack poisoned (every object is built with it)
+        flags += Flags(("-D_GLIBCXX_SANITIZE_VECTOR",))
     if "undefined" in config.sanitizers:
         flags += Flags((f"-fsanitize-ignorelist={config.build_dir / IGNORELIST}",))
     if "cfi" in config.sanitizers:
@@ -820,6 +836,7 @@ def plan(manifest: Manifest, target: Target) -> str:
         + LINK_TIME[platform.os]
         + HARDENING[platform.os]
         + (HARDENING_X86[platform.os] if x86 else NONE)
+        + (HARDENING_ARM64[platform.os] if platform.machine == "aarch64" else NONE)
         + instrumentation(config)
     )
     # sanitized builds are for reports, which want lines and symbols

@@ -1,0 +1,81 @@
+kind: fix
+
+upstream: not for V-HACD, whose debug writers are its own to keep.
+
+The header carries OBJ writers for debugging (VertexIndex::SaveAsObj,
+VoxelHull's SaveVoxelMesh, SaveOBJ and WriteOBJ) that nothing calls. The
+linker drops them, so no wheel imports fopen, but the source still names
+it, and the extension is held to writing no files at all: compile them out,
+so what `uv run scripts threads` scans opens nothing, and that scan needs
+no exception for vendored code.
+Covered by: `uv run scripts threads` (it fails on any fopen the build
+compiles), tests/test_vhacd.py, fuzz/vhacd.cpp.
+
+--- a/include/VHACD.h
++++ b/include/VHACD.h
+@@ -3837,6 +3837,11 @@
+ 
+     uint32_t GetVCount() const;
+ 
++    //// TRIMKIT PATCH: fix.no-file-writers
++    // trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
++    // nothing calls, compiled out: the extension writes no files
++#if 0
++    //// TRIMKIT END PATCH
+     bool SaveAsObj(const char* fname,
+                    uint32_t tcount,
+                    uint32_t* indices)
+@@ -3872,6 +3877,9 @@
+ 
+         return ret;
+     }
++    //// TRIMKIT PATCH: fix.no-file-writers
++#endif
++    //// TRIMKIT END PATCH
+ 
+ private:
+     bool m_snapToGrid : 1;
+@@ -5927,6 +5935,11 @@
+     // It splits the voxels by a plane
+     void PerformPlaneSplit();
+ 
++    //// TRIMKIT PATCH: fix.no-file-writers
++    // trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
++    // nothing calls, compiled out: the extension writes no files
++#if 0
++    //// TRIMKIT END PATCH
+     // Used only for debugging. Saves the voxelized mesh to disk
+     // Optionally saves the original source mesh as well for comparison
+     void SaveVoxelMesh(const SimpleMesh& inputMesh,
+@@ -5943,6 +5956,9 @@
+                   const std::vector<VHACD::Vertex>& vertices,
+                   const std::vector<VHACD::Triangle>& indices,
+                   uint32_t baseIndex);
++    //// TRIMKIT PATCH: fix.no-file-writers
++#endif
++    //// TRIMKIT END PATCH
+ public:
+ 
+     SplitAxis               m_axis{ SplitAxis::X_AXIS_NEGATIVE };
+@@ -6634,6 +6650,11 @@
+     }
+ }
+ 
++//// TRIMKIT PATCH: fix.no-file-writers
++// trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
++// nothing calls, compiled out: the extension writes no files
++#if 0
++//// TRIMKIT END PATCH
+ void VoxelHull::SaveVoxelMesh(const SimpleMesh &inputMesh,
+                               bool saveVoxelMesh,
+                               bool saveSourceMesh)
+@@ -6734,6 +6755,9 @@
+                 t.mI2 + baseIndex);
+     }
+ }
++//// TRIMKIT PATCH: fix.no-file-writers
++#endif
++//// TRIMKIT END PATCH
+ 
+ class VHACDImpl;
+ 

@@ -360,7 +360,10 @@ inline bool ok(VkResult result, const char* what, std::string* reason) {
 }
 
 // the loader's one exported entry point, from whichever library name this
-// platform gives it, or null
+// platform gives it, or null. The only library the extension itself opens,
+// and only for a scene built with `use_gpu`, each name a literal at its call
+// (`cmd_threads` holds Linux's dlopen to them): the loader then opens its own
+// drivers and layers, which the environment can name
 inline PFN_vkGetInstanceProcAddr open_loader() {
 #if defined(_WIN32)
     void* const library = LoadLibraryA("vulkan-1.dll");
@@ -370,17 +373,20 @@ inline PFN_vkGetInstanceProcAddr open_loader() {
     return reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(library, "vkGetInstanceProcAddr"));
 #else
 #if defined(__APPLE__)
-    const char* names[] = {"libvulkan.1.dylib", "libvulkan.dylib"};
-#else
-    const char* names[] = {"libvulkan.so.1", "libvulkan.so"};
-#endif
-    for (const char* name : names) {
-        void* library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
-        if (library != nullptr) {
-            return reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
-        }
+    void* library = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+        library = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
     }
-    return nullptr;
+#else
+    void* library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+        library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    }
+#endif
+    if (library == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
 #endif
 }
 
@@ -635,7 +641,7 @@ inline const char* lacking(const VkPhysicalDeviceProperties& properties, const V
 // nothing (a discrete GPU before an integrated one before a software device),
 // its queue, the shaders as pipelines, and the chunks' buffers. Returns the
 // reason it couldn't
-inline bool open(Device* device, std::string* reason) {
+inline bool open_device(Device* device, std::string* reason) {
     if (!little_endian()) {
         *reason = "the device path reads 64-bit words as little-endian pairs, which this machine doesn't write";
         return false;
@@ -847,7 +853,7 @@ struct Opened {
 inline Device* shared_device(std::string* reason) {
     static Opened opened = [] {
         Opened result;
-        result.usable = open(&result.device, &result.reason);
+        result.usable = open_device(&result.device, &result.reason);
         return result;
     }();
     if (!opened.usable) {

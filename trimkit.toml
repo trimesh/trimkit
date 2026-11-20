@@ -80,7 +80,7 @@ include = ["vendor/earcut/include/mapbox"]
 repo = "kmammou/v-hacd"
 ref = "master"
 commit = "f900e42361491f525262d4825e758845e4969897"
-tree_sha256 = "00e62bf5f7aa48807645956641299451c941d4ed2cd5784ff5c2a869dbe7081e"
+tree_sha256 = "2c55b14bc71e498948834d6db4c2196dee6345959b962da0d2396a394228bca1"
 spdx = "BSD-3-Clause"
 keep = ["LICENSE"]
 include = ["vendor/vhacd/include"]
@@ -91,7 +91,8 @@ VHACD_DISABLE_THREADING = "its fan-outs run on the extension's one pool through 
 [upstream.vhacd.patches]
 "vhacd-atomic-hull-counter.patch" = "71903c62b41004468d59ca933ec04d61994a261b0a947371438e500077a8debb"
 "vhacd-empty-volume.patch" = "a08755c85bf4cf930d9a18744667ff8a71a16980b1a21fb97479eb898400c18b"
-"vhacd-parallel-for.patch" = "d0caa0ecad64b94195023f2436df9d9e6c2f2c6772b6ff52b4464d973d752188"
+"vhacd-no-file-writers.patch" = "da953a7816ceabfb2e359f5fc1acd4a98b895c263b6a8acb8ff959080410bc7e"
+"vhacd-parallel-for.patch" = "ce18e16eb57fda392237d4496f74c83e2a1356a02d19ede397a1761db95f61c8"
 
 [upstream.xatlas]
 repo = "jpcy/xatlas"
@@ -237,6 +238,7 @@ distro = { debian = "libeigen3-dev", fedora = "eigen3-devel" }
 
 [upstream.eigen.defines]
 EIGEN_MPL2_ONLY = "refuse to compile any part of Eigen under a license other than MPL-2.0"
+EIGEN_NO_CPU_CACHE_SYSFS = "no file read for cache sizes, which only size the blocking of large dynamic products we don't make: the extension opens nothing but its cgroup limits"
 
 # nanobind, compiled from these sources into the one extension
 # (src/nb_combined.cpp, its documented build without CMake), with its

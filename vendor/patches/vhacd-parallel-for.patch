@@ -57,7 +57,7 @@ fuzz/vhacd.cpp.
      };
  
      /**
-@@ -6746,7 +6753,8 @@
+@@ -6770,7 +6777,8 @@
      IVHACD::ConvexHull* m_hullA{ nullptr };
      IVHACD::ConvexHull* m_hullB{ nullptr };
      double              m_concavity{ 0 }; // concavity of the two combined
@@ -67,7 +67,7 @@ fuzz/vhacd.cpp.
  };
  
  class HullPair
-@@ -7131,12 +7139,8 @@
+@@ -7155,12 +7163,8 @@
      m_canceled = false;
  
      Clean(); // release any previous results
@@ -82,7 +82,7 @@ fuzz/vhacd.cpp.
      CopyInputMesh(points,
                    triangles);
      if ( !m_canceled )
-@@ -7332,14 +7336,32 @@
+@@ -7356,14 +7360,32 @@
      }
  }
  
@@ -123,7 +123,7 @@ fuzz/vhacd.cpp.
  }
  
  void VHACDImpl::PerformConvexDecomposition()
-@@ -7366,42 +7388,22 @@
+@@ -7390,42 +7412,22 @@
              }
              // First we make a copy of the hulls we are processing
              std::vector<std::unique_ptr<VoxelHull>> oldList = std::move(m_pendingHulls);
@@ -182,7 +182,7 @@ fuzz/vhacd.cpp.
              // Now, we rebuild the pending convex hulls list by
              // adding the two children to the output list if
              // we need to recurse them further
-@@ -7507,43 +7509,21 @@
+@@ -7531,43 +7533,21 @@
                      else
                      {
                          tasks.push_back(std::move(ct));
@@ -241,7 +241,7 @@ fuzz/vhacd.cpp.
                  }
                  ProgressUpdate(Stages::COMPUTING_COST_MATRIX,
                                 100,
-@@ -7631,32 +7611,12 @@
+@@ -7655,32 +7635,12 @@
                              }
                          }
                          m_hulls[combinedHull->m_meshId] = combinedHull;

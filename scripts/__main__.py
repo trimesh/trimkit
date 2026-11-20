@@ -871,7 +871,7 @@ THREAD_CALLS = re.compile(
     r"|condition_variable(?:_any)?|counting_semaphore|binary_semaphore|latch|barrier)\b"
     r"|std::this_thread::(?:sleep_for|sleep_until|yield)"
     r"|pthread_(?:create|mutex_lock|mutex_trylock|cond_wait|cond_timedwait|sigmask|kill|cancel)"
-    r"|_beginthreadex|CreateThread|WaitOnAddress|WakeByAddress\w*|SYS_futex|__ulock_wait|__ulock_wake"
+    r"|_beginthreadex|CreateThread|WaitOnAddress|WakeByAddress\w*|__ulock_wait|__ulock_wake"
     r"|sched_yield|nanosleep|usleep|Sleep|SleepEx|sigaction|sigprocmask|SetConsoleCtrlHandler"
     r"|PyErr_CheckSignals|PyErr_SetInterrupt\w*|notify_one|notify_all)\b"
     r"|\bsignal\s*\(|\braise\s*\(\s*SIG"
@@ -886,16 +886,44 @@ THREAD_CALLS_ALLOWED = {
 # isn't scanned: its thread pool is compiled only with EIGEN_USE_THREADS,
 # which no build may define
 THREAD_CALLS_UNSCANNED = ("vendor/eigen/",)
+# What reaches past the process, by the same scan, Eigen included: a library
+# opened or looked into, a process started, a file or socket opened, the kernel
+# called. The loaders and fork count at any mention (an address taken is a
+# call), the rest when called, each with the literal ending its first or
+# second argument. Linux's names only, as only Linux's branches are seen. Not
+# `system`, which a member initializer can't be told from, nor SYS_futex, a
+# number once preprocessed: check_wheel.py refuses the one imported, and
+# `syscall` is what is seen of the other
+REACHING_CALLS = re.compile(
+    r"(?<![\w.>])(?:(dlopen|dlmopen|dlsym|dlvsym|v?fork)\b"
+    r"|(syscall|open|openat|fopen|freopen|creat|socket|connect|popen|exec[lv]p?e?|fexecve|posix_spawnp?)"
+    r"(?=\s*\((?!\s*\))))"
+    r"(?:\s*\(\s*(?:\w+\s*,\s*)?(\"[^\"]*\")(?=\s*[,)]))?"
+)
+# each file's calls and the literal each names, "*" for any arguments. The
+# loader is pinned to its names; open and syscall only to their file, not to
+# what is opened or which call is made. Windows' loader is check_wheel.py's
+REACHING_ALLOWED = {
+    "src/vulkan/vulkan.hpp": {
+        ("dlopen", '"libvulkan.so.1"'),
+        ("dlopen", '"libvulkan.so"'),
+        ("dlsym", '"vkGetInstanceProcAddr"'),
+    },
+    "src/cgroup.hpp": {("open", "*")},  # limits from /proc and /sys, read-only
+    "src/platform.hpp": {("syscall", "*")},  # futex
+}
 
 
 def cmd_threads(args) -> None:
     """
     Nothing the extension compiles starts, blocks on or sleeps a thread, or
-    handles a signal, outside the pool: every translation unit the dev build
-    compiles is preprocessed with its own command, so what is seen is what is
-    built, every vendored library's #if decided and every patch applied, and
-    each call is traced by its line markers to the file it is written in.
-    The dev build's platform only: another's branches go unread here.
+    handles a signal, outside the pool, nor reaches past the process but as
+    REACHING_ALLOWED says: every translation unit the dev build compiles is
+    preprocessed with its own command, so what is seen is what is built,
+    every vendored library's #if decided and every patch applied, and each
+    call is traced by its line markers to the file it is written in. The dev
+    build's platform only: another's branches go unread here, and what the
+    binaries import is check_wheel.py's.
     """
     compile_commands(args.root)
     build = dev(args.root)
@@ -922,18 +950,28 @@ def cmd_threads(args) -> None:
             if marker:
                 path = (Path(entry["directory"]) / marker[1]).resolve()
                 where = path.relative_to(build.source).as_posix() if path.is_relative_to(build.source) else ""
-            elif where and where not in THREAD_CALLS_ALLOWED and not where.startswith(THREAD_CALLS_UNSCANNED):
-                found |= {(where, call[0]) for call in THREAD_CALLS.finditer(line)}
+            elif where:
+                if where not in THREAD_CALLS_ALLOWED and not where.startswith(THREAD_CALLS_UNSCANNED):
+                    found |= {(where, call[0]) for call in THREAD_CALLS.finditer(line)}
+                allowed = REACHING_ALLOWED.get(where, set())
+                for call in REACHING_CALLS.finditer(line):
+                    name, literal = call[1] or call[2], call[3] or ""
+                    if (name, literal) not in allowed and (name, "*") not in allowed:
+                        found.add((where, f"{name}({literal or '...'})"))
         return found
 
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 1) as pool:
         found = sorted(set().union(*pool.map(scan, entries)))
     if found:
         sys.exit(
-            "threads, waits and signals are src/parallel.hpp's alone, in what the build compiles:\n  "
+            "threads, waits and signals are src/parallel.hpp's alone, and libraries, processes, files,"
+            " sockets and system calls are only as REACHING_ALLOWED says, in what the build compiles:\n  "
             + "\n  ".join(f"{where}: {call}" for where, call in found)
         )
-    print(f"ok: {len(entries)} translation units start, wait on and signal no thread outside the pool")
+    print(
+        f"ok: {len(entries)} translation units start, wait on and signal no thread outside the pool, "
+        "and, in the Linux build's source, open no library but the Vulkan loader"
+    )
 
 
 # the pool against the best of what people write by hand, in every cell of

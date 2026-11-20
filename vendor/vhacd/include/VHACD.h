@@ -3844,6 +3844,11 @@ public:
 
     uint32_t GetVCount() const;
 
+    //// TRIMKIT PATCH: fix.no-file-writers
+    // trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
+    // nothing calls, compiled out: the extension writes no files
+#if 0
+    //// TRIMKIT END PATCH
     bool SaveAsObj(const char* fname,
                    uint32_t tcount,
                    uint32_t* indices)
@@ -3879,6 +3884,9 @@ public:
 
         return ret;
     }
+    //// TRIMKIT PATCH: fix.no-file-writers
+#endif
+    //// TRIMKIT END PATCH
 
 private:
     bool m_snapToGrid : 1;
@@ -5934,6 +5942,11 @@ public:
     // It splits the voxels by a plane
     void PerformPlaneSplit();
 
+    //// TRIMKIT PATCH: fix.no-file-writers
+    // trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
+    // nothing calls, compiled out: the extension writes no files
+#if 0
+    //// TRIMKIT END PATCH
     // Used only for debugging. Saves the voxelized mesh to disk
     // Optionally saves the original source mesh as well for comparison
     void SaveVoxelMesh(const SimpleMesh& inputMesh,
@@ -5950,6 +5963,9 @@ private:
                   const std::vector<VHACD::Vertex>& vertices,
                   const std::vector<VHACD::Triangle>& indices,
                   uint32_t baseIndex);
+    //// TRIMKIT PATCH: fix.no-file-writers
+#endif
+    //// TRIMKIT END PATCH
 public:
 
     SplitAxis               m_axis{ SplitAxis::X_AXIS_NEGATIVE };
@@ -6641,6 +6657,11 @@ void VoxelHull::PerformPlaneSplit()
     }
 }
 
+//// TRIMKIT PATCH: fix.no-file-writers
+// trimkit (vendor/patches/vhacd-no-file-writers.patch): debug writers
+// nothing calls, compiled out: the extension writes no files
+#if 0
+//// TRIMKIT END PATCH
 void VoxelHull::SaveVoxelMesh(const SimpleMesh &inputMesh,
                               bool saveVoxelMesh,
                               bool saveSourceMesh)
@@ -6741,6 +6762,9 @@ void VoxelHull::WriteOBJ(FILE* fph,
                 t.mI2 + baseIndex);
     }
 }
+//// TRIMKIT PATCH: fix.no-file-writers
+#endif
+//// TRIMKIT END PATCH
 
 class VHACDImpl;
 
