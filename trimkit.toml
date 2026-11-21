@@ -81,6 +81,15 @@ apple_clang = [16, 17]
 # the release's manylinux_2_28 and musllinux_1_2, with their packages' clang
 "linux x86_64 glibc 2.28" = "clang version 22.1.8 ( 22.1.8-2.module_el8.10.0+4359+f07421b9) | libstdc++ 15 20260123"
 "linux x86_64 musl" = "Alpine clang version 20.1.8 | libstdc++ 14 20240801 | dirs 14.2.0"
+"linux aarch64 musl" = "Alpine clang version 20.1.8 | libstdc++ 14 20240801 | dirs 14.2.0"
+"linux aarch64 glibc 2.28" = "clang version 22.1.8 ( 22.1.8-2.module_el8.10.0+4359+f07421b9) | libstdc++ 15 20260123"
+# the GitHub runner images, with Xcode's clang
+"macos aarch64" = "Apple clang version 17.0.0 (clang-1700.0.13.5) | libc++ 190102 | macos sdk __MAC_15_5"
+"macos x86_64" = "Apple clang version 17.0.0 (clang-1700.0.13.5) | libc++ 190102 | macos sdk __MAC_15_5"
+# the fetched LLVM below, with the runner image's Visual Studio and Windows SDK
+"windows i686" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
+"windows x86_64" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
+"windows aarch64" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
 
 [toolchain.fetch.windows-x86_64]
 url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
@@ -230,7 +239,7 @@ include = ["vendor/meshoptimizer/src"]
 repo = "coal-library/coal"
 ref = "devel"
 commit = "83cdaa6addd580c11dadd2299476e6f08aece2f4"
-tree_sha256 = "177a68706ab247cc3c0e0d30e39683071183a118841f84fdb966dcb55b1a24ff"
+tree_sha256 = "1bbe0fb5cb74cce07a4d574d4b677887e3583aec44989edd4f965fff709c48cf"
 spdx = "BSD-3-Clause"
 # src/distance/triangle_triangle.cpp defines a ShapeShapeDistancer specialization no header is named after
 keep = ["LICENSE", "src/distance/triangle_triangle.cpp"]
@@ -241,7 +250,9 @@ include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/t
 
 [upstream.coal.patches]
 "coal-bvh-bvh-performance.patch" = "0f53292b95269a8f7e128a393c1ed8deae2003d62d6eae7424f38d795f9aa025"
+"coal-gjk-collision-distance.patch" = "2f9efdee235863b0ac848f82ab630973e0f35557b67d31ce41bd3b47f5e07c12"
 "coal-hierarchy-tree-array-leak.patch" = "4ec9a982489343d9661e765091b9f973ba462d6eac7b034fede4cd295bd98780"
+"coal-support-warm-start.patch" = "80c477b76edc91d5162d75971f33aa97dac356f0532d1e36df44caa5378ad820"
 
 # coal's linear algebra, header only: only the headers coal and our binding
 # reach on some wheel target. MPL-2.0, which binds only its own files, kept

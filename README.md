@@ -268,6 +268,18 @@ The same script times the same assembly as a `CollisionScene`. One call checks e
 
 `distances` is slower because it measures every pair you ask about. Pass `upper_bound` and it stops early on pairs farther apart than that, which is usually all a motion planner needs.
 
+### Against MuJoCo
+
+Three robots from `robot_descriptions`, each link as its convex hull, checking the pairs a motion planner would. Times are microseconds per configuration, trimkit / MuJoCo 4.0.1. MuJoCo is called from C, and on all cores it gets its best thread count:
+
+| robot | pairs | `collides`, 1 core | `distances`, 1 core | `collides`, all cores | `distances`, all cores |
+|---|---|---|---|---|---|
+| panda | 42 | 2.9 / 2.4 | 27.1 / 35.4 | 0.8 / 1.8 | 3.5 / 14.2 |
+| talos | 1,242 | 30.5 / 47.5 | 633 / 662 | 7.3 / 20.7 | 113 / 86.6 |
+| g1 | 438 | 23.2 / 49.9 | 344 / 400 | 7.0 / 18.6 | 45.3 / 62.9 |
+
+Measured 2026-11-20 on the same i9-14900K. Both find the same touching pairs. MuJoCo treats every mesh as its convex hull, while trimkit also handles triangle meshes that aren't convex. `check/bench/collision/mujoco.coal.notes.md` has the details, including the changes to coal behind these numbers.
+
 ### Example: a robot arm planner
 
 `examples/ur10.py`: a UR10e robot arm with a box gripper reaches into a cubby for a block. The planner is one function. It places the arm at every waypoint of a path, makes one `CollisionScene.distances` call for all of them, and hands the result to `scipy.optimize.minimize`. The gradient comes from the normals and closest points that `distances` returns.

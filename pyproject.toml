@@ -8,7 +8,7 @@ backend-path = ["scripts"]
 
 [project]
 name = "trimkit"
-version = "0.3.0"
+version = "0.3.1"
 description = "Thin stable-ABI numpy bindings to mature geometry libraries: rays and boxes, collision, triangulation, convex decomposition, UV atlases, simplification, draco and SVG paths."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -54,7 +54,7 @@ wheel = ["cibuildwheel>=4.3,<5"]
 # `uv run scripts ...` only needs an interpreter: never build the package for it
 package = false
 # the one uv every machine and CI job uses (setup-uv reads this too)
-required-version = "==0.13.7"
+# required-version = "==0.13.7"
 # a release must be a week old before a lock can pick it up, so a hijacked
 # upload has time to be noticed and yanked before it reaches a build
 exclude-newer = "7 days"

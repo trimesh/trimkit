@@ -135,7 +135,9 @@ MinkowskiDiff::GetSupportFunction makeGetSupportFunction1(
       const ConvexBase16* convex1 = static_cast<const ConvexBase16*>(s1);
       if (static_cast<size_t>(convex1->num_points) >
           ConvexBase16::num_vertices_large_convex_threshold) {
-        data[1].visited.assign(convex1->num_points, false);
+        //// TRIMKIT PATCH: perf.support-warm-start
+        // `visited` is sized by the one function that reads it, when it does
+        //// TRIMKIT END PATCH
         data[1].last_dir.setZero();
         if (identity)
           return getSupportFuncTpl<Shape0, LargeConvex16, true,
@@ -156,7 +158,9 @@ MinkowskiDiff::GetSupportFunction makeGetSupportFunction1(
       const ConvexBase32* convex1 = static_cast<const ConvexBase32*>(s1);
       if (static_cast<size_t>(convex1->num_points) >
           ConvexBase32::num_vertices_large_convex_threshold) {
-        data[1].visited.assign(convex1->num_points, false);
+        //// TRIMKIT PATCH: perf.support-warm-start
+        // `visited` is sized by the one function that reads it, when it does
+        //// TRIMKIT END PATCH
         data[1].last_dir.setZero();
         if (identity)
           return getSupportFuncTpl<Shape0, LargeConvex32, true,
@@ -233,7 +237,9 @@ MinkowskiDiff::GetSupportFunction makeGetSupportFunction0(
       const ConvexBase16* convex0 = static_cast<const ConvexBase16*>(s0);
       if (static_cast<size_t>(convex0->num_points) >
           ConvexBase16::num_vertices_large_convex_threshold) {
-        data[0].visited.assign(convex0->num_points, false);
+        //// TRIMKIT PATCH: perf.support-warm-start
+        // `visited` is sized by the one function that reads it, when it does
+        //// TRIMKIT END PATCH
         data[0].last_dir.setZero();
         return makeGetSupportFunction1<LargeConvex16, _SupportOptions>(
             s1, identity, swept_sphere_radius, data);
@@ -246,7 +252,9 @@ MinkowskiDiff::GetSupportFunction makeGetSupportFunction0(
       const ConvexBase32* convex0 = static_cast<const ConvexBase32*>(s0);
       if (static_cast<size_t>(convex0->num_points) >
           ConvexBase32::num_vertices_large_convex_threshold) {
-        data[0].visited.assign(convex0->num_points, false);
+        //// TRIMKIT PATCH: perf.support-warm-start
+        // `visited` is sized by the one function that reads it, when it does
+        //// TRIMKIT END PATCH
         data[0].last_dir.setZero();
         return makeGetSupportFunction1<LargeConvex32, _SupportOptions>(
             s1, identity, swept_sphere_radius, data);

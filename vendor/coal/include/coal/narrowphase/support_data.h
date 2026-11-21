@@ -63,6 +63,13 @@ struct ShapeSupportData {
   // @brief Tracks which points have been visited in a ConvexBase.
   std::vector<int8_t> visited;
 
+  //// TRIMKIT PATCH: perf.support-warm-start
+  // @brief The call each vertex was last visited in, by the support
+  // function's hill climb: visited in this call when it is `visit_stamp`.
+  std::vector<uint64_t> visit_stamps;
+  uint64_t visit_stamp = 0;
+
+  //// TRIMKIT END PATCH
   // @brief Tracks the last support direction used on this shape; used to
   // warm-start the ConvexBase support function.
   Vec3s last_dir = Vec3s::Zero();

@@ -146,6 +146,7 @@ private:
         if (convex) {
             convex_ = std::make_unique<Convex>(model_->vertices, static_cast<unsigned int>(vertex_count),
                                                model_->tri_indices, static_cast<unsigned int>(face_count_));
+            convex_->computeLocalAABB();  // the center its GJK starts from
         }
     }
 
@@ -223,13 +224,12 @@ bool may_be_within(const Placed& a, const Placed& b, double bound) {
     return coal::distance(rotation, translation, a.mesh->root(), b.mesh->root()) <= bound;
 }
 
-// coal warm-starts every GJK from the solver's last run, its support search
-// always (`set` keeps that), so each pair starts it afresh: no answer may
-// depend on the pair before it, nor on how pairs fell across threads
+// coal warm-starts every support search from the solver's last run (`set`
+// keeps that), so each pair starts it afresh: no answer may depend on the
+// pair before it, nor on how pairs fell across threads
 template <typename Request>
 void start_solver(coal::GJKSolver& solver, const Request& request) {
     solver.set(request);
-    solver.cached_guess = coal::Vec3s(1, 0, 0);
     solver.support_func_cached_guess = coal::support_func_guess_t::Zero();
 }
 
@@ -243,6 +243,11 @@ bool collide_pair(const Placed& a, const Placed& b, const coal::CollisionRequest
     const Convex* solid_b = b.mesh->convex();
     if (solid_a != nullptr && solid_b != nullptr) {
         start_solver(solver, request);
+        // GJK starts between the two boxes' centers, as MuJoCo's between its
+        // geoms', not along coal's (1, 0, 0): the pair's own data, so as
+        // deterministic, and one support step tells most separated pairs
+        // apart. Only here, where both shapes have a box (a triangle has none)
+        solver.gjk_initial_guess = coal::GJKInitialGuess::BoundingVolumeGuess;
         return coal::ShapeShapeCollide<coal::ConvexBase32, coal::ConvexBase32>(
                    solid_a, a.transform, solid_b, b.transform, &solver, request, result) > 0;
     }
@@ -325,6 +330,7 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
     double measured = 0.0;
     if (solid_a != nullptr && solid_b != nullptr) {
         start_solver(solver, request);
+        solver.gjk_initial_guess = coal::GJKInitialGuess::BoundingVolumeGuess;  // as collide_pair
         solver.distance_upper_bound = past;
         measured = coal::ShapeShapeDistance<coal::ConvexBase32, coal::ConvexBase32>(
             solid_a, a.transform, solid_b, b.transform, &solver, request, result);
@@ -562,6 +568,10 @@ public:
         }
         coal::CollisionRequest request(coal::NO_REQUEST, 1);
         request.security_margin = margin;
+        // GJK stops at the first plane that separates a pair by more than the
+        // margin (`set` raises this bound to it): coal's default bound is
+        // infinite, which measured every separated pair's distance in full
+        request.distance_upper_bound = 0;
         // one pass: each pair culled, then tested, keeping those that touch
         trimkit::Gathered<std::int64_t> touching;
         trimkit::gather_in_parallel<std::int64_t>(
@@ -588,6 +598,7 @@ public:
                                                      std::int64_t maximum_contacts) {
         coal::CollisionRequest request(coal::CONTACT, static_cast<std::size_t>(maximum_contacts));
         request.security_margin = margin;
+        request.distance_upper_bound = 0;  // as `collides`: separated pairs stop early
         trimkit::Gathered<Row> found;
         trimkit::gather_in_parallel<Row>(
             pair_count, &found, [&](std::size_t begin, std::size_t end, std::vector<Row>& kept) {

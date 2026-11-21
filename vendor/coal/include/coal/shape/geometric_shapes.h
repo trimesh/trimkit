@@ -856,8 +856,16 @@ class ConvexBaseTpl : public ShapeBase {
   using SupportWarmStartPolytope =
       ConvexBaseTplSupportWarmStartPolytope<IndexType>;
 
-  /// @brief Number of support warm starts.
-  static constexpr size_t num_support_warm_starts = 14;
+  //// TRIMKIT PATCH: perf.support-warm-start
+  /// @brief The support warm starts are a cube map: the vertex farthest along
+  /// the middle of each of 16 by 16 cells on each of a cube's 6 faces, their
+  /// indices only. Measured on robot and ellipsoid hulls of 42 to 2562
+  /// vertices, more cells kept shortening the climb from a seed up to 16 a
+  /// side, for 6 KB a hull.
+  static constexpr size_t support_warm_start_side = 16;
+  static constexpr size_t num_support_warm_starts =
+      6 * support_warm_start_side * support_warm_start_side;
+  //// TRIMKIT END PATCH
 
   /// @brief Support warm start polytopes.
   SupportWarmStartPolytope support_warm_starts;
