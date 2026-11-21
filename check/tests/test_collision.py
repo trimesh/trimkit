@@ -184,11 +184,12 @@ def test_large_convex_measures_as_its_corners():
     # cube of 8 corners, which it finds by looking at every vertex
     line = np.linspace(0, 1, 4)
     grid = np.array([[u, v] for u in line for v in line])
-    cell = np.array([4 * i + j for i in range(3) for j in range(3)])
+    cell = np.array([4 * i + j for i in range(3) for j in range(3)], dtype=np.int64)
     triangles = np.vstack([cell[:, None] + [0, 4, 5], cell[:, None] + [0, 5, 1]])
     sides = [np.insert(grid, axis, side, axis=1) for axis in range(3) for side in (0.0, 1.0)]
     vertices, merged = np.unique(np.vstack(sides), axis=0, return_inverse=True)
-    faces = merged.reshape(6, 16)[:, triangles].reshape(-1, 3)
+    # np.unique's inverse is intp: int32 on 32-bit
+    faces = merged.reshape(6, 16)[:, triangles].reshape(-1, 3).astype(np.int64)
     assert len(vertices) == 56
     rng = np.random.default_rng(3)
     count = 30
