@@ -50,18 +50,45 @@
 #                      one platform's manifest
 #   requires           what building and testing need, besides `distro` packages
 #
-# [toolchain], the compilers our own builds (`-Cstrict=true`) accept: inclusive
-# [oldest, newest] major versions, the ones the gate and the release's wheels
-# have passed with, so an untried toolchain stops a release instead of shipping.
-# Anyone else building the sdist is held only to the oldest.
+# [toolchain], what compiles our own builds (`-Cstrict=true`): every part of it
+# either fetched by hash or listed exactly, so nothing changes under a release
+# without a diff here. Anyone else building the sdist is held only to the oldest:
+#   llvm, apple_clang  inclusive [oldest, newest] major versions
+#   accept             { PLACE = ENVIRONMENT } the one environment our builds
+#                      run in at each place (its machine and C library):
+#                      the compiler, its C++ library and its SDK, exactly, as
+#                      scripts/builder.py's fingerprint() reads them. A strict
+#                      build in any other stops and prints its place's line,
+#                      to replace the old one once a build with it passes
+#   fetch.OS-MACHINE   { url, sha256 } an LLVM release `uv run scripts wheel`
+#                      builds with there, rather than the machine's own
+# Runner images can't be pinned: Linux's toolchain comes with its image, held
+# by cibuildwheel's version in uv.lock, macOS's with the runner's Xcode, and
+# Windows' STL and SDK with the runner's Visual Studio. LLVM's own Linux builds
+# need a newer glibc than manylinux's, and Xcode has no hash, so only Windows
+# fetches its compiler.
 
 [toolchain]
 # clang, with its lld, llvm-ar or llvm-lib and llvm-profdata of the same LLVM,
-# which ThinLTO's bitcode and PGO's profiles need: the dev image's Debian 19,
-# musllinux's 20, manylinux's 21 and the Windows runners' LLVM: x64's 20, arm64's 22
+# which ThinLTO's bitcode and PGO's profiles need
 llvm = [19, 22]
 # Xcode's clang on macOS, with Xcode's own linker, libtool and llvm-profdata
 apple_clang = [16, 17]
+
+[toolchain.accept]
+# the dev image, scripts/docker/Dockerfile
+"linux x86_64 glibc 2.41" = "Debian clang version 19.1.7 (3+b1) | libstdc++ 14 20250315"
+# the release's manylinux_2_28 and musllinux_1_2, with their packages' clang
+"linux x86_64 glibc 2.28" = "clang version 22.1.8 ( 22.1.8-2.module_el8.10.0+4359+f07421b9) | libstdc++ 15 20260123"
+"linux x86_64 musl" = "Alpine clang version 20.1.8 | libstdc++ 14 20240801 | dirs 14.2.0"
+
+[toolchain.fetch.windows-x86_64]
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
+sha256 = "d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234"
+
+[toolchain.fetch.windows-aarch64]
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-aarch64-pc-windows-msvc.tar.xz"
+sha256 = "de718c58ebbc5f61d58c17b90457fcf42983bc2c4a4aba3e010d108713bfd7f1"
 
 [upstream.earcut]
 repo = "mapbox/earcut.hpp"

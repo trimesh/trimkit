@@ -53,7 +53,6 @@ import concurrent.futures
 import doctest
 import functools
 import hashlib
-import io
 import json
 import os
 import platform
@@ -265,6 +264,31 @@ def cmd_asan(args) -> None:
     )
 
 
+def fetch(url: str, sha256: str, into: Path) -> Path:
+    """
+    A release tarball, checked against its pinned sha256 as it streams in,
+    extracted into `into`, emptied first: its one top directory.
+    """
+    # S310 warns of urlopen reading file: and other schemes: https only
+    if not url.startswith("https://"):
+        sys.exit(f"{url} isn't https")
+    shutil.rmtree(into, ignore_errors=True)
+    into.mkdir(parents=True)
+    print("+ fetch", url, flush=True)
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=120) as response, tempfile.TemporaryFile() as tarball:  # noqa: S310
+        while chunk := response.read(1 << 20):
+            digest.update(chunk)
+            tarball.write(chunk)
+        if digest.hexdigest() != sha256:
+            sys.exit(f"{url} is {digest.hexdigest()}, not its pinned sha256 {sha256}")
+        tarball.seek(0)
+        with tarfile.open(fileobj=tarball) as tar:
+            tar.extractall(into, filter="data")
+    (tree,) = into.iterdir()
+    return tree
+
+
 def tsan_python(root: Path) -> Path:
     """
     A free-threaded CPython built with ThreadSanitizer, once per build root:
@@ -275,17 +299,8 @@ def tsan_python(root: Path) -> Path:
     if python.exists():
         return python
     source = root / f"cpython-{CPYTHON}-src"
-    shutil.rmtree(source, ignore_errors=True)
-    source.mkdir(parents=True)
     url = f"https://www.python.org/ftp/python/{CPYTHON}/Python-{CPYTHON}.tar.xz"
-    print("+ fetch", url, flush=True)
-    with urllib.request.urlopen(url, timeout=120) as response:
-        tarball = response.read()
-    if hashlib.sha256(tarball).hexdigest() != CPYTHON_SHA256:
-        sys.exit(f"{url} does not match its pinned sha256")
-    with tarfile.open(fileobj=io.BytesIO(tarball)) as tar:
-        tar.extractall(source, filter="data")
-    (tree,) = source.iterdir()
+    tree = fetch(url, CPYTHON_SHA256, source)
     configure = ["./configure", "-q", "--disable-gil", "--with-thread-sanitizer", f"--prefix={prefix}"]
     run(*configure, cwd=tree, env={"CC": "clang", "CXX": "clang++"})
     run(tool("make"), "-s", f"-j{os.cpu_count()}", cwd=tree)
@@ -1744,6 +1759,18 @@ def cmd_wheel(args) -> None:
     # as cryptography's) that not every image's platform has
     export(source / "requirements.txt", "build", "test")
     export(source / "audit.txt", "audit")
+    # where [toolchain] fetches the compiler (Windows, which cibuildwheel
+    # builds on this machine), that LLVM first on PATH, once per hash
+    here = builder.Platform.current()
+    env = None
+    if pinned := MANIFEST.fetch.get(f"{here.os}-{here.machine}"):
+        llvm = args.root / "toolchain" / pinned["sha256"]
+        if not llvm.exists():
+            partial = llvm.with_name(llvm.name + ".partial")
+            fetch(pinned["url"], pinned["sha256"], partial)
+            partial.rename(llvm)
+        (tree,) = llvm.iterdir()
+        env = {"PATH": os.pathsep.join([str(tree / "bin"), os.environ["PATH"]])}
     run(
         tool("uv"),
         "run",
@@ -1758,6 +1785,7 @@ def cmd_wheel(args) -> None:
         "--output-dir",
         ROOT / "wheelhouse",
         cwd=source,
+        env=env,
     )
 
 

@@ -22,7 +22,9 @@ Standard library only: this runs inside the build backend (scripts/backend.py).
 
 import dataclasses
 import functools
+import json
 import platform as host
+import re
 import shlex
 import shutil
 import subprocess
@@ -153,9 +155,13 @@ class Manifest:
     # upstreams every part compiles against
     budget: int
     extension_upstreams: tuple[Upstream, ...]
-    # [toolchain]: each an inclusive [oldest, newest] of major versions
+    # [toolchain]: each an inclusive [oldest, newest] of major versions, the
+    # one environment strict builds run in at each place, and what each
+    # OS-MACHINE fetches
     llvm: tuple[int, int]
     apple_clang: tuple[int, int]
+    accept: dict[str, str]
+    fetch: dict[str, dict]
     # [distribution]: what `uv run scripts distro` writes packaging for, by name
     distributions: dict[str, dict]
 
@@ -218,9 +224,18 @@ def load() -> Manifest:
         if not errors:
             values = {**_tuples(table), "upstreams": tuple(upstreams[u] for u in wanted)}
             parts[name] = Part(name=name, **values)
+    toolchain = raw["toolchain"]
+    unknown = toolchain.keys() - {"llvm", "apple_clang", "accept", "fetch"}
+    errors += [f"[toolchain]: no key {k!r}" for k in sorted(unknown)]
+    if not isinstance(toolchain["accept"], dict):
+        errors.append("[toolchain.accept]: a table, each place's one environment")
+    errors += [
+        f"[toolchain.fetch.{name}]: wants exactly url and sha256"
+        for name, table in toolchain.get("fetch", {}).items()
+        if table.keys() != {"url", "sha256"}
+    ]
     if errors:
         sys.exit("trimkit.toml:\n  " + "\n  ".join(errors))
-    toolchain = raw["toolchain"]
     return Manifest(
         upstreams,
         parts,
@@ -228,6 +243,8 @@ def load() -> Manifest:
         tuple(upstreams[u] for u in raw["extension"]["upstreams"]),
         tuple(toolchain["llvm"]),
         tuple(toolchain["apple_clang"]),
+        toolchain["accept"],
+        toolchain.get("fetch", {}),
         raw["distribution"],
     )
 
@@ -307,14 +324,14 @@ class Python:
         )
 
 
-def major_version(output: str) -> int | None:
+def version(output: str) -> str | None:
     # the first dotted number a tool's --version prints: "Debian clang version
     # 19.1.7 (3+b1)", "LLD 21.1.8 (compatible with GNU linkers)", "Apple clang
     # version 17.0.0 (clang-1700.0.13.5)"
     for word in output.split():
         parts = word.split(".")
         if len(parts) > 1 and all(part.isdigit() for part in parts):
-            return int(parts[0])
+            return word
     return None
 
 
@@ -323,17 +340,18 @@ def _output(*args: str | Path) -> str:
     return result.stdout + result.stderr
 
 
-def _accept(compiler: Path, vendor: str, accepted: tuple[int, int]) -> int:
-    # its major version if trimkit.toml accepts it: Apple's clang only on macOS
-    version = _output(compiler, "--version")
-    first = version.splitlines()[0] if version else "nothing"
-    major = major_version(version)
+def _accept(compiler: Path, vendor: str, accepted: tuple[int, int]) -> str:
+    # its version if trimkit.toml accepts its major: Apple's clang only on macOS
+    output = _output(compiler, "--version")
+    first = output.splitlines()[0] if output else "nothing"
+    found = version(output)
+    major = int(found.split(".")[0]) if found else None
     oldest, newest = accepted
-    apple = version.startswith("Apple clang")
+    apple = output.startswith("Apple clang")
     if apple != (vendor == "Apple clang") or major is None or not oldest <= major <= newest:
         upper = "or newer" if newest == 10**6 else f"to {newest}"
         sys.exit(f"{compiler} is {first!r}: trimkit.toml accepts {vendor} {oldest} {upper}")
-    return major
+    return found
 
 
 def include_path(compiler: Path) -> tuple[Path, ...]:
@@ -349,6 +367,57 @@ def include_path(compiler: Path) -> tuple[Path, ...]:
     return tuple(
         Path(line.strip()) for line in searched.splitlines() if line.strip() and "(framework" not in line
     )
+
+
+# what fingerprint() preprocesses, and the macros it reads there: each the
+# version of a library or SDK clang compiles against, where it has one
+_PROBE = """
+#include <cstddef>
+#include <cstdio>
+#ifdef __APPLE__
+#include <Availability.h>
+#endif
+"""
+_LIBRARIES = {
+    "libstdc++": ("_GLIBCXX_RELEASE", "__GLIBCXX__"),
+    "libc++": ("_LIBCPP_VERSION",),
+    "msvc": ("_MSC_FULL_VER", "_MSVC_STL_UPDATE"),  # the Visual C++ clang emulates, and its STL
+    "macos sdk": ("__MAC_OS_X_VERSION_MAX_ALLOWED",),
+}
+
+
+def fingerprint(compiler: Path, platform: Platform, searched: tuple[Path, ...]) -> tuple[str, str]:
+    """
+    Where `compiler` builds and what with, as [toolchain.accept] holds them:
+    the place, its machine and C library, and the environment there, the
+    compiler's own name for itself and the version of each library and SDK
+    it compiles against, so an image that moves any of them is another line.
+    `searched` is its include path. musl names no version of itself, so a
+    musllinux place is its image's.
+    """
+    defined = subprocess.run(
+        [str(compiler), "-xc++", "-E", "-dM", "-"], input=_PROBE, capture_output=True, text=True, check=True
+    ).stdout
+    # `#define NAME VALUE`, a string's quotes dropped
+    macros = {
+        name: value.strip().strip('"').strip()
+        for name, value in (line.split(" ", 2)[1:] for line in defined.splitlines() if line.count(" ") >= 2)
+    }
+    place = f"{platform.os} {platform.machine}"
+    if platform.musl:
+        place += " musl"
+    elif "__GLIBC__" in macros:
+        place += f" glibc {macros['__GLIBC__']}.{macros['__GLIBC_MINOR__']}"
+    fields = [_output(compiler, "--version").splitlines()[0].strip()]
+    for library, names in _LIBRARIES.items():
+        if values := [macros[name] for name in names if name in macros]:
+            fields.append(f"{library} {' '.join(values)}")
+    # where no macro has one, the version a directory searched is named by:
+    # Windows' MSVC toolset (14.52.37025) and SDK (10.0.26100.0)
+    versions = [part for d in searched for part in d.parts if re.fullmatch(r"\d+(\.\d+){2,}", part)]
+    if versions:
+        fields.append("dirs " + " ".join(dict.fromkeys(versions)))
+    return place, " | ".join(fields)
 
 
 @dataclass(frozen=True)
@@ -377,6 +446,17 @@ class Tools:
         if found is None:
             sys.exit("no clang++ on PATH: every build is clang")
         compiler = Path(found)
+        searched = include_path(compiler)
+        if strict:
+            place, environment = fingerprint(compiler, platform, searched)
+            held = manifest.accept.get(place)
+            if held != environment:
+                sys.exit(
+                    f"{compiler} builds in {place!r} with what [toolchain.accept] doesn't hold there"
+                    + (f", which is\n    {json.dumps(held)}" if held else "")
+                    + "\nonce a build with it passes, make this that place's line in trimkit.toml:\n"
+                    + f"    {json.dumps(place)} = {json.dumps(environment)}"
+                )
         if platform.os == "macos":
             # /usr/bin's clang++ runs the selected Xcode's, with its SDK and
             # linker; libtool and llvm-profdata are that same Xcode's
@@ -388,8 +468,8 @@ class Tools:
                 sys.exit(
                     f"xcrun finds no Xcode libtool and llvm-profdata: {[str(p) for p in paths.values()]}"
                 )
-            return cls(compiler, paths["libtool"], paths["llvm-profdata"], include_path(compiler))
-        major = _accept(compiler, "clang", accepted(manifest.llvm))
+            return cls(compiler, paths["libtool"], paths["llvm-profdata"], searched)
+        llvm = _accept(compiler, "clang", accepted(manifest.llvm))
         # each tool as clang itself finds it, which for the linker is the one
         # -fuse-ld=lld runs, and each of clang's own LLVM
         linker, archiver, profiler = {
@@ -405,9 +485,14 @@ class Tools:
             # llvm-lib reports no version, so it must be the one beside clang
             if name == "llvm-lib" and paths[name].resolve().parent != compiler.resolve().parent:
                 sys.exit(f"{paths[name]} isn't beside {compiler}, so may not be its LLVM's")
-            if name != "llvm-lib" and major_version(_output(paths[name], "--version")) != major:
-                sys.exit(f"{paths[name]} isn't LLVM {major}, as {compiler} is")
-        return cls(compiler, paths[archiver], paths[profiler], include_path(compiler))
+            # the rest of clang's own release in strict builds; elsewhere of its
+            # major, as ThinLTO's bitcode and PGO's profiles need
+            if name != "llvm-lib":
+                got = version(_output(paths[name], "--version")) or "unknown"
+                want, have = (llvm, got) if strict else (llvm.split(".")[0], got.split(".")[0])
+                if have != want:
+                    sys.exit(f"{paths[name]} is LLVM {got}, not {compiler}'s {want}")
+        return cls(compiler, paths[archiver], paths[profiler], searched)
 
     @classmethod
     def example(cls, platform: Platform) -> "Tools":
