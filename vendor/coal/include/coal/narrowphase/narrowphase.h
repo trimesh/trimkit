@@ -756,7 +756,12 @@ struct COAL_DLLAPI GJKSolver {
     // this->cached_guess = this->gjk.ray;
     this->support_func_cached_guess = this->gjk.support_hint;
 
-    distance = Scalar(this->gjk.distance);
+    //// TRIMKIT PATCH: fix.gjk-collision-distance
+    // GJK said the shapes overlap: they are 0 apart, not the sliver its
+    // simplex stopped short of the origin by, which collision then compared
+    // to its threshold as a gap and reported no contact
+    distance = Scalar(0);
+    //// TRIMKIT END PATCH
     p1 = p2 = normal = Vec3s::Constant(std::numeric_limits<Scalar>::max());
   }
 

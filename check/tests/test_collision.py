@@ -177,6 +177,50 @@ def test_both_kernels_agree_on_distance():
     assert meshes[apart] == pytest.approx(solids[apart], abs=1e-6)
 
 
+def test_large_convex_measures_as_its_corners():
+    # past 32 vertices coal finds a solid's farthest vertex by climbing its
+    # edges from a warm start, here over faces that are grids of coplanar
+    # vertices, level to any direction square to them: the same solid as the
+    # cube of 8 corners, which it finds by looking at every vertex
+    line = np.linspace(0, 1, 4)
+    grid = np.array([[u, v] for u in line for v in line])
+    cell = np.array([4 * i + j for i in range(3) for j in range(3)])
+    triangles = np.vstack([cell[:, None] + [0, 4, 5], cell[:, None] + [0, 5, 1]])
+    sides = [np.insert(grid, axis, side, axis=1) for axis in range(3) for side in (0.0, 1.0)]
+    vertices, merged = np.unique(np.vstack(sides), axis=0, return_inverse=True)
+    faces = merged.reshape(6, 16)[:, triangles].reshape(-1, 3)
+    assert len(vertices) == 56
+    rng = np.random.default_rng(3)
+    count = 30
+    # half of them square to each other, so faces meet faces
+    rotations = [np.eye(3)] * (count // 2) + [rotation(rng) for _ in range(count // 2)]
+    matrices = placed(*rng.uniform(0, 2.5, (count, 3)), rotations=rotations)
+    index = np.zeros(count, np.int64)
+    corners, gridded = scene(True), scene(True, (vertices, faces))
+    expected, measured = corners.distances(matrices, index), gridded.distances(matrices, index)
+    assert (expected.distances < -1e-3).any() and (expected.distances > 1e-3).any()
+    assert measured.distances == pytest.approx(expected.distances, abs=1e-5)
+    assert np.array_equal(gridded.collides(matrices, index).pairs, corners.collides(matrices, index).pairs)
+    # no pair's answer depends on the pairs measured before it
+    backward = gridded.distances(matrices, index, pairs=measured.pairs[::-1])
+    assert np.array_equal(backward.distances, measured.distances[::-1])
+
+
+def test_overlapping_convex_solids_collide():
+    # like solids overlapping deeply: a GJK started between their centers
+    # often stops on a simplex through the origin, sure of the overlap but
+    # with no depth, which coal alone would count as a gap
+    rng = np.random.default_rng(15)
+    count = 60
+    matrices = placed(*rng.uniform(0, 3, (count, 3)), rotations=[rotation(rng) for _ in range(count)])
+    index = np.zeros(count, np.int64)
+    balls = scene(True, sphere(10, 20))
+    measured = balls.distances(matrices, index)
+    overlapping = measured.pairs[measured.distances < 0]
+    assert len(overlapping) > 100
+    assert np.array_equal(balls.collides(matrices, index, pairs=measured.pairs).pairs, overlapping)
+
+
 @pytest.mark.parametrize(
     ("matrix", "match"),
     [

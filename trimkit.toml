@@ -237,7 +237,7 @@ include = ["vendor/meshoptimizer/src"]
 repo = "coal-library/coal"
 ref = "devel"
 commit = "83cdaa6addd580c11dadd2299476e6f08aece2f4"
-tree_sha256 = "177a68706ab247cc3c0e0d30e39683071183a118841f84fdb966dcb55b1a24ff"
+tree_sha256 = "1bbe0fb5cb74cce07a4d574d4b677887e3583aec44989edd4f965fff709c48cf"
 spdx = "BSD-3-Clause"
 # src/distance/triangle_triangle.cpp defines a ShapeShapeDistancer specialization no header is named after
 keep = ["LICENSE", "src/distance/triangle_triangle.cpp"]
@@ -248,7 +248,9 @@ include = ["vendor/coal/include", "vendor/coal/src", "vendor/coal/include/coal/t
 
 [upstream.coal.patches]
 "coal-bvh-bvh-performance.patch" = "0f53292b95269a8f7e128a393c1ed8deae2003d62d6eae7424f38d795f9aa025"
+"coal-gjk-collision-distance.patch" = "2f9efdee235863b0ac848f82ab630973e0f35557b67d31ce41bd3b47f5e07c12"
 "coal-hierarchy-tree-array-leak.patch" = "4ec9a982489343d9661e765091b9f973ba462d6eac7b034fede4cd295bd98780"
+"coal-support-warm-start.patch" = "80c477b76edc91d5162d75971f33aa97dac356f0532d1e36df44caa5378ad820"
 
 # coal's linear algebra, header only: only the headers coal and our binding
 # reach on some wheel target. MPL-2.0, which binds only its own files, kept
