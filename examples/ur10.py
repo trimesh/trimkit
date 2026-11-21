@@ -89,7 +89,7 @@ class PlannableScene:
         keep = (b >= len(world)) & ((a < len(world)) | (abs(depth[a] - depth[b]) >= joint_gap))
         self.pairs = np.stack([a[keep], b[keep]], axis=1)
         self.pair_row = np.zeros((self.mesh_count, self.mesh_count), dtype=np.int64)
-        self.pair_row[a[keep], b[keep]] = np.arange(len(self.pairs))
+        self.pair_row[a[keep], b[keep]] = np.arange(len(self.pairs), dtype=np.int64)
 
     def forward(self, angles: np.ndarray) -> np.ndarray:
         """`(n, l, 4, 4)` poses of `self.links` for `(n, j)` joint angles."""
