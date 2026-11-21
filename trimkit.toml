@@ -81,12 +81,14 @@ apple_clang = [16, 17]
 # the release's manylinux_2_28 and musllinux_1_2, with their packages' clang
 "linux x86_64 glibc 2.28" = "clang version 22.1.8 ( 22.1.8-2.module_el8.10.0+4359+f07421b9) | libstdc++ 15 20260123"
 "linux x86_64 musl" = "Alpine clang version 20.1.8 | libstdc++ 14 20240801 | dirs 14.2.0"
+"linux aarch64 musl" = "Alpine clang version 20.1.8 | libstdc++ 14 20240801 | dirs 14.2.0"
 "linux aarch64 glibc 2.28" = "clang version 22.1.8 ( 22.1.8-2.module_el8.10.0+4359+f07421b9) | libstdc++ 15 20260123"
 # the GitHub runner images, with Xcode's clang
 "macos aarch64" = "Apple clang version 17.0.0 (clang-1700.0.13.5) | libc++ 190102 | macos sdk __MAC_15_5"
 "macos x86_64" = "Apple clang version 17.0.0 (clang-1700.0.13.5) | libc++ 190102 | macos sdk __MAC_15_5"
 # the fetched LLVM below, with the runner image's Visual Studio and Windows SDK
 "windows i686" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
+"windows x86_64" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
 "windows aarch64" = "clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1) | msvc 195237029 202609L | dirs 14.52.37025 10.0.26100.0"
 
 [toolchain.fetch.windows-x86_64]
