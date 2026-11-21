@@ -309,25 +309,8 @@ void getShapeSupportLog(const ConvexBaseTpl<IndexType>* convex,
                         ShapeSupportData& support_data) {
   assert(convex->neighbors != nullptr && "Convex has no neighbors.");
 
-  // Use warm start if current support direction is distant from last support
-  // direction.
-  const Scalar use_warm_start_threshold = Scalar(0.9);
-  Vec3s dir_normalized = dir.normalized();
-  if (!support_data.last_dir.isZero() &&
-      !convex->support_warm_starts.points.empty() &&
-      support_data.last_dir.dot(dir_normalized) < use_warm_start_threshold) {
-    // Change hint if last dir is too far from current dir.
-    Scalar maxdot = convex->support_warm_starts.points[0].dot(dir);
-    hint = int(convex->support_warm_starts.indices[0]);
-    for (size_t i = 1; i < convex->support_warm_starts.points.size(); ++i) {
-      Scalar dot = convex->support_warm_starts.points[i].dot(dir);
-      if (dot > maxdot) {
-        maxdot = dot;
-        hint = int(convex->support_warm_starts.indices[i]);
-      }
-    }
-  }
-  support_data.last_dir = dir_normalized;
+  //// TRIMKIT PATCH: perf.support-warm-start
+  //// TRIMKIT END PATCH
 
   const std::vector<Vec3s>& pts = *(convex->points);
   typedef typename ConvexBaseTpl<IndexType>::Neighbors Neighbors;
@@ -337,16 +320,50 @@ void getShapeSupportLog(const ConvexBaseTpl<IndexType>* convex,
     hint = 0;
   }
   Scalar maxdot = pts[static_cast<size_t>(hint)].dot(dir);
-  std::vector<int8_t>& visited = support_data.visited;
-  if (support_data.visited.size() == convex->num_points) {
-    std::fill(visited.begin(), visited.end(), false);
-  } else {
-    // std::vector::assign not only assigns the values of the vector but also
-    // resizes the vector. So if `visited` has not been set up yet, this makes
-    // sure the size convex's points and visited are identical.
-    support_data.visited.assign(convex->num_points, false);
+  //// TRIMKIT PATCH: perf.support-warm-start
+  // Start from the better of the hint and the warm start of this direction's
+  // cell of the cube map (ConvexBaseTpl::num_support_warm_starts): two dot
+  // products a call, where coal scanned all 14 of its warm starts on every
+  // sharp turn, and none on the first support of a pair, which climbed from
+  // the hint, vertex 0. A direction too small to scale or not finite has no
+  // cell, and the table is only complete, so only used, once it is built.
+  const size_t side = ConvexBaseTpl<IndexType>::support_warm_start_side;
+  const Vec3s size = dir.cwiseAbs();
+  const Eigen::Index axis = size[0] >= size[1] ? (size[0] >= size[2] ? 0 : 2)
+                                               : (size[1] >= size[2] ? 1 : 2);
+  if (convex->support_warm_starts.indices.size() ==
+          ConvexBaseTpl<IndexType>::num_support_warm_starts &&
+      dir.allFinite() &&
+      size[axis] >= Scalar(side) * (std::numeric_limits<Scalar>::min)()) {
+    // the other two axes' shares of the largest, -1 to 1, in `side` steps
+    const Scalar scale = Scalar(side) / 2 / size[axis];
+    const auto step = [&](Eigen::Index other) {
+      const Scalar along = dir[(axis + other) % 3] + size[axis];
+      return (std::min)(side - 1, size_t(along * scale));
+    };
+    const size_t cell =
+        ((2 * size_t(axis) + (dir[axis] > 0)) * side + step(1)) * side +
+        step(2);
+    const int seed = int(convex->support_warm_starts.indices[cell]);
+    if (pts[static_cast<size_t>(seed)].dot(dir) > maxdot) {
+      hint = seed;
+    }
   }
-  visited[static_cast<std::size_t>(hint)] = true;
+  // taken again rather than kept from the comparison, which is as likely
+  // either way: this form measured 4% faster than the branch that keeps it
+  maxdot = pts[static_cast<size_t>(hint)].dot(dir);
+  // A vertex is visited in this call when its stamp is this call's: the
+  // same visits as clearing a flag per vertex every call, which made each
+  // climb cost the whole hull. Stamps only grow, so one left by another
+  // shape never matches and none needs clearing; 64 bits never wrap, and
+  // alias neither the points nor the neighbor indices the loop reads
+  std::vector<uint64_t>& visited = support_data.visit_stamps;
+  if (visited.size() < convex->num_points) {
+    visited.resize(convex->num_points, 0);
+  }
+  const uint64_t stamp = ++support_data.visit_stamp;
+  visited[static_cast<std::size_t>(hint)] = stamp;
+  //// TRIMKIT END PATCH
   // When the first face is orthogonal to dir, all the dot products will be
   // equal. Yet, the neighbors must be visited.
   bool found = true;
@@ -357,8 +374,10 @@ void getShapeSupportLog(const ConvexBaseTpl<IndexType>* convex,
     IndexType current_vertex_idx = IndexType(hint);
     for (IndexType in = 0; in < n.count; ++in) {
       const IndexType ip = convex->neighbor(current_vertex_idx, in);
-      if (visited[ip]) continue;
-      visited[ip] = true;
+      //// TRIMKIT PATCH: perf.support-warm-start
+      if (visited[ip] == stamp) continue;
+      visited[ip] = stamp;
+      //// TRIMKIT END PATCH
       const Scalar dot = pts[ip].dot(dir);
       bool better = false;
       if (dot > maxdot) {
@@ -900,9 +919,11 @@ void getShapeSupportSetLog(const ConvexBaseTpl<IndexType>* convex,
   const Scalar support_value = support.dot(support_dir);
 
   std::vector<int8_t>& visited = support_data.visited;
-  // `visited` is guaranteed to be of right size due to previous call to convex
-  // log support function.
-  std::fill(support_data.visited.begin(), support_data.visited.end(), false);
+  //// TRIMKIT PATCH: perf.support-warm-start
+  // sized here: the hill climb above keeps stamps of its own, and no pair
+  // pays to clear flags only this function reads
+  visited.assign(convex->num_points, false);
+  //// TRIMKIT END PATCH
 
   std::vector<Vec2s>& polygon = support_data.polygon;
   polygon.clear();

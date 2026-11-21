@@ -1,0 +1,33 @@
+kind: fix
+
+When GJK stops sure the shapes overlap (status Collision: its simplex came
+within tolerance of the origin) and no depth was asked for, coal skipped EPA
+but returned GJK's last distance, a sliver up to its tolerance (1e-6) above
+0. ShapeShapeCollide and the mesh/shape collision leaves then subtract the
+margin from that and compare it to collision_distance_threshold (1e-12 by
+default), so an overlap, however deep, could be reported as no contact.
+It happens mostly between like or symmetric solids whose GJK starts near
+the line between their centers: trimkit's collides missed 2 of 2222
+touching pairs over 300 talos configurations and 2 of 1452 over 200 g1
+ones at the request defaults, overlapping by up to 2.5 mm, and once GJK
+started between box centers, 11 pairs 0.06 to 1.7 deep among 40 placements
+of 60 copies of one sphere. The distance is 0, as overlapping shapes are.
+Covered by check/tests/test_collision.py::test_overlapping_convex_solids_collide.
+Not reported upstream yet; the same lines are in coal devel as pinned.
+
+--- a/include/coal/narrowphase/narrowphase.h
++++ b/include/coal/narrowphase/narrowphase.h
+@@ -756,7 +756,12 @@
+     // this->cached_guess = this->gjk.ray;
+     this->support_func_cached_guess = this->gjk.support_hint;
+ 
+-    distance = Scalar(this->gjk.distance);
++    //// TRIMKIT PATCH: fix.gjk-collision-distance
++    // GJK said the shapes overlap: they are 0 apart, not the sliver its
++    // simplex stopped short of the origin by, which collision then compared
++    // to its threshold as a gap and reported no contact
++    distance = Scalar(0);
++    //// TRIMKIT END PATCH
+     p1 = p2 = normal = Vec3s::Constant(std::numeric_limits<Scalar>::max());
+   }
+ 

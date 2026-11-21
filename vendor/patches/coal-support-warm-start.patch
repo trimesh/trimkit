@@ -1,0 +1,329 @@
+kind: perf
+
+The hill climb that finds a large convex's support point (getShapeSupportLog,
+every convex past 32 vertices) cost far more than its few steps:
+- its warm-start table was skipped whenever the last direction was zero, which
+  MinkowskiDiff::set makes it for every new pair, so each pair's first climb
+  started at vertex 0 and crossed the hull; and a turn of the direction
+  replaced the hint with the table's best even when the hint was better
+- the table took 14 dot products to consult, on every sharp turn
+- it cleared a visited flag for every vertex on every call, so each climb
+  cost the whole hull however short it was
+Now the table is a cube map, the vertex farthest along the middle of each of
+16 by 16 cells on each face of a cube (indices only, 6 KB a hull), built
+where the 14 were, and each call starts from the better of the hint and its
+direction's cell: two dot products, as MuJoCo seeds its own climb from a
+27-direction grid (engine_collision_convex.c). More cells kept shortening
+the climb up to 16 a side on robot and ellipsoid hulls of 42 to 2562
+vertices: 27 cells to 1536 took distances on g1's 724-vertex (median) hulls
+from 509 to 344 us. A vertex is visited when its 64-bit stamp is the call's,
+which only grows, so nothing is ever cleared.
+The climb visits as it did, so it returns a vertex as far along the
+direction; only where several are equally far may it name another.
+The flags the climb used are left to the one function that still reads them
+(getShapeSupportSetLog, which now sizes them itself, as the climb did for
+it), so MinkowskiDiff::set no longer clears them for every pair.
+Measured on robot hulls, one core, every non-adjacent pair, trimkit 0.3.0
+with its GJK starting between the hulls' centers, us per configuration:
+distances 1187 -> 633 (talos) and 924 -> 344 (g1), collides 58 -> 31 and
+62 -> 23 (check/bench/collision/mujoco.coal.notes.md). Covered by
+check/tests/test_collision.py and check/bench/collision/trimkit_robot.py's
+distance against exact triangle distance between the hulls.
+Not reported upstream yet.
+
+--- a/include/coal/narrowphase/support_data.h
++++ b/include/coal/narrowphase/support_data.h
+@@ -63,6 +63,13 @@
+   // @brief Tracks which points have been visited in a ConvexBase.
+   std::vector<int8_t> visited;
+ 
++  //// TRIMKIT PATCH: perf.support-warm-start
++  // @brief The call each vertex was last visited in, by the support
++  // function's hill climb: visited in this call when it is `visit_stamp`.
++  std::vector<uint64_t> visit_stamps;
++  uint64_t visit_stamp = 0;
++
++  //// TRIMKIT END PATCH
+   // @brief Tracks the last support direction used on this shape; used to
+   // warm-start the ConvexBase support function.
+   Vec3s last_dir = Vec3s::Zero();
+--- a/include/coal/shape/geometric_shapes.h
++++ b/include/coal/shape/geometric_shapes.h
+@@ -856,8 +856,16 @@
+   using SupportWarmStartPolytope =
+       ConvexBaseTplSupportWarmStartPolytope<IndexType>;
+ 
+-  /// @brief Number of support warm starts.
+-  static constexpr size_t num_support_warm_starts = 14;
++  //// TRIMKIT PATCH: perf.support-warm-start
++  /// @brief The support warm starts are a cube map: the vertex farthest along
++  /// the middle of each of 16 by 16 cells on each of a cube's 6 faces, their
++  /// indices only. Measured on robot and ellipsoid hulls of 42 to 2562
++  /// vertices, more cells kept shortening the climb from a seed up to 16 a
++  /// side, for 6 KB a hull.
++  static constexpr size_t support_warm_start_side = 16;
++  static constexpr size_t num_support_warm_starts =
++      6 * support_warm_start_side * support_warm_start_side;
++  //// TRIMKIT END PATCH
+ 
+   /// @brief Support warm start polytopes.
+   SupportWarmStartPolytope support_warm_starts;
+--- a/src/narrowphase/gjk.cpp
++++ b/src/narrowphase/gjk.cpp
+@@ -1486,66 +1486,31 @@
+     return;
+   }
+ 
+-  this->support_warm_starts.points.reserve(
+-      ConvexBaseType::num_support_warm_starts);
+-  this->support_warm_starts.indices.reserve(
+-      ConvexBaseType::num_support_warm_starts);
+-
+-  Vec3s axiis(0, 0, 0);
+-  details::ShapeSupportData support_data;
+-  int support_hint = 0;
+-  for (int i = 0; i < 3; ++i) {
+-    axiis(i) = 1;
+-    {
+-      Vec3s support;
+-      coal::details::getShapeSupport<false, IndexType>(
+-          this, axiis, support, support_hint, support_data);
+-      this->support_warm_starts.points.emplace_back(support);
+-      this->support_warm_starts.indices.emplace_back(support_hint);
+-    }
+-
+-    axiis(i) = -1;
+-    {
+-      Vec3s support;
+-      coal::details::getShapeSupport<false, IndexType>(
+-          this, axiis, support, support_hint, support_data);
+-      this->support_warm_starts.points.emplace_back(support);
+-      this->support_warm_starts.indices.emplace_back(support_hint);
+-    }
+-
+-    axiis(i) = 0;
+-  }
+-
+-  std::array<Vec3s, 4> eis = {Vec3s(1, 1, 1),    //
+-                              Vec3s(-1, 1, 1),   //
+-                              Vec3s(-1, -1, 1),  //
+-                              Vec3s(1, -1, 1)};
+-
+-  for (size_t ei_index = 0; ei_index < 4; ++ei_index) {
+-    {
+-      Vec3s support;
+-      coal::details::getShapeSupport<false, IndexType>(
+-          this, eis[ei_index], support, support_hint, support_data);
+-      this->support_warm_starts.points.emplace_back(support);
+-      this->support_warm_starts.indices.emplace_back(support_hint);
+-    }
+-
+-    {
+-      Vec3s support;
+-      coal::details::getShapeSupport<false, IndexType>(
+-          this, -eis[ei_index], support, support_hint, support_data);
+-      this->support_warm_starts.points.emplace_back(support);
+-      this->support_warm_starts.indices.emplace_back(support_hint);
+-    }
+-  }
+-
+-  if (this->support_warm_starts.points.size() !=
+-          ConvexBaseType::num_support_warm_starts ||
+-      this->support_warm_starts.indices.size() !=
+-          ConvexBaseType::num_support_warm_starts) {
+-    COAL_THROW_PRETTY("Wrong number of support warm starts.",
+-                      std::runtime_error);
+-  }
++  //// TRIMKIT PATCH: perf.support-warm-start
++  // cell (face, u, v) of the cube map looks along the middle of that cell:
++  // face 2 * axis is that axis's negative side, 2 * axis + 1 its positive
++  const size_t side = ConvexBaseType::support_warm_start_side;
++  this->support_warm_starts.points.clear();
++  this->support_warm_starts.indices.clear();
++  this->support_warm_starts.indices.reserve(
++      ConvexBaseType::num_support_warm_starts);
++  details::ShapeSupportData support_data;
++  int support_hint = 0;
++  for (size_t cell = 0; cell < ConvexBaseType::num_support_warm_starts;
++       ++cell) {
++    const size_t face = cell / (side * side), axis = face / 2;
++    Vec3s direction;
++    direction[Eigen::Index(axis)] = face % 2 ? 1 : -1;
++    direction[Eigen::Index((axis + 1) % 3)] =
++        Scalar(2 * (cell / side % side) + 1) / Scalar(side) - 1;
++    direction[Eigen::Index((axis + 2) % 3)] =
++        Scalar(2 * (cell % side) + 1) / Scalar(side) - 1;
++    Vec3s support;
++    coal::details::getShapeSupport<false, IndexType>(
++        this, direction, support, support_hint, support_data);
++    this->support_warm_starts.indices.emplace_back(support_hint);
++  }
++  //// TRIMKIT END PATCH
+ }
+ 
+ template void COAL_DLLAPI
+--- a/src/narrowphase/minkowski_difference.cpp
++++ b/src/narrowphase/minkowski_difference.cpp
+@@ -135,7 +135,9 @@
+       const ConvexBase16* convex1 = static_cast<const ConvexBase16*>(s1);
+       if (static_cast<size_t>(convex1->num_points) >
+           ConvexBase16::num_vertices_large_convex_threshold) {
+-        data[1].visited.assign(convex1->num_points, false);
++        //// TRIMKIT PATCH: perf.support-warm-start
++        // `visited` is sized by the one function that reads it, when it does
++        //// TRIMKIT END PATCH
+         data[1].last_dir.setZero();
+         if (identity)
+           return getSupportFuncTpl<Shape0, LargeConvex16, true,
+@@ -156,7 +158,9 @@
+       const ConvexBase32* convex1 = static_cast<const ConvexBase32*>(s1);
+       if (static_cast<size_t>(convex1->num_points) >
+           ConvexBase32::num_vertices_large_convex_threshold) {
+-        data[1].visited.assign(convex1->num_points, false);
++        //// TRIMKIT PATCH: perf.support-warm-start
++        // `visited` is sized by the one function that reads it, when it does
++        //// TRIMKIT END PATCH
+         data[1].last_dir.setZero();
+         if (identity)
+           return getSupportFuncTpl<Shape0, LargeConvex32, true,
+@@ -233,7 +237,9 @@
+       const ConvexBase16* convex0 = static_cast<const ConvexBase16*>(s0);
+       if (static_cast<size_t>(convex0->num_points) >
+           ConvexBase16::num_vertices_large_convex_threshold) {
+-        data[0].visited.assign(convex0->num_points, false);
++        //// TRIMKIT PATCH: perf.support-warm-start
++        // `visited` is sized by the one function that reads it, when it does
++        //// TRIMKIT END PATCH
+         data[0].last_dir.setZero();
+         return makeGetSupportFunction1<LargeConvex16, _SupportOptions>(
+             s1, identity, swept_sphere_radius, data);
+@@ -246,7 +252,9 @@
+       const ConvexBase32* convex0 = static_cast<const ConvexBase32*>(s0);
+       if (static_cast<size_t>(convex0->num_points) >
+           ConvexBase32::num_vertices_large_convex_threshold) {
+-        data[0].visited.assign(convex0->num_points, false);
++        //// TRIMKIT PATCH: perf.support-warm-start
++        // `visited` is sized by the one function that reads it, when it does
++        //// TRIMKIT END PATCH
+         data[0].last_dir.setZero();
+         return makeGetSupportFunction1<LargeConvex32, _SupportOptions>(
+             s1, identity, swept_sphere_radius, data);
+--- a/src/narrowphase/support_functions.cpp
++++ b/src/narrowphase/support_functions.cpp
+@@ -309,25 +309,8 @@
+                         ShapeSupportData& support_data) {
+   assert(convex->neighbors != nullptr && "Convex has no neighbors.");
+ 
+-  // Use warm start if current support direction is distant from last support
+-  // direction.
+-  const Scalar use_warm_start_threshold = Scalar(0.9);
+-  Vec3s dir_normalized = dir.normalized();
+-  if (!support_data.last_dir.isZero() &&
+-      !convex->support_warm_starts.points.empty() &&
+-      support_data.last_dir.dot(dir_normalized) < use_warm_start_threshold) {
+-    // Change hint if last dir is too far from current dir.
+-    Scalar maxdot = convex->support_warm_starts.points[0].dot(dir);
+-    hint = int(convex->support_warm_starts.indices[0]);
+-    for (size_t i = 1; i < convex->support_warm_starts.points.size(); ++i) {
+-      Scalar dot = convex->support_warm_starts.points[i].dot(dir);
+-      if (dot > maxdot) {
+-        maxdot = dot;
+-        hint = int(convex->support_warm_starts.indices[i]);
+-      }
+-    }
+-  }
+-  support_data.last_dir = dir_normalized;
++  //// TRIMKIT PATCH: perf.support-warm-start
++  //// TRIMKIT END PATCH
+ 
+   const std::vector<Vec3s>& pts = *(convex->points);
+   typedef typename ConvexBaseTpl<IndexType>::Neighbors Neighbors;
+@@ -337,16 +320,50 @@
+     hint = 0;
+   }
+   Scalar maxdot = pts[static_cast<size_t>(hint)].dot(dir);
+-  std::vector<int8_t>& visited = support_data.visited;
+-  if (support_data.visited.size() == convex->num_points) {
+-    std::fill(visited.begin(), visited.end(), false);
+-  } else {
+-    // std::vector::assign not only assigns the values of the vector but also
+-    // resizes the vector. So if `visited` has not been set up yet, this makes
+-    // sure the size convex's points and visited are identical.
+-    support_data.visited.assign(convex->num_points, false);
+-  }
+-  visited[static_cast<std::size_t>(hint)] = true;
++  //// TRIMKIT PATCH: perf.support-warm-start
++  // Start from the better of the hint and the warm start of this direction's
++  // cell of the cube map (ConvexBaseTpl::num_support_warm_starts): two dot
++  // products a call, where coal scanned all 14 of its warm starts on every
++  // sharp turn, and none on the first support of a pair, which climbed from
++  // the hint, vertex 0. A direction too small to scale or not finite has no
++  // cell, and the table is only complete, so only used, once it is built.
++  const size_t side = ConvexBaseTpl<IndexType>::support_warm_start_side;
++  const Vec3s size = dir.cwiseAbs();
++  const Eigen::Index axis = size[0] >= size[1] ? (size[0] >= size[2] ? 0 : 2)
++                                               : (size[1] >= size[2] ? 1 : 2);
++  if (convex->support_warm_starts.indices.size() ==
++          ConvexBaseTpl<IndexType>::num_support_warm_starts &&
++      dir.allFinite() &&
++      size[axis] >= Scalar(side) * (std::numeric_limits<Scalar>::min)()) {
++    // the other two axes' shares of the largest, -1 to 1, in `side` steps
++    const Scalar scale = Scalar(side) / 2 / size[axis];
++    const auto step = [&](Eigen::Index other) {
++      const Scalar along = dir[(axis + other) % 3] + size[axis];
++      return (std::min)(side - 1, size_t(along * scale));
++    };
++    const size_t cell =
++        ((2 * size_t(axis) + (dir[axis] > 0)) * side + step(1)) * side +
++        step(2);
++    const int seed = int(convex->support_warm_starts.indices[cell]);
++    if (pts[static_cast<size_t>(seed)].dot(dir) > maxdot) {
++      hint = seed;
++    }
++  }
++  // taken again rather than kept from the comparison, which is as likely
++  // either way: this form measured 4% faster than the branch that keeps it
++  maxdot = pts[static_cast<size_t>(hint)].dot(dir);
++  // A vertex is visited in this call when its stamp is this call's: the
++  // same visits as clearing a flag per vertex every call, which made each
++  // climb cost the whole hull. Stamps only grow, so one left by another
++  // shape never matches and none needs clearing; 64 bits never wrap, and
++  // alias neither the points nor the neighbor indices the loop reads
++  std::vector<uint64_t>& visited = support_data.visit_stamps;
++  if (visited.size() < convex->num_points) {
++    visited.resize(convex->num_points, 0);
++  }
++  const uint64_t stamp = ++support_data.visit_stamp;
++  visited[static_cast<std::size_t>(hint)] = stamp;
++  //// TRIMKIT END PATCH
+   // When the first face is orthogonal to dir, all the dot products will be
+   // equal. Yet, the neighbors must be visited.
+   bool found = true;
+@@ -357,8 +374,10 @@
+     IndexType current_vertex_idx = IndexType(hint);
+     for (IndexType in = 0; in < n.count; ++in) {
+       const IndexType ip = convex->neighbor(current_vertex_idx, in);
+-      if (visited[ip]) continue;
+-      visited[ip] = true;
++      //// TRIMKIT PATCH: perf.support-warm-start
++      if (visited[ip] == stamp) continue;
++      visited[ip] = stamp;
++      //// TRIMKIT END PATCH
+       const Scalar dot = pts[ip].dot(dir);
+       bool better = false;
+       if (dot > maxdot) {
+@@ -900,9 +919,11 @@
+   const Scalar support_value = support.dot(support_dir);
+ 
+   std::vector<int8_t>& visited = support_data.visited;
+-  // `visited` is guaranteed to be of right size due to previous call to convex
+-  // log support function.
+-  std::fill(support_data.visited.begin(), support_data.visited.end(), false);
++  //// TRIMKIT PATCH: perf.support-warm-start
++  // sized here: the hill climb above keeps stamps of its own, and no pair
++  // pays to clear flags only this function reads
++  visited.assign(convex->num_points, false);
++  //// TRIMKIT END PATCH
+ 
+   std::vector<Vec2s>& polygon = support_data.polygon;
+   polygon.clear();

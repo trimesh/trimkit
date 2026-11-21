@@ -1486,66 +1486,31 @@ void ConvexBaseTpl<IndexType>::buildSupportWarmStart() {
     return;
   }
 
-  this->support_warm_starts.points.reserve(
-      ConvexBaseType::num_support_warm_starts);
+  //// TRIMKIT PATCH: perf.support-warm-start
+  // cell (face, u, v) of the cube map looks along the middle of that cell:
+  // face 2 * axis is that axis's negative side, 2 * axis + 1 its positive
+  const size_t side = ConvexBaseType::support_warm_start_side;
+  this->support_warm_starts.points.clear();
+  this->support_warm_starts.indices.clear();
   this->support_warm_starts.indices.reserve(
       ConvexBaseType::num_support_warm_starts);
-
-  Vec3s axiis(0, 0, 0);
   details::ShapeSupportData support_data;
   int support_hint = 0;
-  for (int i = 0; i < 3; ++i) {
-    axiis(i) = 1;
-    {
-      Vec3s support;
-      coal::details::getShapeSupport<false, IndexType>(
-          this, axiis, support, support_hint, support_data);
-      this->support_warm_starts.points.emplace_back(support);
-      this->support_warm_starts.indices.emplace_back(support_hint);
-    }
-
-    axiis(i) = -1;
-    {
-      Vec3s support;
-      coal::details::getShapeSupport<false, IndexType>(
-          this, axiis, support, support_hint, support_data);
-      this->support_warm_starts.points.emplace_back(support);
-      this->support_warm_starts.indices.emplace_back(support_hint);
-    }
-
-    axiis(i) = 0;
+  for (size_t cell = 0; cell < ConvexBaseType::num_support_warm_starts;
+       ++cell) {
+    const size_t face = cell / (side * side), axis = face / 2;
+    Vec3s direction;
+    direction[Eigen::Index(axis)] = face % 2 ? 1 : -1;
+    direction[Eigen::Index((axis + 1) % 3)] =
+        Scalar(2 * (cell / side % side) + 1) / Scalar(side) - 1;
+    direction[Eigen::Index((axis + 2) % 3)] =
+        Scalar(2 * (cell % side) + 1) / Scalar(side) - 1;
+    Vec3s support;
+    coal::details::getShapeSupport<false, IndexType>(
+        this, direction, support, support_hint, support_data);
+    this->support_warm_starts.indices.emplace_back(support_hint);
   }
-
-  std::array<Vec3s, 4> eis = {Vec3s(1, 1, 1),    //
-                              Vec3s(-1, 1, 1),   //
-                              Vec3s(-1, -1, 1),  //
-                              Vec3s(1, -1, 1)};
-
-  for (size_t ei_index = 0; ei_index < 4; ++ei_index) {
-    {
-      Vec3s support;
-      coal::details::getShapeSupport<false, IndexType>(
-          this, eis[ei_index], support, support_hint, support_data);
-      this->support_warm_starts.points.emplace_back(support);
-      this->support_warm_starts.indices.emplace_back(support_hint);
-    }
-
-    {
-      Vec3s support;
-      coal::details::getShapeSupport<false, IndexType>(
-          this, -eis[ei_index], support, support_hint, support_data);
-      this->support_warm_starts.points.emplace_back(support);
-      this->support_warm_starts.indices.emplace_back(support_hint);
-    }
-  }
-
-  if (this->support_warm_starts.points.size() !=
-          ConvexBaseType::num_support_warm_starts ||
-      this->support_warm_starts.indices.size() !=
-          ConvexBaseType::num_support_warm_starts) {
-    COAL_THROW_PRETTY("Wrong number of support warm starts.",
-                      std::runtime_error);
-  }
+  //// TRIMKIT END PATCH
 }
 
 template void COAL_DLLAPI

@@ -15,11 +15,11 @@ from scipy.interpolate import BSpline
 from scipy.optimize import minimize
 from trimesh import Trimesh
 from trimesh.creation import box
-from trimesh.geometry import align_vectors
 from trimesh.transformations import rotation_matrix
 from yourdfpy import URDF
 
 import trimkit
+from trimkit import CollisionResult
 
 
 @dataclass(frozen=True)
@@ -56,8 +56,15 @@ class PlannableScene:
         meshes = [*world, *hulls, *tool]
         self.mesh_count = len(meshes)
         self.scene = trimkit.CollisionScene([(mesh.vertices, mesh.faces) for mesh in meshes], convex=True)
-        # the link carrying each mesh: obstacles ride the base, which never moves
+        # the link carrying each mesh (obstacles ride the base, which never
+        # moves), and each joint's child, which turns about the joint's axis
+        # in its own frame, from its own origin
+        joints = robot.actuated_joints
         links = [robot.base_link] * len(world) + owners + [tool_link] * len(tool)
+        self.links = list(dict.fromkeys([*links, *(joint.child for joint in joints)]))
+        self.mesh_link = np.array([self.links.index(link) for link in links])
+        self.joint_link = np.array([self.links.index(joint.child) for joint in joints])
+        self.joint_axes = np.array([joint.axis for joint in joints])
 
         # forward kinematics once, symbolically, walking the chain as the URDF writes it
         angles = sympy.symbols(f"q:{robot.num_actuated_joints}")
@@ -66,18 +73,13 @@ class PlannableScene:
         for joint in robot.robot.joints:  # each joint's parent before it
             turn = rotation_matrix(turns[joint.name], joint.axis) if joint.name in turns else sympy.eye(4)
             pose[joint.child] = pose[joint.parent] * sympy.Matrix(joint.origin) * turn
-        # every mesh's instance matrix, then each joint's frame turned so its z is the joint's axis
-        joint_frames = [
-            pose[joint.child] * sympy.Matrix(align_vectors([0, 0, 1], joint.axis))
-            for joint in robot.actuated_joints
-        ]
-        entries = list(sympy.Matrix.vstack(*(pose[link] for link in links), *joint_frames))
+        entries = list(sympy.Matrix.vstack(*(pose[link] for link in self.links)))
         # numpy hands back the entries that never change as scalars, so fill those in once
         self.varies = np.array([bool(entry.free_symbols) for entry in entries])
         self.constants = np.array([0.0 if v else float(e) for e, v in zip(entries, self.varies, strict=True)])
         varying = [entry for entry, v in zip(entries, self.varies, strict=True) if v]
         self.kinematics = sympy.lambdify(angles, varying, modules="numpy", cse=True)
-        self.limits = np.array([(joint.limit.lower, joint.limit.upper) for joint in robot.actuated_joints])
+        self.limits = np.array([(joint.limit.lower, joint.limit.upper) for joint in joints])
 
         # which joints move each mesh, read off its pose: measure every obstacle
         # against the arm, and the arm's meshes `joint_gap` joints apart
@@ -86,32 +88,33 @@ class PlannableScene:
         a, b = np.triu_indices(self.mesh_count, 1)
         keep = (b >= len(world)) & ((a < len(world)) | (abs(depth[a] - depth[b]) >= joint_gap))
         self.pairs = np.stack([a[keep], b[keep]], axis=1)
+        self.pair_row = np.zeros((self.mesh_count, self.mesh_count), dtype=np.int64)
+        self.pair_row[a[keep], b[keep]] = np.arange(len(self.pairs))
 
     def forward(self, angles: np.ndarray) -> np.ndarray:
-        """
-        `(n, m + j, 4, 4)` poses for `(n, j)` joint angles: every mesh's
-        instance matrix, then each joint's frame, its z the joint's axis.
-        """
+        """`(n, l, 4, 4)` poses of `self.links` for `(n, j)` joint angles."""
         values = np.empty((len(angles), len(self.constants)))
         values[:] = self.constants
         values[:, self.varies] = np.array(self.kinematics(*angles.T)).T
         return values.reshape(len(angles), -1, 4, 4)
 
-    def measure(
-        self, poses: np.ndarray, upper_bound: float = np.inf
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def measure(self, poses: np.ndarray, within: float) -> tuple[np.ndarray, np.ndarray, CollisionResult]:
         """
-        Every pair's distance, closest points and normal at every waypoint, in
-        one `distances` call: instance `w * m + i` is mesh `i` at waypoint `w`.
+        The pairs closer than `within` at any waypoint, found by one `collides`
+        call over every waypoint (instance `w * m + i` is mesh `i` at waypoint
+        `w`), then measured by one `distances` call over just them: each one's
+        waypoint and row of `self.pairs`, and what `distances` found.
         """
         count = len(poses)
-        matrices = poses[:, : self.mesh_count].reshape(-1, 4, 4)
+        matrices = poses[:, self.mesh_link].reshape(-1, 4, 4)
         index = np.tile(np.arange(self.mesh_count, dtype=np.int64), count)
         pairs = (self.pairs + self.mesh_count * np.arange(count, dtype=np.int64)[:, None, None]).reshape(
             -1, 2
         )
-        found = self.scene.distances(matrices, index, pairs=pairs, upper_bound=upper_bound)
-        return found.distances, found.points, found.normals
+        near = self.scene.collides(matrices, index, pairs=pairs, margin=within).pairs
+        found = self.scene.distances(matrices, index, pairs=near)
+        waypoint, mesh = np.divmod(near, self.mesh_count)
+        return waypoint[:, 0], self.pair_row[mesh[:, 0], mesh[:, 1]], found
 
     def plan(self, guess: np.ndarray, *, clearance: float, smoothing: float, waypoint_count: int) -> Plan:
         """
@@ -135,20 +138,21 @@ class PlannableScene:
             nonlocal clear
             controls[1:-1] = free.reshape(-1, joint_count)
             poses = self.forward(weights @ controls)
-            distances, points, normals = self.measure(poses, target)
-            short = np.nonzero(distances < target)[0]
-            clear = len(short) == 0
-            shortfall = target - distances[short]
-            waypoint, pair = np.divmod(short, len(self.pairs))
+            waypoint, pair, found = self.measure(poses, target)
+            # 0 where the margin `collides` found it by and its distance
+            # disagree, within GJK's tolerance
+            shortfall = np.maximum(target - found.distances, 0.0)
+            clear = not shortfall.any()
             # how fast each side's closest point moves along the normal as each
-            # joint turns: `axis x (point - origin)`
-            joints = poses[waypoint, self.mesh_count :]
-            axes, origins = joints[:, :, :3, 2], joints[:, :, :3, 3]
-            slope = np.zeros((len(short), joint_count))
-            for side, sign in ((0, -1.0), (1, 1.0)):
-                velocity = np.cross(axes, points[short, None, side] - origins)
-                along = (velocity * normals[short, None]).sum(axis=-1)
-                slope += sign * along * self.moved[self.pairs[pair, side]]
+            # joint turns, `(axis x (point - origin)) . normal`, taken as
+            # `(point - origin) . (normal x axis)`, where the joint moves it
+            child = poses[:, self.joint_link]
+            axes = (child[..., :3, :3] @ self.joint_axes[..., None])[..., 0]
+            turn = np.cross(found.normals[:, None], axes[waypoint])
+            along = np.einsum("sik,sjk->sij", found.points, turn)
+            along -= np.einsum("sjk,sjk->sj", child[waypoint, :, :3, 3], turn)[:, None]
+            along *= self.moved[self.pairs[pair]]
+            slope = along[:, 1] - along[:, 0]
             bent = bend @ controls
             gradient = smoothing * bend.T @ bent - weights[waypoint].T @ (shortfall[:, None] * slope)
             value = 0.5 * (shortfall @ shortfall + smoothing * np.sum(bent**2))
@@ -178,7 +182,7 @@ class PlannableScene:
             controls[1:-1] = solved.x.reshape(-1, joint_count)
             path = BSpline(knots, controls.copy(), 3)
             # infinite when nothing at all comes within `clearance`
-            checked = self.measure(self.forward(path(checks)), clearance)[0].min()
+            checked = self.measure(self.forward(path(checks)), clearance)[2].distances.min(initial=np.inf)
             best = max(best, (checked, target, path), key=lambda round_: round_[0])
             if checked >= clearance:
                 break
@@ -222,6 +226,6 @@ if __name__ == "__main__":
     rounds = f"{plan.rounds} round" + ("s" if plan.rounds > 1 else "")
     print(
         f"planned in {plan.seconds * 1e3:.0f} ms: {plan.evaluations} L-BFGS-B evaluations of"
-        f" {waypoint_count * len(scene.pairs):,} pair distances each, aiming for {plan.target * 1e3:.1f} mm"
+        f" {waypoint_count * len(scene.pairs):,} pairs each, aiming for {plan.target * 1e3:.1f} mm"
         f" over {rounds}\nthen twenty times as many waypoints checked {checked}"
     )
