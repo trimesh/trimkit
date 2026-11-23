@@ -591,57 +591,182 @@ def longest_gil_stall(call, minimum: float = 0.2) -> float:
 SVG_ROWS = np.dtype(
     [
         ("kind", "u1"),
-        ("closes", "?"),
+        ("closes", "?"),  # a line back to its subpath's first vertex: a `Z`
         ("moves", "?"),  # starts a subpath: not on the vertex the last segment ended on
         ("start", "(2,)f8"),
         ("end", "(2,)f8"),
-        ("control", "(2,2)f8"),
-        ("radius", "(2,)f8"),
-        ("rotation", "f8"),
-        ("center", "(2,)f8"),
-        ("middle", "(2,)f8"),  # an arc's point halfway along its sweep
-        ("angles", "(2,)f8"),
+        ("control", "(2,2)f8"),  # a Bezier's, or a conic's in the first row
+        ("middle", "(2,)f8"),  # on the curve halfway along an arc, a conic or a cubic
+        ("center", "(2,)f8"),  # an arc's, from its `kind_data`
+        ("weight", "f8"),  # a conic's, from its `kind_data`
     ]
 )
 
 
-def evaluate_arc(arcs: np.ndarray, angle: np.ndarray) -> np.ndarray:
-    """
-    A point on each arc at `angle`, from its center parameterization.
-    """
-    phi = np.radians(arcs["rotation"])
-    rx, ry = arcs["radius"].T
-    x = rx * np.cos(angle)
-    y = ry * np.sin(angle)
-    return arcs["center"] + np.column_stack(
-        [np.cos(phi) * x - np.sin(phi) * y, np.sin(phi) * x + np.cos(phi) * y]
-    )
-
-
 def svg_rows(vertices: np.ndarray, segments: np.ndarray) -> np.ndarray:
     """
-    Expand indexed vertices and segments into one row per segment with every
-    point resolved, NaN where a kind has none.
+    Expand parsed SVG segments into one row per segment with every point
+    resolved, NaN where a kind has none.
+    """
+    kinds, points, data = segments["kind"], segments["points"], segments["kind_data"]
+    rows = np.zeros(len(segments), SVG_ROWS)
+    rows["kind"] = kinds
+    start, end = points[:, 0], points[:, 3]
+    rows["moves"][:1] = True
+    rows["moves"][1:] = start[1:] != end[:-1]
+    # each row's subpath starts on the vertex of the last row that moved
+    subpath = start[np.maximum.accumulate(np.where(rows["moves"], np.arange(len(kinds), dtype=np.int64), 0))]
+    rows["closes"] = (kinds == 0) & (end == subpath) & (start != subpath)
+    rows["start"], rows["end"] = vertices[start], vertices[end]
+    for field in ("control", "middle", "center", "weight"):
+        rows[field] = np.nan
+    for kind, slots in ((1, 1), (2, 2), (4, 1)):
+        chosen = kinds == kind
+        for slot in range(slots):
+            rows["control"][chosen, slot] = vertices[points[chosen, 1 + slot]]
+    arc = kinds == 3
+    rows["middle"][arc] = vertices[points[arc, 1]]
+    rows["center"][arc] = data[arc]
+    conic = kinds == 4
+    w = data[conic, :1]
+    rows["weight"][conic] = w[:, 0]
+    rows["middle"][conic] = (
+        rows["start"][conic] + 2 * w * rows["control"][conic, 0] + rows["end"][conic]
+    ) / (2 + 2 * w)
+    cubic = kinds == 2
+    rows["middle"][cubic] = (
+        rows["start"][cubic] + 3 * rows["control"][cubic].sum(axis=1) + rows["end"][cubic]
+    ) / 8
+    return rows
+
+
+def check_svg_arc(pieces: np.ndarray, ellipse, sweep_positive: bool, large: bool) -> None:
+    """
+    Every piece an SVG arc became lies on the ellipse `svg_reference.ellipse`
+    gives for it, in order and in the direction of travel, each at most 120
+    degrees with its middle halfway along it, and together the large arc
+    exactly when asked (or a half ellipse, from radii scaled up to reach).
+    An arc's center is the circle's.
+    """
+    center, radius_x, radius_y, phi = ellipse[:4]
+    cos, sin = math.cos(phi), math.sin(phi)
+    # rounding is relative to the coordinates, so in the unit frame it is
+    # each axis' extent over its radius: the tolerance follows a needle-thin
+    # ellipse far from the origin, but stays tight for an upright one
+    extent_x = abs(center[0]) + radius_x * abs(cos) + radius_y * abs(sin)
+    extent_y = abs(center[1]) + radius_x * abs(sin) + radius_y * abs(cos)
+    spread = (abs(cos) * extent_x + abs(sin) * extent_y) / radius_x
+    spread += (abs(sin) * extent_x + abs(cos) * extent_y) / radius_y
+    tolerance = 1e-9 * (1.0 + spread)
+
+    def angle_and_reach(point):
+        x, y = point[..., 0] - center[0], point[..., 1] - center[1]
+        u, v = (cos * x + sin * y) / radius_x, (-sin * x + cos * y) / radius_y
+        return np.arctan2(v, u), np.hypot(u, v)
+
+    def turned(angle):
+        return angle % (2 * math.pi) if sweep_positive else angle % (2 * math.pi) - 2 * math.pi
+
+    arcs = pieces[pieces["kind"] == 3]
+    assert np.abs(arcs["center"] - center).max(initial=0) <= tolerance * (
+        abs(center[0]) + abs(center[1]) + radius_x
+    )
+    total = 0.0
+    for row in pieces:
+        assert row["kind"] in (3, 4)
+        angles, reach = angle_and_reach(np.array([row["start"], row["middle"], row["end"]]))
+        assert np.abs(reach - 1).max() <= tolerance
+        sweep, half = turned(angles[2] - angles[0]), turned(angles[1] - angles[0])
+        assert abs(sweep) <= math.radians(120) + tolerance
+        assert abs(half - sweep / 2) <= tolerance
+        total += sweep
+    assert abs(abs(total) - math.pi) <= tolerance or (abs(total) > math.pi) == large
+
+
+def svg_round_trip(path: str) -> str:
+    """
+    Parse `path`, write it with 17 digits, and check that parsing what was
+    written gives back the same kinds and points, and the same vertices bit
+    for bit, except an arc's halfway point and a conic's control, recomputed
+    from the radii written, which come back within rounding, magnified by an
+    ellipse's eccentricity, as do an arc's center and a conic's weight.
+    Returns what was written.
     """
     import trimkit
 
-    rows = np.zeros(len(segments), SVG_ROWS)
-    for field in ("kind", "closes", "radius", "rotation", "angles"):
-        rows[field] = segments[field]
-    points = segments["points"]
-    rows["moves"][:1] = True
-    rows["moves"][1:] = points[1:, 0] != points[:-1, 3]
+    vertices, segments = trimkit.exchange.svg_parse(path)
+    written = trimkit.exchange.svg_string(vertices, segments, digits=17)
+    again_vertices, again = trimkit.exchange.svg_parse(written)
+    assert again["kind"].tobytes() == segments["kind"].tobytes()
+    assert again["points"].tobytes() == segments["points"].tobytes()
+    exact = np.ones(len(vertices), dtype=bool)
+    exact[segments["points"][segments["kind"] >= 3, 1]] = False
+    assert again_vertices[exact].tobytes() == vertices[exact].tobytes()
+    scale = 1.0 + np.abs(vertices).max(initial=0)
+    assert np.abs(again_vertices[~exact] - vertices[~exact]).max(initial=0) <= 1e-11 * scale
+    arc, conic = segments["kind"] == 3, segments["kind"] == 4
+    reach = 1.0 + np.abs(segments["kind_data"][arc]).max(initial=0)
+    assert np.abs(again["kind_data"][arc] - segments["kind_data"][arc]).max(initial=0) <= 1e-11 * max(
+        scale, reach
+    )
+    assert np.abs(again["kind_data"][conic] - segments["kind_data"][conic]).max(initial=0) <= 1e-12
+    rest = ~(arc | conic)
+    assert (again["kind_data"][rest] == 0).all() and (segments["kind_data"][rest] == 0).all()
+    return written
 
-    def at(k):
-        out = np.full((len(points), 2), np.nan)
-        used = points[:, k] >= 0
-        out[used] = vertices[points[used, k]]
-        return out
 
-    arc = (segments["kind"] == trimkit.exchange.SvgKind.ARC)[:, None]
-    rows["start"], rows["end"] = at(0), at(3)
-    rows["control"][:, 0] = np.where(arc, np.nan, at(1))
-    rows["control"][:, 1] = np.where(arc, np.nan, at(2))
-    rows["center"] = np.where(arc, at(1), np.nan)
-    rows["middle"] = np.where(arc, at(2), np.nan)
-    return rows
+def check_svg_segments(rows: np.ndarray, expected: list, reference) -> None:
+    """
+    `svg_rows` of a parse against `svg_reference.evaluate`'s segments for the
+    same data (`reference` is that module). Lines and Beziers are the same
+    doubles: both parses round correctly, and the arithmetic on them is the
+    spec's, in the same order. An arc is one, two or four pieces, the last
+    ending exactly where it ends, all on the reference's ellipse
+    (`check_svg_arc`). Or it is a line, where its middle is within rounding
+    of its chord, or no double can place a center for it at all.
+    """
+    position = 0
+    for e in expected:
+        row = rows[position]
+        assert row["moves"] == e["moves"] and row["start"].tolist() == list(e["start"])
+        if e["kind"] != reference.ARC or row["kind"] == 0:
+            assert row["kind"] == e["kind"] or e["kind"] == reference.ARC
+            assert bool(row["closes"]) == bool(e["flags"] & reference.CLOSE)
+            assert row["end"].tolist() == list(e["end"])
+            used = len(e.get("control", ()))
+            assert row["control"][:used].tolist() == [list(c) for c in e.get("control", ())]
+            assert np.isnan(row["control"][used:]).all()
+            if e["kind"] == reference.ARC:
+                arc = reference.ellipse(
+                    e["start"],
+                    e["end"],
+                    *e["radius"],
+                    e["rotation"],
+                    large=bool(e["flags"] & reference.LARGE_ARC),
+                    sweep=bool(e["flags"] & reference.SWEEP),
+                )
+                if arc is not None:
+                    middle = np.array(reference.arc_point(arc, arc[4] + arc[5] / 2))
+                    chord = (np.array(e["start"]) + np.array(e["end"])) / 2
+                    scale = 1.0 + np.abs(arc[0]).sum() + arc[1] + arc[2]
+                    assert np.abs(middle - chord).max() <= 1e-12 * scale
+            position += 1
+            continue
+        pieces = 1
+        while rows["end"][position + pieces - 1].tolist() != list(e["end"]):
+            pieces += 1
+        assert pieces in (1, 2, 4)
+        group = rows[position : position + pieces]
+        assert not group["moves"][1:].any() and not group["closes"].any()
+        # the pieces of one arc carry one center, exactly
+        assert (group["center"][group["kind"] == 3] == group["center"][0]).all()
+        circle = e["radius"][0] == e["radius"][1]
+        assert (group["kind"] == (3 if circle else 4)).all() or (not circle and (group["kind"] == 1).all())
+        if group["kind"][0] != 1:
+            large, sweep = bool(e["flags"] & reference.LARGE_ARC), bool(e["flags"] & reference.SWEEP)
+            arc = reference.ellipse(
+                e["start"], e["end"], *e["radius"], e["rotation"], large=large, sweep=sweep
+            )
+            check_svg_arc(group, arc, sweep, large)
+        position += pieces
+    assert position == len(rows)

@@ -3,16 +3,15 @@
 and an independent reading of the spec, `svg_reference`.
 
 - It accepts exactly the `LENIENT` language, and so all of `STRICT`.
-- Every segment it emits is bit-identical to the reference's, and every arc's
-  center parameterization reproduces its endpoints, flags and direction.
+- Every line and Bezier it emits is bit-identical to the reference's, and
+  every arc's pieces lie on the reference's ellipse, in its direction.
 - Malformed data keeps exactly the segments before the error.
 - It agrees with `svg.path`, the package it replaces in trimesh.
 """
 
-import numpy as np
 import pytest
 import svg_reference as ref
-from helpers import evaluate_arc, svg_rows
+from helpers import check_svg_segments, svg_round_trip, svg_rows
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from hypothesis.extra.lark import from_lark
@@ -134,51 +133,7 @@ def test_strict_paths_are_strict(d):
 def test_segments_match_reference(d):
     commands = ref.parse(ref.LENIENT_PARSER, d)
     assert commands is not None
-    expected = ref.evaluate(commands)
-    s = svg_rows(*trimkit.exchange.svg_parse(d))
-    assert len(s) == len(expected)
-    for row, e in zip(s, expected, strict=True):
-        # the same doubles: both parses round correctly, and the arithmetic
-        # on them is the spec's, in the same order
-        assert row["kind"] == e["kind"] and bool(row["closes"]) == bool(e["flags"] & ref.CLOSE)
-        assert row["moves"] == e["moves"]
-        assert row["start"].tolist() == list(e["start"])
-        assert row["end"].tolist() == list(e["end"])
-        used = len(e.get("control", ()))
-        assert row["control"][:used].tolist() == [list(c) for c in e.get("control", ())]
-        assert np.isnan(row["control"][used:]).all()
-        if e["kind"] == ref.ARC:
-            assert row["rotation"] == e["rotation"]
-            # the radii as written, or scaled up together to just reach both
-            # endpoints, which leaves a half ellipse (F.6.6)
-            k = row["radius"] / np.array(e["radius"])
-            assert np.isclose(k[0], k[1], rtol=1e-12) and k.min() >= 1 - 1e-12
-            if not np.isclose(abs(row["angles"][1]), np.pi, rtol=1e-9):
-                assert row["radius"].tolist() == list(e["radius"])
-    arc_flags = np.array([e["flags"] for e in expected if e["kind"] == ref.ARC], dtype=np.int64)
-    _check_arcs(s[s["kind"] == trimkit.exchange.SvgKind.ARC], arc_flags)
-
-
-def _check_arcs(arcs: np.ndarray, flags: np.ndarray) -> None:
-    # every arc's center parameterization reproduces both its endpoints and
-    # its halfway point, its
-    # direction is the sweep flag as written (`flags`, from the reference),
-    # and it is the large arc exactly when asked
-    # (radii scaled up to reach both endpoints make a half ellipse, F.6.6).
-    # With the radii checked against the input, that leaves one center
-    start, sweep = arcs["angles"].T
-    scale = 1.0 + np.abs(arcs["center"]).sum(axis=1) + arcs["radius"].sum(axis=1)
-    for angle, point in (
-        (start, arcs["start"]),
-        (start + sweep / 2, arcs["middle"]),
-        (start + sweep, arcs["end"]),
-    ):
-        on = evaluate_arc(arcs, angle)
-        assert (np.abs(on - point).max(axis=1, initial=0) <= 1e-9 * scale).all()
-    assert np.array_equal(sweep > 0, (flags & ref.SWEEP) > 0)
-    half = np.isclose(np.abs(sweep), np.pi, rtol=1e-9)
-    large = (flags & ref.LARGE_ARC) > 0
-    assert (half | ((np.abs(sweep) > np.pi) == large)).all()
+    check_svg_segments(svg_rows(*trimkit.exchange.svg_parse(d)), ref.evaluate(commands), ref)
 
 
 @SETTINGS
@@ -186,7 +141,7 @@ def _check_arcs(arcs: np.ndarray, flags: np.ndarray) -> None:
 def test_error_keeps_the_prefix(d, bad):
     # SVG renders up to the command with the first error
     whole, prefix = trimkit.exchange.svg_parse(d + bad + SENTINEL), trimkit.exchange.svg_parse(d)
-    assert whole[0].tobytes() == prefix[0].tobytes() and whole[1].tobytes() == prefix[1].tobytes()
+    assert [a.tobytes() for a in whole] == [a.tobytes() for a in prefix]
 
 
 @SETTINGS
@@ -211,54 +166,43 @@ def test_matches_svg_path(d):
         old.append(seg)
     old = [seg for seg in old if not isinstance(seg, Move)]
     s = svg_rows(*trimkit.exchange.svg_parse(d))
-    assert len(old) == len(s)
-    for seg, row in zip(old, s, strict=True):
+    position = 0
+    for seg in old:
+        row = s[position]
         assert [seg.start.real, seg.start.imag] == row["start"].tolist()
+        if isinstance(seg, Arc) and row["kind"] != trimkit.exchange.SvgKind.LINE:
+            # an arc's pieces, the last ending where it ends. Their points
+            # aren't compared: svg.path's are only good to about 1e-6, and
+            # wrong for extreme radii, while `check_svg_arc` pins ours
+            end = [seg.end.real, seg.end.imag]
+            while s["end"][position].tolist() != end:
+                position += 1
+            position += 1
+            continue
+        position += 1
         assert [seg.end.real, seg.end.imag] == row["end"].tolist()
         kind = {
+            Arc: trimkit.exchange.SvgKind.LINE,  # one no ellipse in doubles describes
             Line: trimkit.exchange.SvgKind.LINE,
             Close: trimkit.exchange.SvgKind.LINE,
             QuadraticBezier: trimkit.exchange.SvgKind.QUADRATIC,
             CubicBezier: trimkit.exchange.SvgKind.CUBIC,
         }
-        # arc centers aren't compared: svg.path's are only good to about 1e-6
-        # and wrong for extreme radii, while `_check_arcs` pins ours exactly.
-        # svg.path draws every arc with nonzero radii, where we draw a line for
-        # one with no ellipse within the coordinate bound (`_drawable`)
-        if (
-            isinstance(seg, Arc)
-            and seg.radius.real != 0
-            and seg.radius.imag != 0
-            and ref._drawable(
-                (seg.start.real, seg.start.imag),
-                (seg.end.real, seg.end.imag),
-                seg.radius.real,
-                seg.radius.imag,
-                seg.rotation,
-            )
-        ):
-            assert row["kind"] == trimkit.exchange.SvgKind.ARC
-        elif isinstance(seg, Arc):
-            assert row["kind"] == trimkit.exchange.SvgKind.LINE
-        else:
-            assert row["kind"] == kind[type(seg)]
-            assert bool(row["closes"]) == isinstance(seg, Close)
+        assert row["kind"] == kind[type(seg)]
+        assert bool(row["closes"]) == isinstance(seg, Close)
         if isinstance(seg, CubicBezier):
             assert row["control"].tolist() == [[c.real, c.imag] for c in (seg.control1, seg.control2)]
         if isinstance(seg, QuadraticBezier):
             assert row["control"][0].tolist() == [seg.control.real, seg.control.imag]
+    assert position == len(s)
 
 
 @SETTINGS
 @given(paths())
 def test_string_round_trips(d):
     # whatever the grammar allows, writing the segments back and parsing
-    # them again gives the same segments, bit for bit, NaN slots included
-    vertices, segments = trimkit.exchange.svg_parse(d)
-    written = trimkit.exchange.svg_string(vertices, segments)
-    again = trimkit.exchange.svg_parse(written)
-    assert again[0].tobytes() == vertices.tobytes() and again[1].tobytes() == segments.tobytes()
-    # and what is written is path data the reference grammar accepts: the
-    # lenient one only for a signed arc rotation, kept as parsed (SVG 1.1).
-    # Arcs are written with their F.6.6-scaled radii, the same ellipse
+    # them again gives the same segments (`svg_round_trip`), and what is
+    # written is path data the reference grammar accepts: the lenient one
+    # only for a signed arc rotation (SVG 1.1)
+    written = svg_round_trip(d)
     assert ref.parse(ref.LENIENT_PARSER, written) is not None or written == ""

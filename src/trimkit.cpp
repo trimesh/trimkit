@@ -364,7 +364,7 @@ DracoKind : enum.IntEnum
 SvgKind : enum.IntEnum
   What drew an SvgSegment, its `kind` field.
 SvgSegment : numpy.dtype
-  One drawing command of an SVG path, as `svg_parse` returns them and
+  One segment of an SVG path, as `svg_parse` returns them and
   `svg_string` takes them.
 
 Examples

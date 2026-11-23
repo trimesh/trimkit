@@ -1,17 +1,19 @@
-// `format` on raw, hand-built rows rather than on what `parse` produced: the
-// first byte picks how many vertices follow as doubles, and the rest are
-// Segment rows, any bit pattern at all.
+// `format` on raw, hand-built segments rather than on what `parse` produced:
+// two bytes pick how many vertices follow and how many digits to write, then
+// the vertices as doubles, any bit pattern, then segments of 21 bytes each:
+// the kind as a byte, any value, four indices as bytes near the vertex range
+// (some past it, some negative), and kind_data as two doubles, any bits.
 //
-// Properties: every finite double is written as std::to_chars writes it,
-// `format` reads only what it validated (the sanitizers check that), and
-// whatever it accepts is path data that parses completely and
-// then round trips byte for byte. Without arcs, which `parse` may legally
-// rewrite (radii scaled up, a zero-length arc dropped), the parse gives back
-// exactly the input's kinds, closes flags and coordinates (with -0 read as
-// 0, since an absolute coordinate is 0 + the number written).
+// Properties: every finite double written with 17 digits reads back as
+// itself, `format` reads only what it validated (the sanitizers check that),
+// a refusal names a segment that exists or the arguments as a whole, and
+// whatever it accepts is path data that parses completely, and formats
+// again. At 17 digits and without arcs or conics, which are recomputed from
+// the radii written and split past MAX_ARC, the parse gives back exactly the
+// input's kinds and the coordinates of every point they name (with -0 read
+// as 0, since an absolute coordinate is 0 + the number written).
 #include "../../src/svgpath.hpp"
 
-#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -20,86 +22,87 @@
 #include <vector>
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
-    if (size < 1) {
+    if (size < 2) {
         return 0;
     }
     const std::size_t vertex_count = data[0] % 17;
+    const int digits = data[1] % 19;  // 0 and 18 are refused
     const std::size_t vertex_bytes = vertex_count * 2 * sizeof(double);
-    if (size - 1 < vertex_bytes) {
+    if (size < 2 + vertex_bytes) {
         return 0;
     }
-    // copied out to aligned storage, as numpy's arrays are
-    std::vector<double> vertices(2 * vertex_count);
-    if (vertex_bytes > 0) {
-        std::memcpy(vertices.data(), data + 1, vertex_bytes);
+    const std::uint8_t* cursor = data + 2;
+    svgpath::SvgPath path;
+    path.vertices.resize(2 * vertex_count);
+    if (vertex_count > 0) {
+        std::memcpy(path.vertices.data(), cursor, vertex_bytes);
     }
-    const std::size_t segment_count = (size - 1 - vertex_bytes) / sizeof(svgpath::Segment);
-    std::vector<svgpath::Segment> segments(segment_count);
-    if (segment_count > 0) {
-        std::memcpy(segments.data(), data + 1 + vertex_bytes, segment_count * sizeof(svgpath::Segment));
+    cursor += vertex_bytes;
+    constexpr std::size_t SEGMENT_BYTES = 1 + 4 + (2 * sizeof(double));
+    for (std::size_t left = size - 2 - vertex_bytes; left >= SEGMENT_BYTES; left -= SEGMENT_BYTES) {
+        svgpath::SvgSegment segment = {cursor[0], {}, {}, {}};
+        for (int slot = 0; slot < 4; slot++) {
+            segment.points[slot] = static_cast<std::int64_t>(cursor[1 + slot] % 20) - 2;
+        }
+        std::memcpy(segment.kind_data, cursor + 5, sizeof(segment.kind_data));
+        path.segments.push_back(segment);
+        cursor += SEGMENT_BYTES;
     }
 
-    // svgpath writes numbers exactly as std::to_chars does, character for
-    // character, for every finite double the fuzzer makes
-    for (const double value : vertices) {
-        if (!std::isfinite(value)) {
+    // every finite double, written with 17 digits, reads back as itself
+    for (const double value : path.vertices) {
+        if (!svgpath::within(value)) {
             continue;
         }
-        char expected[64];
-        const std::to_chars_result result = std::to_chars(expected, expected + sizeof(expected), value);
-        std::string number;
-        svgpath::write_number(&number, value);
-        if (number != std::string(expected, result.ptr)) {
+        char number[svgpath::MOST_NUMBER_CHARACTERS];
+        const char* end = svgpath::write_number(number, value, 17);
+        double read = 0.0;
+        svgpath::PathDataReader reader = {number, static_cast<std::size_t>(end - number), 0};
+        if (!svgpath::read_number(&reader, &read) || reader.offset != reader.size ||
+            std::memcmp(&read, &value, sizeof(double)) != 0) {
             __builtin_trap();
         }
     }
 
     std::string written;
     std::size_t refused = 0;
-    if (svgpath::format(vertices.data(), vertex_count, segments.data(), segment_count, &written, &refused) != nullptr) {
-        if (refused >= segment_count) {
-            __builtin_trap();  // a refusal names a segment that exists
+    if (svgpath::format(&path, digits, &written, &refused) != nullptr) {
+        if (refused > path.segments.size()) {
+            __builtin_trap();  // a refusal names a segment that exists, or all of them
         }
         return 0;
     }
-    svgpath::Path parsed;
+    svgpath::SvgPath parsed;
     if (svgpath::parse(written.data(), written.size(), &parsed) != written.size()) {
         __builtin_trap();  // everything `format` writes is path data
     }
     std::string rewritten;
-    if (svgpath::format(parsed.vertices.data(), parsed.vertices.size() / 2, parsed.segments.data(),
-                        parsed.segments.size(), &rewritten, &refused) != nullptr) {
-        __builtin_trap();
-    }
-    svgpath::Path again;
-    static_cast<void>(svgpath::parse(rewritten.data(), rewritten.size(), &again));
-    if (again.vertices.size() != parsed.vertices.size() || again.segments.size() != parsed.segments.size() ||
-        (!parsed.vertices.empty() &&
-         std::memcmp(again.vertices.data(), parsed.vertices.data(), parsed.vertices.size() * sizeof(double)) != 0) ||
-        (!parsed.segments.empty() && std::memcmp(again.segments.data(), parsed.segments.data(),
-                                                 parsed.segments.size() * sizeof(svgpath::Segment)) != 0)) {
+    if (svgpath::format(&parsed, digits, &rewritten, &refused) != nullptr) {
         __builtin_trap();
     }
 
-    for (std::size_t index = 0; index < segment_count; index++) {
-        if (segments[index].kind == svgpath::ARC) {
+    for (const svgpath::SvgSegment& segment : path.segments) {
+        if (segment.kind == svgpath::ARC || segment.kind == svgpath::CONIC) {
             return 0;
         }
     }
-    if (parsed.segments.size() != segment_count) {
-        __builtin_trap();
+    if (digits != 17 || parsed.segments.size() != path.segments.size()) {
+        if (digits == 17) {
+            __builtin_trap();
+        }
+        return 0;
     }
-    for (std::size_t index = 0; index < segment_count; index++) {
-        const svgpath::Segment* given = &segments[index];
-        const svgpath::Segment* read = &parsed.segments[index];
-        if (given->kind != read->kind || (given->closes != 0) != (read->closes != 0)) {
+    for (std::size_t index = 0; index < path.segments.size(); index++) {
+        const svgpath::SvgSegment* given = &path.segments[index];
+        const svgpath::SvgSegment* read = &parsed.segments[index];
+        if (given->kind != read->kind) {
             __builtin_trap();
         }
         for (int slot = 0; slot < 4; slot++) {
             if (read->points[slot] < 0) {
                 continue;  // a slot this kind doesn't use
             }
-            const double* expected = &vertices[2 * static_cast<std::size_t>(given->points[slot])];
+            const double* expected = &path.vertices[2 * static_cast<std::size_t>(given->points[slot])];
             const double* actual = &parsed.vertices[2 * static_cast<std::size_t>(read->points[slot])];
             if (expected[0] != actual[0] || expected[1] != actual[1]) {
                 __builtin_trap();

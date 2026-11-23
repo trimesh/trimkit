@@ -81,11 +81,10 @@ def case_svg_parse(data: atheris.FuzzedDataProvider):
     assert segments.dtype == trimkit.exchange.SvgSegment and segments["points"].max(initial=-1) < len(
         vertices
     )
-    # the round trip holds for anything parsed
-    written = trimkit.exchange.svg_string(vertices, segments)
-    again = trimkit.exchange.svg_parse(written)
-    assert again[0].tobytes() == vertices.tobytes() and again[1].tobytes() == segments.tobytes()
-    assert trimkit.exchange.svg_string(*again) == written
+    # anything parsed writes, and what is written parses (check/fuzz/svgpath.cpp
+    # checks what comes back)
+    written = trimkit.exchange.svg_string(vertices, segments, digits=17)
+    trimkit.exchange.svg_string(*trimkit.exchange.svg_parse(written))
     return result
 
 
@@ -94,7 +93,9 @@ def case_svg_string(data: atheris.FuzzedDataProvider):
     size = trimkit.exchange.SvgSegment.itemsize
     raw = data.ConsumeBytes(size * data.ConsumeIntInRange(0, 4))
     segments = np.frombuffer(raw[: len(raw) // size * size], dtype=np.uint8).view(trimkit.exchange.SvgSegment)
-    result = trimkit.exchange.svg_string(array(data, 2, np.float64), segments)
+    result = trimkit.exchange.svg_string(
+        array(data, 2, np.float64), segments, digits=data.ConsumeIntInRange(-2, 20)
+    )
     return result
 
 

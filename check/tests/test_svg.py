@@ -1,46 +1,78 @@
-import decimal
+import contextlib
 import math
+import struct
+import sys
+import threading
 
 import numpy as np
 import pytest
-from helpers import evaluate_arc, svg_rows
+import svg_reference as ref
+from helpers import check_svg_arc, check_svg_segments, svg_round_trip, svg_rows
 
 import trimkit
+
+X = trimkit.exchange
+LINE, QUADRATIC, CUBIC, ARC, CONIC = (int(k) for k in X.SvgKind)
 
 
 def rows(path: str) -> np.ndarray:
     # every segment with its points resolved, to check against references
-    return svg_rows(*trimkit.exchange.svg_parse(path))
+    return svg_rows(*X.svg_parse(path))
 
 
 def test_commands():
-    vertices, segments = trimkit.exchange.svg_parse(
+    vertices, segments = X.svg_parse(
         "M10 10 h5 v5 l-5-5 Z m1 1 C1 2 3 4 5 6 s1 1 2 2 q1 1 2 2 t3 3 a5 5 0 1 0 10 0"
     )
-    assert segments.dtype == trimkit.exchange.SvgSegment and segments.dtype.itemsize == 80
+    assert segments.dtype == X.SvgSegment and segments.dtype.itemsize == 56
     assert vertices.dtype == np.float64 and vertices.shape[1] == 2
     # shared, not repeated: each segment starts where the last ended, and the
     # close ends on the subpath's first vertex
     points = segments["points"]
     assert (points[1:4, 0] == points[0:3, 3]).all() and points[3, 3] == points[0, 0]
     s = svg_rows(vertices, segments)
-    assert s["kind"].tolist() == [0, 0, 0, 0, 2, 2, 1, 1, 3]
+    # the half circle is two arcs of 90 degrees
+    assert s["kind"].tolist() == [0, 0, 0, 0, 2, 2, 1, 1, 3, 3]
     # only the `m` after the close starts on a new vertex
-    assert s["moves"].tolist() == [True, False, False, False, True, False, False, False, False]
-    assert s["closes"].tolist() == [False, False, False, True, False, False, False, False, False]
+    assert s["moves"].tolist() == [True] + [False] * 3 + [True] + [False] * 5
+    assert s["closes"].tolist() == [False, False, False, True] + [False] * 6
     # relative moves after a close are from the closed subpath's start
     assert s["start"][4].tolist() == [11, 11]
     # smooth curves reflect the previous control point about the current point
     assert s["control"][5].tolist() == [[7, 8], [6, 7]]
     assert s["control"][7][0].tolist() == [10, 11]
-    # a half circle of radius 5 sweeping counter-clockwise in y-down space
-    arc = s[-1]
-    assert np.allclose(arc["center"], [17, 13])
-    assert np.allclose(arc["angles"], [np.pi, -np.pi])
-    assert np.allclose(arc["middle"], [17, 18])
-    # slots a kind doesn't use are NaN
-    assert np.isnan(s["control"][0]).all()
-    assert np.isnan(s["control"][6][1]).all()
+    # a half circle of radius 5 the large way round (any way is half), sweep
+    # flag 0: through (17, 18), each arc's middle a quarter of the way along,
+    # and both arcs carry its center, the chord's midpoint, exactly
+    arcs = s[-2:]
+    assert arcs["end"][0].tolist() == [17, 18] and arcs["end"][1].tolist() == [22, 13]
+    quarter = 5 / 2**0.5
+    assert np.allclose(arcs["middle"], [[17 - quarter, 13 + quarter], [17 + quarter, 13 + quarter]])
+    assert arcs["center"].tolist() == [[17, 13], [17, 13]]
+    # slots a kind doesn't use are -1, and kind_data it doesn't use 0
+    assert (points[:4, 1:3] == -1).all() and (points[6:8, 2] == -1).all() and (points[8:, 2] == -1).all()
+    assert (segments["kind_data"][:8] == 0).all()
+
+
+@pytest.mark.skipif(sys.byteorder != "little", reason="the golden bytes are little-endian")
+def test_layout_is_pinned():
+    # one record per segment, meant to stay readable for decades: kind, seven
+    # zero bytes, four int64 vertex indices, two float64 of kind_data
+    assert X.SvgSegment.itemsize == 56
+    assert [(name, X.SvgSegment.fields[name][1]) for name in X.SvgSegment.names] == [
+        ("kind", 0),
+        ("points", 8),
+        ("kind_data", 40),
+    ]
+    vertices, segments = X.svg_parse("M0 0 L1 0 Q1 1 2 1 C3 1 3 2 4 2 Z")
+    golden = [(0, (0, -1, -1, 1)), (1, (1, 2, -1, 3)), (2, (3, 4, 5, 6)), (0, (6, -1, -1, 0))]
+    assert segments.tobytes() == b"".join(struct.pack("<B7x4q2d", k, *p, 0.0, 0.0) for k, p in golden)
+    corners = [[0, 0], [1, 0], [1, 1], [2, 1], [3, 1], [3, 2], [4, 2]]
+    assert vertices.tobytes() == np.array(corners, "<f8").tobytes()
+    # an arc's kind_data is its center, a conic's its weight then 0
+    _, arcs = X.svg_parse("M0 0 A1 1 0 0 1 1 1 A2 1 0 0 1 3 2")
+    assert arcs["kind"].tolist() == [ARC, CONIC]
+    assert np.allclose(arcs["kind_data"][0], [0, 1]) and np.allclose(arcs["kind_data"][1], [0.5**0.5, 0])
 
 
 @pytest.mark.parametrize(
@@ -59,39 +91,50 @@ def test_grammar(d, expected):
     if expected is not None:
         assert np.column_stack([s["start"], s["end"]]).reshape((-1, 4)).tolist() == expected
     else:
-        assert s["kind"].tolist() == [trimkit.exchange.SvgKind.ARC]
+        assert s["kind"].tolist() == [ARC]
 
 
-def test_chained_and_arcs_consistent():
-    # a long random path of every command: the end of each segment is the start
-    # of the next within a subpath, and every arc's center parameterization
-    # reproduces both its endpoints, which checks the whole F.6.5 conversion
-    rng = np.random.default_rng(0)
+@pytest.mark.parametrize("sweep", [0, 1])
+def test_chained_and_arcs_consistent(sweep):
+    # a long random path of every command: the end of each segment is the
+    # start of the next, and every arc's pieces lie on its ellipse in order
+    rng = np.random.default_rng(sweep)
     parts = ["M 0 0"]
     for _ in range(2000):
         c = rng.choice(list("LHVCSQTAlhvcsqta"))
         if c in "Aa":
-            rx, ry, rot = [*rng.uniform(0.1, 5, 2).tolist(), rng.uniform(0, 360)]
-            flags = rng.integers(0, 2, 2)
-            x, y = rng.uniform(-5, 5, 2)
-            parts.append(f"{c}{rx} {ry} {rot} {flags[0]} {flags[1]} {x} {y}")
+            rx, ry, rot = [*rng.uniform(0.1, 5, 2).tolist(), float(rng.uniform(0, 360))]
+            if rng.integers(0, 3) == 0:
+                ry = rx
+            large = int(rng.integers(0, 2))
+            x, y = rng.uniform(-5, 5, 2).tolist()
+            parts.append(f"{c}{rx!r} {ry!r} {rot!r} {large} {sweep} {x!r} {y!r}")
         else:
             n = {"L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2}[c.upper()]
             parts.append(c + " ".join(f"{v:.6g}" for v in rng.uniform(-5, 5, n)))
-    s = rows(" ".join(parts))
-    assert len(s) == 2000  # no command was dropped
-    assert np.allclose(s["end"][:-1], s["start"][1:])
+    d = " ".join(parts)
+    s = rows(d)
+    assert np.array_equal(s["end"][:-1], s["start"][1:])
+    check_svg_segments(s, ref.evaluate(ref.parse(ref.LENIENT_PARSER, d)), ref)
+    conics = s["weight"][s["kind"] == CONIC]
+    assert len(conics) and (conics >= 0.5).all() and (conics < 1).all()
 
-    arcs = s[s["kind"] == trimkit.exchange.SvgKind.ARC]
-    assert len(arcs) > 50
-    start, sweep = arcs["angles"].T
-    assert np.allclose(evaluate_arc(arcs, start), arcs["start"], atol=1e-9)
-    assert np.allclose(evaluate_arc(arcs, start + sweep), arcs["end"], atol=1e-9)
-    assert np.allclose(evaluate_arc(arcs, start + sweep / 2), arcs["middle"], atol=1e-9)
-    # the sweep flag decides the direction of travel
-    flags = [p for p in parts if p[0] in "Aa"]
-    written = np.array([int(p.split()[4]) for p in flags])
-    assert np.array_equal(sweep > 0, written[: len(sweep)] == 1)
+
+@pytest.mark.parametrize(
+    ("degrees", "pieces"),
+    [(1, 1), (60, 1), (119, 1), (121, 2), (179, 2), (181, 2), (239, 2), (241, 4), (300, 4), (359, 4)],
+)
+@pytest.mark.parametrize("radii", ["1 1", "2 1"])
+def test_arcs_split_at_120_degrees(degrees, pieces, radii):
+    # every piece is at most 120 degrees: two past it, four past twice it
+    angle = math.radians(degrees)
+    # on the unit circle, or that circle stretched to an ellipse twice as wide
+    width = 2.0 if radii == "2 1" else 1.0
+    end = (width * math.cos(angle), math.sin(angle))
+    s = rows(f"M{width!r} 0 A{radii} 0 {int(degrees > 180)} 1 {end[0]!r} {end[1]!r}")
+    assert len(s) == pieces
+    assert (s["kind"] == (ARC if width == 1 else CONIC)).all()
+    check_svg_arc(s, ((0.0, 0.0), width, 1.0, 0.0), True, degrees > 180)
 
 
 @pytest.mark.parametrize(
@@ -107,7 +150,7 @@ def test_chained_and_arcs_consistent():
 )
 def test_malformed_keeps_prefix(d, count):
     # like an SVG renderer, everything before the first error is kept
-    assert len(trimkit.exchange.svg_parse(d)[1]) == count
+    assert len(X.svg_parse(d)[1]) == count
 
 
 @pytest.mark.parametrize("rx", ["1e150", "2e30"])
@@ -116,37 +159,46 @@ def test_radii_past_the_bound(rx):
     assert len(rows(f"M1 0 L2 0 A{rx} 12 0 0 1 1 14")) == 1
 
 
-def test_arc_reaching_past_the_bound_is_a_line():
-    # radii scaled up (F.6.6) past 1e30 to reach their endpoints make an
-    # ellipse reaching past it: like subnormal ones, that arc is a line
-    assert rows("M0 0 A1 1e-291 0 0 0 0 1")["kind"].tolist() == [trimkit.exchange.SvgKind.LINE]
+@pytest.mark.parametrize(
+    "path",
+    [
+        # radii scaled up (F.6.6) past 1e30 to reach their endpoints make an
+        # ellipse reaching past it: like subnormal ones, that arc is a line
+        "M0 0 A1 1e-291 0 0 0 0 1",
+        # found by fuzzing: a chord of 1e-300 against radii of 1e30 underflows
+        # (the endpoints coincide as far as the ellipse can tell)
+        "M0 0 A1e30 1e30 0 0 1 1e-300 0",
+        # an arc whose middle lies closer to its chord than the coordinates'
+        # precision: three points on one line, so its chord
+        "M1e6 1e6 A1e30 1e30 0 0 1 1000001 1000001",
+        "M1 0 A3.2e-168 12 0 0 1 1 14",
+        # all the way round a circle of 1e30 reaches past the bound
+        "M0 0 A1e30 1e30 0 1 1 1 0",
+        # a circle bulging toward the origin, its center past the bound
+        "M1e30 0 A1e30 1e30 0 0 0 1e30 1e29",
+    ],
+)
+def test_arcs_no_double_describes_are_lines(path):
+    assert rows(path)["kind"].tolist() == [LINE]
 
 
-def test_arc_below_its_radii_precision_is_a_line():
-    # found by fuzzing: a chord of 1e-300 against radii of 1e30 underflows the
-    # center conversion to nothing (the endpoints coincide as far as the
-    # ellipse can tell), so that arc is its chord
-    assert rows("M0 0 A1e30 1e30 0 0 1 1e-300 0")["kind"].tolist() == [trimkit.exchange.SvgKind.LINE]
-
-
-@pytest.mark.parametrize("rx", ["3.2e-168", "1e-300", "1e30"])
-def test_extreme_radii(rx):
-    # found by fuzzing: squaring radii like these underflowed or overflowed the
-    # center conversion, so the arc no longer passed through its endpoints
-    s = rows(f"M1 0 A{rx} 12 0 0 1 1 14")
-    assert s["kind"].tolist() == [trimkit.exchange.SvgKind.ARC]
-    assert all(np.isfinite(s[k]).all() for k in ("center", "radius", "angles"))
-    # a huge radius puts the center equally far away, so error is relative to it
-    scale = 1 + np.abs(s["center"]).sum() + s["radius"].sum()
-    start, sweep = s["angles"].T
-    assert np.abs(evaluate_arc(s, start) - s["start"]).max() < 1e-12 * scale
-    assert np.abs(evaluate_arc(s, start + sweep) - s["end"]).max() < 1e-12 * scale
+@pytest.mark.parametrize(
+    ("rx", "ry"), [("1e30", "12"), ("1e-300", "1e-300"), ("3.2e-168", "3.2e-168"), ("1e7", "3e7")]
+)
+def test_extreme_radii(rx, ry):
+    # found by fuzzing: radii like these underflowed or overflowed the center
+    # conversion, so the arc no longer passed through its endpoints. Tiny
+    # radii are scaled up to reach, a half circle
+    s = rows(f"M1 0 A{rx} {ry} 0 0 1 1 14")
+    assert set(s["kind"].tolist()) == {ARC if rx == ry else CONIC}
+    ellipse = ref.ellipse((1.0, 0.0), (1.0, 14.0), float(rx), float(ry), 0.0, large=False, sweep=True)
+    check_svg_arc(s, ellipse, True, False)
 
 
 @pytest.mark.parametrize(
     ("path", "circular"),
     [
-        ("M0 0 A5 5 0 0 1 10 0", True),  # a half circle
+        ("M0 0 A5 5 0 0 1 8 4", True),
         ("M0 0 A5 5 0 1 1 6 0", True),  # the large way round
         ("M0 0 A1 1 0 0 0 10 0", True),  # radii scaled up together stay equal
         ("M0 0 A5 5 45 0 1 3 4", True),  # rotation doesn't make a circle an ellipse
@@ -155,26 +207,45 @@ def test_extreme_radii(rx):
     ],
 )
 def test_arc_three_point_form(path, circular):
-    # an arc is circular exactly when its radii are equal, and then start,
-    # halfway point and end are the three-point arc trimesh's `Arc` takes
-    vertices, segments = trimkit.exchange.svg_parse(path)
-    (arc,) = svg_rows(vertices, segments)
-    assert (arc["radius"][0] == arc["radius"][1]) == circular
-    # the halfway point is a vertex of its own, read in place
-    three = vertices[segments["points"][0, [0, 2, 3]]]
-    assert np.array_equal(three, [arc["start"], arc["middle"], arc["end"]])
+    # equal radii are arcs: start, halfway point and end, the three-point arc
+    # trimesh's `Arc` takes, on the circle around the center they carry. Any
+    # other is a conic
+    s = rows(path)
+    assert (s["kind"] == (ARC if circular else CONIC)).all()
     if circular:
-        # on the circle, and as far from either end along it
-        radius = arc["radius"][0]
-        assert np.allclose(np.linalg.norm(three - arc["center"], axis=1), radius)
-        assert np.isclose(np.linalg.norm(three[1] - three[0]), np.linalg.norm(three[1] - three[2]))
+        radius = np.linalg.norm(s["start"] - s["center"], axis=1)
+        for point in ("middle", "end"):
+            assert np.allclose(np.linalg.norm(s[point] - s["center"], axis=1), radius)
 
 
-def round_trip(path: str) -> None:
-    # parsing what svg_string writes reproduces the segments bit for bit
-    vertices, segments = trimkit.exchange.svg_parse(path)
-    again = trimkit.exchange.svg_parse(trimkit.exchange.svg_string(vertices, segments))
-    assert again[0].tobytes() == vertices.tobytes() and again[1].tobytes() == segments.tobytes()
+def test_centers_merge_circles():
+    # one circle drawn as two half arcs: four pieces, one center, exactly, so
+    # an importer can tell it is one closed circle by comparing them
+    s = rows("M0 0 A5 5 0 0 1 10 0 A5 5 0 0 1 0 0")
+    assert len(s) == 4 and (s["kind"] == ARC).all()
+    assert len({tuple(c) for c in s["center"].tolist()}) == 1 and s["center"][0].tolist() == [5, 0]
+
+
+def test_string_ignores_arc_centers():
+    # an arc's circle is its three points: its center isn't read back, and a
+    # scribbled one changes nothing
+    vertices, segments = X.svg_parse("M0 0 A5 5 0 0 1 8 4 A5 3 30 1 0 4 1")
+    scribbled = segments.copy()
+    scribbled["kind_data"][scribbled["kind"] == ARC] = np.nan
+    assert X.svg_string(vertices, scribbled) == X.svg_string(vertices, segments)
+
+
+def test_conics_are_affine():
+    # a conic's vertices and weight are geometry, not a frame: the same arc
+    # turned, scaled and moved is the same pieces, turned, scaled and moved
+    a_vertices, a = X.svg_parse("M1 2 A5 3 20 1 0 4 1")
+    turn = math.radians(35)
+    matrix = 2.5 * np.array([[math.cos(turn), -math.sin(turn)], [math.sin(turn), math.cos(turn)]])
+    start, end = (matrix @ [1, 2] + [7, -3]).tolist(), (matrix @ [4, 1] + [7, -3]).tolist()
+    b_vertices, b = X.svg_parse(f"M{start[0]!r} {start[1]!r} A12.5 7.5 55 1 0 {end[0]!r} {end[1]!r}")
+    assert np.array_equal(a["kind"], b["kind"]) and np.array_equal(a["points"], b["points"])
+    assert np.allclose(a_vertices @ matrix.T + [7, -3], b_vertices, atol=1e-12)
+    assert np.allclose(a["kind_data"], b["kind_data"], atol=1e-13)
 
 
 @pytest.mark.parametrize(
@@ -191,53 +262,61 @@ def round_trip(path: str) -> None:
         "M1 1 Z",
         "M0 0 A0.1 0.1 0 0 1 10 10",  # radii scaled up to reach, F.6.6
         "M0 0 A5 5 0 1 0 10 0 A5 5 0 0 1 20 0",  # semicircles
-        "M1 0 A3.2e-168 12 0 0 1 1 14",
+        "M0 0 A5 3 30 1 0 4 1 A7 2 -10 0 1 -3 2",  # ellipses
+        "M1 0 A1e30 12 0 0 1 1 14",  # a radius at the bound stays there
+        "M0 0 A1e30 1e30 0 0 1 1 0",  # its middle 1.25e-31 off the chord, near 0 still a double
+        "M1 0 A1e-300 1e-300 0 0 1 1 14",
         "M0 0 L1e-300 -0.0 L1e300 5e-324",
-        # found by fuzzing: radii scaled up to reach both endpoints but still
-        # subnormal read back as not quite reaching them, and scaled again
-        "M3.93406263e-316 5.432309224886e-312 A2.9460499388320934e-307 2.583497e-317 "
-        "2.2444127800473476e-189 0 0 7.290231990012995e-304 4e-323",
         "M 0 0 L 1 1 L 2 x L 3 3",  # malformed: the parsed prefix
     ],
 )
 def test_round_trip(path):
-    round_trip(path)
+    svg_round_trip(path)
 
 
 def test_string_is_compact_absolute_and_locale_free():
-    path = trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("m1 1 l2 0.5 z"))
-    assert path == "M1 1 L3 1.5 Z"
-    assert trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("")) == ""
+    assert X.svg_string(*X.svg_parse("m1 1 l2 0.5 z")) == "M1 1 L3 1.5 Z"
+    assert X.svg_string(*X.svg_parse("")) == ""
+    # arcs are written at most 120 degrees each, never the large arc
+    assert X.svg_string(*X.svg_parse("M0 0 A5 5 0 0 1 10 0")) == "M0 0 A5 5 0 0 1 5 -5 A5 5 0 0 1 10 0"
 
 
-def to_chars(value: float) -> str:
-    """
-    What C++'s std::to_chars(first, last, value) writes, from Python's own
-    shortest round-trip digits: fixed or scientific notation, whichever is
-    shorter, fixed on a tie, and a fixed integer past its shortest digits
-    written exactly.
-    """
-    if value == 0:
-        return "-0" if math.copysign(1.0, value) < 0 else "0"
-    shortest = decimal.Decimal(repr(abs(value))).normalize().as_tuple()
-    digits = "".join(map(str, shortest.digits))
-    point = len(digits) + shortest.exponent
-    exponent = point - 1
-    scientific = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
-    scientific += f"e{'-' if exponent < 0 else '+'}{abs(exponent):02d}"
-    if point > len(digits):
-        fixed = str(int(abs(value)))
-    elif point > 0:
-        fixed = digits[:point] + ("." + digits[point:] if point < len(digits) else "")
-    else:
-        fixed = "0." + "0" * -point + digits
-    return ("-" if value < 0 else "") + (fixed if len(fixed) <= len(scientific) else scientific)
+@pytest.mark.parametrize(
+    ("number", "digits", "written"),
+    [
+        ("3.14159265358979", 8, "3.1415927"),
+        ("123456789.123", 8, "123456790"),  # an integer padded with zeros
+        ("1e-7", 8, "1e-07"),  # scientific where it is shorter
+        ("0.000123456789", 4, "0.0001235"),
+        ("2.675", 3, "2.68"),  # the decimal shown, rounded half away from zero
+        ("9.995", 3, "10"),  # a carry into a new digit
+        ("-0.125", 2, "-0.13"),
+        ("0.1", 17, "0.1"),  # never more digits than the shortest
+        ("1152921504606846976", 17, "1152921504606847000"),  # 2^60, its shortest digits
+    ],
+)
+def test_digits(number, digits, written):
+    vertices, segments = X.svg_parse(f"M0 0 L{number} 0")
+    assert X.svg_string(vertices, segments, digits=digits) == f"M0 0 L{written} 0"
 
 
-def test_numbers_are_written_as_to_chars():
-    # svg_string writes every number as std::to_chars would (svgpath formats
-    # with Dragonbox rather than link libstdc++'s formatting): random bit
-    # patterns within the bound, decimals, integers past 2^53, and the powers
+def test_digits_must_be_1_to_17():
+    arrays = X.svg_parse("M0 0 L1 1")
+    for digits in (0, 18, -5, 2**40):
+        with pytest.raises(ValueError, match="digits must be from 1 to 17"):
+            X.svg_string(*arrays, digits=digits)
+
+
+def significant(text: str) -> str:
+    # a written number's significant digits, without sign, point or exponent
+    return text.lower().split("e")[0].lstrip("-").replace(".", "").strip("0")
+
+
+def test_numbers_read_back():
+    # Random bit patterns within the bound, decimals, integers past 2^53, and
+    # the powers. At 17 digits every number is its shortest digits (Python's
+    # repr has the same), and reads back as exactly itself; at the default
+    # 8, at most 8 of them, within half a unit of the eighth
     rng = np.random.default_rng(0)
     patterns = rng.integers(0, 2**64, 40_000, dtype=np.uint64).view(np.float64)
     integers = 2.0**53 + rng.integers(-(2**40), 2**60, 4_000).astype(np.float64) * 16
@@ -254,62 +333,85 @@ def test_numbers_are_written_as_to_chars():
     values = values[: len(values) // 4 * 4]
     vertices = np.ascontiguousarray(values.reshape(-1, 2))
     # one line per pair of vertices: `M x y L x y`, so every number is written
-    template_vertices, template = trimkit.exchange.svg_parse("M0 0 L0 0 " * (len(vertices) // 2))
+    template_vertices, template = X.svg_parse("M0 0 L0 0 " * (len(vertices) // 2))
     assert len(template_vertices) == len(vertices)
-    written = trimkit.exchange.svg_string(vertices, template).replace("M", "").replace("L", "").split()
-    assert written == [to_chars(float(v)) for v in values]
+    for digits in (17, 8):
+        written = X.svg_string(vertices, template, digits=digits).replace("M", "").replace("L", "").split()
+        read = np.array([float(w) for w in written])
+        if digits == 17:
+            assert read.tobytes() == values.tobytes()
+            assert [significant(w) for w in written] == [significant(repr(float(v))) for v in values]
+        else:
+            assert max(len(significant(w)) for w in written) <= 8
+            assert (np.abs(read - values) <= 5e-8 * np.abs(values) + 5e-324).all()
 
 
 def test_string_hand_built():
     # a hand-built array: a segment that doesn't start on the vertex the last
-    # one ended on gets a moveto, and unused slots are ignored
-    vertices, segments = trimkit.exchange.svg_parse("M0 0 L1 0 M5 5 L6 5")
-    assert trimkit.exchange.svg_string(vertices, segments) == "M0 0 L1 0 M5 5 L6 5"
+    # one ended on gets a moveto, and what a kind doesn't use is ignored
+    vertices, segments = X.svg_parse("M0 0 L1 0 M5 5 L6 5")
+    assert X.svg_string(vertices, segments) == "M0 0 L1 0 M5 5 L6 5"
     unused = segments.copy()
     unused["points"][:, 1:3] = 12345
-    unused["radius"] = np.nan
-    assert trimkit.exchange.svg_string(vertices, unused) == "M0 0 L1 0 M5 5 L6 5"
+    unused["kind_data"] = np.nan
+    assert X.svg_string(vertices, unused) == "M0 0 L1 0 M5 5 L6 5"
     joined = segments.copy()
     joined["points"][1, 0] = joined["points"][0, 3]
-    assert trimkit.exchange.svg_string(vertices, joined) == "M0 0 L1 0 L6 5"
+    assert X.svg_string(vertices, joined) == "M0 0 L1 0 L6 5"
 
     bad = segments.copy()
     bad["kind"][1] = 9
-    with pytest.raises(ValueError, match="SvgKind"):
-        trimkit.exchange.svg_string(vertices, bad)
+    with pytest.raises(ValueError, match="segment 1: kind is not an SvgKind"):
+        X.svg_string(vertices, bad)
     with pytest.raises(ValueError, match="finite"):
-        trimkit.exchange.svg_string(
-            np.where(np.arange(len(vertices), dtype=np.int64)[:, None] == 3, np.nan, vertices), segments
-        )
+        X.svg_string(np.where(np.arange(4, dtype=np.int64)[:, None] == 3, np.nan, vertices), segments)
     bad = segments.copy()
     bad["points"][1, 3] = len(vertices)
-    with pytest.raises(ValueError, match="out of range"):
-        trimkit.exchange.svg_string(vertices, bad)
+    with pytest.raises(ValueError, match="segment 1: points names a vertex out of range"):
+        X.svg_string(vertices, bad)
     # float32 vertices cast safely: converted with a warning, the same path
     with pytest.warns(UserWarning, match="vertices: float32 converted to float64"):
-        converted = trimkit.exchange.svg_string(vertices.astype(np.float32), segments)
-    assert converted == trimkit.exchange.svg_string(vertices, segments)
+        converted = X.svg_string(vertices.astype(np.float32), segments)
+    assert converted == X.svg_string(vertices, segments)
+
+
+def segment(kind: int, points, kind_data=(0.0, 0.0)) -> np.ndarray:
+    row = np.zeros(1, X.SvgSegment)
+    row["kind"], row["points"], row["kind_data"] = kind, points, kind_data
+    return row
+
+
+def test_string_hand_built_arcs():
+    vertices = np.array([[1, 0], [0, 1], [0, -1], [-1, 0], [2, 0], [0.5**0.5, 0.5**0.5]], dtype=np.float64)
+    # three points on the unit circle, 270 degrees from start to end: four `A`s
+    written = X.svg_string(vertices, segment(ARC, [0, 1, -1, 2]), digits=17)
+    assert written.count("A") == 4
+    s = rows(written)
+    assert len(s) == 4 and s["end"][-1].tolist() == [0, -1]
+    check_svg_arc(s, ((0.0, 0.0), 1.0, 1.0, 0.0), True, True)
+    # and 90 degrees is one
+    assert X.svg_string(vertices, segment(ARC, [0, 5, -1, 1])).count("A") == 1
+    with pytest.raises(
+        ValueError, match="segment 0: an arc's or conic's three points must not lie on one line"
+    ):
+        X.svg_string(vertices, segment(ARC, [3, 0, -1, 4]))
+    # a conic of weight 0.2 sweeps 2 acos(0.2), 157 degrees: two `A`s
+    s = rows(X.svg_string(vertices, segment(CONIC, [0, 4, -1, 1], (0.2, 0.0))))
+    assert len(s) == 2 and s["start"][0].tolist() == [1, 0] and s["end"][1].tolist() == [0, 1]
+    for weight in (0.0, 1.0, -0.5, np.nan):
+        with pytest.raises(ValueError, match="weight must be between 0 and 1"):
+            X.svg_string(vertices, segment(CONIC, [0, 4, -1, 1], (weight, 0.0)))
 
 
 def test_string_close_is_by_vertex():
     # a close returns to its subpath's first vertex, by index: the same
     # coordinates in another vertex are not a close
-    vertices, segments = trimkit.exchange.svg_parse("M0 0 L1 0 L1 1 Z")
-    assert trimkit.exchange.svg_string(vertices, segments) == "M0 0 L1 0 L1 1 Z"
+    vertices, segments = X.svg_parse("M0 0 L1 0 L1 1 Z")
+    assert X.svg_string(vertices, segments) == "M0 0 L1 0 L1 1 Z"
     copy = np.vstack([vertices, vertices[:1]])
-    bad = segments.copy()
-    bad["points"][2, 3] = len(copy) - 1
-    with pytest.raises(ValueError, match="first vertex"):
-        trimkit.exchange.svg_string(copy, bad)
-    bad = segments.copy()
-    bad["closes"][1] = True
-    with pytest.raises(ValueError, match="first vertex"):
-        trimkit.exchange.svg_string(vertices, bad)
-    vertices, segments = trimkit.exchange.svg_parse("M0 0 Q1 1 2 0 Z")
-    bad = segments.copy()
-    bad["closes"][0] = True
-    with pytest.raises(ValueError, match="only a line"):
-        trimkit.exchange.svg_string(vertices, bad)
+    other = segments.copy()
+    other["points"][2, 3] = len(copy) - 1
+    assert X.svg_string(copy, other) == "M0 0 L1 0 L1 1 L0 0"
 
 
 @pytest.mark.parametrize(
@@ -326,16 +428,30 @@ def test_string_close_is_by_vertex():
     ],
 )
 def test_shapes(path, segment_count, vertex_count):
-    vertices, segments = trimkit.exchange.svg_parse(path)
+    vertices, segments = X.svg_parse(path)
     assert (len(segments), len(vertices)) == (segment_count, vertex_count)
-    round_trip(path)
+    svg_round_trip(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "M0 0 h" + ".1" * 50_000,  # two bytes a line
+        "M0 0" + "h1z" * 20_000,  # three bytes for a line and a close: the most
+        "M0 0 a1 1 0 11 1 1" + " 1 1 0 11 1 1" * 5_000,  # twelve for four arcs
+        "M0 0 a1 2 0 11 1 1" + " 1 2 0 11 1 1" * 5_000,  # or four conics
+    ],
+)
+def test_output_is_linear_in_the_input(path):
+    # the bound `svg_parse` documents, at the inputs that come closest to it
+    assert sum(a.nbytes for a in X.svg_parse(path)) <= 43 * len(path)
 
 
 def test_string_rejects_other_arrays():
-    vertices, segments = trimkit.exchange.svg_parse("M0 0 L1 1 L2 2 L3 3 L4 4")
+    vertices, segments = X.svg_parse("M0 0 L1 1 L2 2 L3 3 L4 4")
     for wrong in (np.zeros(3), segments.reshape((1, -1)), segments.tolist()):
         with pytest.raises(TypeError, match="SvgSegment"):
-            trimkit.exchange.svg_string(vertices, wrong)
+            X.svg_string(vertices, wrong)
 
 
 # found by check/fuzz/svgpath.cpp: `svg_string` refused what `svg_parse` produced,
@@ -382,16 +498,43 @@ def test_overflowing_command_ends_the_path(path):
     # finite numbers, but a coordinate that overflows: the path ends before
     # that command, as for a number that overflows, and what remains is
     # finite and writes back exactly
-    vertices, segments = trimkit.exchange.svg_parse(path)
+    vertices, segments = X.svg_parse(path)
     assert np.isfinite(vertices).all() and len(segments) > 0
-    round_trip(path)
+    svg_round_trip(path)
 
 
 def test_copied_layout_outlives_the_call():
     # any other layout is copied once, and that copy must stay alive while it is
     # read: big enough for numpy to really free it, so ASan sees any later read
-    vertices, segments = trimkit.exchange.svg_parse("M0 0 " + "L1 1 " * 5000)
+    vertices, segments = X.svg_parse("M0 0 " + "L1 1 " * 5000)
     reversed_rows = segments[::-1]
-    assert trimkit.exchange.svg_string(vertices, reversed_rows) == trimkit.exchange.svg_string(
-        vertices, reversed_rows.copy()
-    )
+    assert X.svg_string(vertices, reversed_rows) == X.svg_string(vertices, reversed_rows.copy())
+
+
+def test_string_reads_a_copy():
+    # what svg_string writes is what the arrays held when it was called:
+    # it copies them before letting go of the GIL, so another thread
+    # changing them meanwhile can't put an unchecked value in front of it
+    vertices, segments = X.svg_parse("M0 0 " + "A1 2 0 0 1 1 1 a1 2 0 0 0 -1 -1 " * 20_000)
+    expected = X.svg_string(vertices, segments)
+    stop = threading.Event()
+
+    def scribble():
+        rng = np.random.default_rng(0)
+        while not stop.is_set():
+            segments["kind_data"][rng.integers(0, len(segments)), 0] = np.nan
+            vertices[rng.integers(0, len(vertices))] = np.inf
+
+    kept = segments.copy(), vertices.copy()
+    thread = threading.Thread(target=scribble)
+    thread.start()
+    try:
+        for _ in range(5):
+            # what it copied may already be scribbled on: refused, never misread
+            with contextlib.suppress(ValueError):
+                X.svg_string(vertices, segments)
+    finally:
+        stop.set()
+        thread.join()
+    segments[:], vertices[:] = kept
+    assert X.svg_string(vertices, segments) == expected

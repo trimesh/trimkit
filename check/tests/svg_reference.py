@@ -70,13 +70,13 @@ NUMBER: {_LENIENT_NUMBER}
 """
 )
 
-# trimkit's bound on every coordinate (src/numpy.hpp, vendor/svgpath)
+# trimkit's bound on every coordinate (src/numpy.hpp, src/svgpath.hpp)
 COORDINATE_LIMIT = 1e30
 
 STRICT_PARSER = Lark(STRICT, parser="lalr", lexer="contextual")
 LENIENT_PARSER = Lark(LENIENT, parser="lalr", lexer="contextual")
 
-# segment kinds and flags, as `trimkit.exchange.SvgSegment` stores them
+# segment kinds, as `trimkit.exchange.SvgKind` numbers them, and the reference's own flags
 LINE, QUADRATIC, CUBIC, ARC = 0, 1, 2, 3
 LARGE_ARC, SWEEP, CLOSE = 1, 2, 4
 
@@ -107,19 +107,60 @@ def parse(grammar: Lark, d: str):
 
 
 def _drawable(start, end, rx, ry, rotation) -> bool:
-    # F.6.5.1 and F.6.6: the radii, scaled up when too small (beyond the
-    # parser's 16 ulp band around exactly reaching), are finite and, when
-    # scaled, normal: subnormal ones can't be written back precisely
+    # F.6.5.1 and F.6.6: the radii, scaled up when too small, are finite and,
+    # when scaled, normal: subnormal ones can't be written back precisely
     phi = math.radians(rotation)
     dx, dy = (start[0] - end[0]) / 2.0, (start[1] - end[1]) / 2.0
     x1 = math.cos(phi) * dx + math.sin(phi) * dy
     y1 = -math.sin(phi) * dx + math.cos(phi) * dy
     reach = math.hypot(x1 / abs(rx), y1 / abs(ry))
-    if reach <= 1.0 + 16.0 * sys.float_info.epsilon:
+    if reach <= 1.0:
         return True
     scaled = (abs(rx) * reach, abs(ry) * reach)
     # and, past the coordinate bound, would reach beyond it: a line instead
     return all(sys.float_info.min <= r <= COORDINATE_LIMIT for r in scaled)
+
+
+def ellipse(start, end, rx, ry, rotation, *, large: bool, sweep: bool):
+    """
+    The ellipse an arc lies on, F.6.5 with F.6.6: its center, radii,
+    rotation, and the arc's start angle and signed sweep, in radians. None
+    when the chord is too short against the radii to place a center at all.
+    Written in the ratios x1 / rx, y1 / ry, which neither overflow nor
+    underflow where the squares of the radii do.
+    """
+    phi = math.radians(rotation)
+    cos, sin = math.cos(phi), math.sin(phi)
+    dx, dy = (start[0] - end[0]) / 2.0, (start[1] - end[1]) / 2.0
+    x1, y1 = cos * dx + sin * dy, -sin * dx + cos * dy
+    rx, ry = abs(rx), abs(ry)
+    reach = math.hypot(x1 / rx, y1 / ry)
+    if reach == 0.0:
+        return None
+    if reach >= 1.0:
+        rx, ry, k = rx * reach, ry * reach, 0.0
+    else:
+        k = math.sqrt((1.0 - reach) * (1.0 + reach)) / reach * (1.0 if large != sweep else -1.0)
+    cx, cy = k * rx * (y1 / ry), -k * ry * (x1 / rx)
+    center = (
+        cos * cx - sin * cy + (start[0] + end[0]) / 2.0,
+        sin * cx + cos * cy + (start[1] + end[1]) / 2.0,
+    )
+    # F.6.5.5 and F.6.5.6: the angles from the center to each end
+    theta = math.atan2((y1 - cy) / ry, (x1 - cx) / rx)
+    delta = (math.atan2((-y1 - cy) / ry, (-x1 - cx) / rx) - theta) % (2.0 * math.pi)
+    if not sweep:
+        delta -= 2.0 * math.pi
+    return center, rx, ry, phi, theta, delta
+
+
+def arc_point(arc, angle: float):
+    """
+    The point at `angle` on an ellipse `ellipse` returned, F.6.3.
+    """
+    (cx, cy), rx, ry, phi = arc[:4]
+    x, y = rx * math.cos(angle), ry * math.sin(angle)
+    return (cx + math.cos(phi) * x - math.sin(phi) * y, cy + math.sin(phi) * x + math.cos(phi) * y)
 
 
 def evaluate(commands) -> list[dict]:

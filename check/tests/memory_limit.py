@@ -29,9 +29,9 @@ def main() -> None:
     limit = int(limit)
     wanted = np.zeros(1, np.int64)
 
-    # a path past the limit: each `h1` is two bytes of an 80-byte segment and a
+    # a path past the limit: each `h1` is two bytes of a 56-byte segment and a
     # 16-byte vertex
-    lines = "M0 0" + "h1" * (limit // 64)
+    lines = "M0 0" + "h1" * (limit // 32)
     assert refused(trimkit.exchange.svg_parse, lines), "a path past the limit parsed"
     del lines
 

@@ -1,14 +1,24 @@
 // Properties of `parse` on any bytes:
+// - every kind is an SvgKind, a point index is -1 exactly where its kind has
+//   no such point, and the padding and unused kind_data are zero
 // - vertices are used in the order they were added, each first by the
 //   segment that added it: every point is either the vertex the pen is on,
 //   a closing line's return to its subpath's first vertex, or the next new
 //   vertex, and no vertex goes unused
-// - a point index is -1 exactly where its kind has no such point
-// - a line closes exactly when it ends on an old vertex
-// - every arc's center parameterization is finite and reproduces both of
-//   its endpoints and its halfway point
-// - `format` writes it all, parsing that gives the same vertices and
-//   segments byte for byte, and formatting that gives the same text
+// - every coordinate is within the bound, and the output is at most the 43
+//   bytes per byte of input `parse` documents
+// - every arc and conic is a piece of at most MAX_ARC that `format` writes
+//   as one `A` command: an arc's three points on one circle, the middle
+//   halfway along it, its center finite and within the bound; a conic's
+//   weight between 1/2 and 1
+// - `format` writes it all at 17 digits, and that parses completely. Every
+//   segment's end comes back bit for bit, in order, and without arcs or
+//   conics everything does. An arc's halfway point and center, and a
+//   conic's control and weight, are recomputed from the radii written, so
+//   an arc whose radius is near the coordinates' rounding (radius 5 at
+//   y = 2e16, where doubles are 4 apart) can come back as a line or split
+//   again; the tests check that ordinary coordinates round trip exactly,
+//   with those within rounding
 #include "../../src/svgpath.hpp"
 
 #include <cmath>
@@ -16,107 +26,139 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
-static bool same_path(const svgpath::Path* first, const svgpath::Path* second) {
-    if (first->vertices.size() != second->vertices.size() || first->segments.size() != second->segments.size()) {
-        return false;
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+    svgpath::SvgPath parsed;
+    static_cast<void>(svgpath::parse(reinterpret_cast<const char*>(data), size, &parsed));
+    const std::size_t bytes =
+        (parsed.vertices.size() * sizeof(double)) + (parsed.segments.size() * sizeof(svgpath::SvgSegment));
+    if (bytes > (43 * size) + 16) {
+        __builtin_trap();  // past the documented bound
     }
-    const bool same_vertices = first->vertices.empty() || std::memcmp(first->vertices.data(), second->vertices.data(),
-                                                                      first->vertices.size() * sizeof(double)) == 0;
-    const bool same_segments =
-        first->segments.empty() || std::memcmp(first->segments.data(), second->segments.data(),
-                                               first->segments.size() * sizeof(svgpath::Segment)) == 0;
-    return same_vertices && same_segments;
-}
-
-// an arc's center, radii, rotation and angles put its endpoints and its
-// halfway point back
-static void check_arc(const svgpath::Path* path, const svgpath::Segment* segment) {
-    const double* center = &path->vertices[2 * static_cast<std::size_t>(segment->points[1])];
-    if (!std::isfinite(segment->angles[0]) || !std::isfinite(segment->angles[1])) {
-        __builtin_trap();
-    }
-    const double scale = 1.0 + std::abs(center[0]) + std::abs(center[1]) + segment->radius[0] + segment->radius[1];
-    if (!std::isfinite(scale) || scale > 1e12) {
-        return;  // precision is meaningless once coordinates overflow
-    }
-    const double rotation = segment->rotation * svgpath::PI / 180.0;
-    // start, halfway and end: the slots of the points at 0, 1/2 and 1 of the sweep
-    const int slots[3] = {0, 2, 3};
-    for (int which = 0; which < 3; which++) {
-        const double angle = segment->angles[0] + (0.5 * which * segment->angles[1]);
-        const double x = segment->radius[0] * std::cos(angle);
-        const double y = segment->radius[1] * std::sin(angle);
-        const std::int64_t vertex = segment->points[slots[which]];
-        const double* expected = &path->vertices[2 * static_cast<std::size_t>(vertex)];
-        const double error_x = center[0] + (std::cos(rotation) * x) - (std::sin(rotation) * y) - expected[0];
-        const double error_y = center[1] + (std::sin(rotation) * x) + (std::cos(rotation) * y) - expected[1];
-        if (std::abs(error_x) > 1e-7 * scale || std::abs(error_y) > 1e-7 * scale) {
+    for (const double value : parsed.vertices) {
+        if (!svgpath::within(value)) {
             __builtin_trap();
         }
     }
-}
-
-extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
-    svgpath::Path parsed;
-    static_cast<void>(svgpath::parse(reinterpret_cast<const char*>(data), size, &parsed));
     std::int64_t next_vertex = 0;  // the vertex the next new point must be
     std::int64_t pen = -1;         // the vertex the last segment ended on
     std::int64_t start = -1;       // the first vertex of the current subpath
-    for (std::size_t index = 0; index < parsed.segments.size(); index++) {
-        const svgpath::Segment* segment = &parsed.segments[index];
-        if (segment->kind > svgpath::ARC) {
+    bool arcs = false;
+    for (const svgpath::SvgSegment& segment : parsed.segments) {
+        const std::uint8_t kind = segment.kind;
+        if (kind > svgpath::CONIC) {
             __builtin_trap();
+        }
+        for (const std::uint8_t byte : segment.padding) {
+            if (byte != 0) {
+                __builtin_trap();
+            }
         }
         // a new subpath starts on the next new vertex, anything else on the pen
-        if (segment->points[0] == next_vertex) {
+        if (segment.points[0] == next_vertex) {
             start = next_vertex;
             next_vertex++;
-        } else if (segment->points[0] != pen) {
+        } else if (segment.points[0] != pen) {
             __builtin_trap();
         }
-        const bool uses[3] = {segment->kind != svgpath::LINE,
-                              segment->kind == svgpath::CUBIC || segment->kind == svgpath::ARC, true};
+        const bool uses[3] = {kind != svgpath::LINE, kind == svgpath::CUBIC, true};
         for (int slot = 1; slot < 4; slot++) {
-            const std::int64_t vertex = segment->points[slot];
+            const std::int64_t vertex = segment.points[slot];
             if (!uses[slot - 1]) {
                 if (vertex != -1) {
                     __builtin_trap();
                 }
             } else if (vertex == next_vertex) {
                 next_vertex++;
-            } else if (!(slot == 3 && segment->closes != 0 && vertex == start)) {
-                __builtin_trap();
+            } else if (!(slot == 3 && kind == svgpath::LINE && vertex == start)) {
+                __builtin_trap();  // only a close returns to an old vertex
             }
         }
-        if ((segment->closes != 0) != (segment->points[3] <= segment->points[0]) ||
-            (segment->closes != 0 && segment->kind != svgpath::LINE)) {
+        pen = segment.points[3];
+        if (kind != svgpath::ARC && kind != svgpath::CONIC) {
+            if (segment.kind_data[0] != 0.0 || segment.kind_data[1] != 0.0) {
+                __builtin_trap();
+            }
+            continue;
+        }
+        arcs = true;
+        double coordinates[6];
+        double largest = 0.0;
+        const int slots[3] = {0, 1, 3};
+        for (int which = 0; which < 3; which++) {
+            for (int axis = 0; axis < 2; axis++) {
+                coordinates[(2 * which) + axis] =
+                    parsed.vertices[(2 * static_cast<std::size_t>(segment.points[slots[which]])) + axis];
+                largest = std::fmax(largest, std::abs(coordinates[(2 * which) + axis]));
+            }
+        }
+        if (kind == svgpath::ARC) {
+            if (!svgpath::within(segment.kind_data[0]) || !svgpath::within(segment.kind_data[1])) {
+                __builtin_trap();  // its center
+            }
+            // the middle is as far from either end, to within rounding of
+            // the coordinates, which far from the origin is coarse
+            const double before = std::hypot(coordinates[2] - coordinates[0], coordinates[3] - coordinates[1]);
+            const double after = std::hypot(coordinates[4] - coordinates[2], coordinates[5] - coordinates[3]);
+            if (std::abs(before - after) > (1e-6 * (before + after)) + (1e-14 * largest)) {
+                __builtin_trap();
+            }
+        } else if (!(segment.kind_data[0] >= svgpath::MAX_ARC_HALF_COSINE && segment.kind_data[0] < 1.0) ||
+                   segment.kind_data[1] != 0.0) {
+            __builtin_trap();  // its weight
+        }
+        svgpath::SvgArcCommands commands;
+        if (svgpath::arc_commands(kind, &coordinates[0], &coordinates[2], &coordinates[4], segment.kind_data[0],
+                                  &commands) != nullptr) {
+            __builtin_trap();  // a piece `format` would refuse
+        }
+        // and one it writes as a single `A`, unless its radius is so near the
+        // coordinates' rounding that its sweep, recomputed, can pass MAX_ARC
+        if (commands.count != 1 && std::fmin(commands.radius_x, commands.radius_y) > 1e-8 * largest) {
             __builtin_trap();
         }
-        if (segment->kind == svgpath::ARC) {
-            check_arc(&parsed, segment);
-        }
-        pen = segment->points[3];
     }
     if (static_cast<std::size_t>(next_vertex) != parsed.vertices.size() / 2) {
         __builtin_trap();  // a vertex no segment uses
     }
 
-    // the round trip: what `format` writes parses back to exactly this
+    // the round trip
     std::string written;
     std::size_t refused = 0;
-    if (svgpath::format(parsed.vertices.data(), parsed.vertices.size() / 2, parsed.segments.data(),
-                        parsed.segments.size(), &written, &refused) != nullptr) {
+    if (svgpath::format(&parsed, 17, &written, &refused) != nullptr) {
         __builtin_trap();  // anything `parse` produced formats: by construction, kept as a tripwire
     }
-    svgpath::Path again;
-    if (svgpath::parse(written.data(), written.size(), &again) != written.size() || !same_path(&parsed, &again)) {
+    svgpath::SvgPath again;
+    if (svgpath::parse(written.data(), written.size(), &again) != written.size()) {
         __builtin_trap();
     }
-    std::string rewritten;
-    if (svgpath::format(again.vertices.data(), again.vertices.size() / 2, again.segments.data(), again.segments.size(),
-                        &rewritten, &refused) != nullptr ||
-        rewritten != written) {
+    // each segment's end, in order: the original's among the new one's
+    const auto ends = [](const svgpath::SvgPath* path) {
+        std::vector<double> coordinates;
+        for (const svgpath::SvgSegment& segment : path->segments) {
+            const std::size_t vertex = static_cast<std::size_t>(segment.points[3]);
+            coordinates.push_back(path->vertices[2 * vertex]);
+            coordinates.push_back(path->vertices[(2 * vertex) + 1]);
+        }
+        return coordinates;
+    };
+    const std::vector<double> before = ends(&parsed);
+    const std::vector<double> after = ends(&again);
+    std::size_t found = 0;
+    for (std::size_t index = 0; index < after.size() && found < before.size(); index += 2) {
+        if (std::memcmp(&after[index], &before[found], 2 * sizeof(double)) == 0) {
+            found += 2;
+        }
+    }
+    if (found != before.size()) {
+        __builtin_trap();
+    }
+    const bool same_segments =
+        again.segments.size() == parsed.segments.size() &&
+        (parsed.segments.empty() || std::memcmp(again.segments.data(), parsed.segments.data(),
+                                                parsed.segments.size() * sizeof(svgpath::SvgSegment)) == 0);
+    if (!arcs && (!same_segments || again.vertices != parsed.vertices)) {
         __builtin_trap();
     }
     return 0;

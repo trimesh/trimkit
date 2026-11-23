@@ -451,58 +451,58 @@ def svg_path_new(path_string, start):
     n = len(segments)
     if n == 0:
         return [], np.zeros((0, 2))
-    kind = segments["kind"]
-    index = segments["points"]
-    line = kind == trimkit.exchange.SvgKind.LINE
-    arc = kind == trimkit.exchange.SvgKind.ARC
+    LINE, CUBIC, ARC, CONIC = (int(trimkit.exchange.SvgKind[k]) for k in ("LINE", "CUBIC", "ARC", "CONIC"))
+    kind, index, data = segments["kind"], segments["points"], segments["kind_data"]
+    # trimesh's `Arc` is circular, through three points: a conic piece of an
+    # ellipse is drawn through its start, middle and end, as svg.path's arcs were
+    vertices = vertices.copy()
+    conic = kind == CONIC
+    if conic.any():
+        control, w = index[conic, 1], data[conic, :1]
+        vertices[control] = (
+            vertices[index[conic, 0]] + 2 * w * vertices[control] + vertices[index[conic, 3]]
+        ) / (2 + 2 * w)
+    arc = (kind == ARC) | conic
+    line = kind == LINE
 
     # a run is consecutive segments of one kind that each start on the last
     # one's end vertex: only a moveto breaks a run, as in trimesh's grouping,
     # so lines drawn on after a close continue the polyline through it
+    group = np.where(arc, ARC, kind)
     first = np.ones(n, dtype=bool)
-    first[1:] = (kind[1:] != kind[:-1]) | (index[1:, 0] != index[:-1, 3])
+    first[1:] = (group[1:] != group[:-1]) | (index[1:, 0] != index[:-1, 3])
     last = np.ones(n, dtype=bool)
     last[:-1] = first[1:]
 
-    # each segment's points as trimesh's entities take them: start, a control
-    # point or an arc's halfway point, a cubic's second control point, end
-    slots = index.copy()
-    slots[arc, 1] = index[arc, 2]
-
     closed = np.zeros(n, dtype=bool)
-    if arc.any():
-        # a run of arcs sharing center, radius and rotation whose last end is
-        # its first start is one closed circle, the test trimesh makes on
-        # svg.path (within a run, each arc starts on the last one's end vertex)
+    circular = kind == ARC
+    if circular.any():
+        # a run of arcs around one center whose last end is its first start
+        # is one closed circle, the test trimesh makes on svg.path's arcs
         runs = np.flatnonzero(first)
         run_ends = np.append(runs[1:], n) - 1
-        params = np.column_stack([vertices[index[:, 1]], segments["radius"], segments["rotation"]])
-        spread = np.maximum.reduceat(params, runs) - np.minimum.reduceat(params, runs)
+        centers = np.where(circular[:, None], data, np.nan)
+        spread = np.maximum.reduceat(centers, runs) - np.minimum.reduceat(centers, runs)
         gap = np.abs(vertices[index[runs, 0]] - vertices[index[run_ends, 3]]).max(axis=1)
-        circle = (spread.mean(axis=1) < 1e-3) & (gap < 1e-8)
-        closed = ((kind[runs] == trimkit.exchange.SvgKind.ARC) & (run_ends > runs) & circle)[
-            np.cumsum(first) - 1
-        ]
+        circle = (np.nan_to_num(spread, nan=1.0).max(axis=1) < 1e-3) & (gap < 1e-8)
+        closed = (circular[runs] & (run_ends > runs) & circle)[np.cumsum(first) - 1]
 
     # a polyline takes each segment's start plus its last end, a closed
     # circle only its first arc, anything else all of its own points
     keep = ~closed | first
-    mask = np.column_stack(
-        [keep, keep & ~line, kind == trimkit.exchange.SvgKind.CUBIC, keep & (last | ~line)]
-    )
-    vertices = vertices[slots[mask]]
+    mask = np.column_stack([keep, keep & ~line, kind == CUBIC, keep & (last | ~line)])
+    vertices = vertices[index[mask]]
 
     # the one remaining loop builds trimesh's entity objects
     heads = np.flatnonzero(first | ~(line | closed))
     bounds = np.zeros(len(heads) + 1, dtype=np.int64)
     np.cumsum(np.add.reduceat(mask.sum(axis=1), heads), out=bounds[1:])
-    index = np.arange(start, start + len(vertices), dtype=np.int64)
+    positions = np.arange(start, start + len(vertices), dtype=np.int64)
     entities = [
-        Arc(points=index[a:b], closed=c)
-        if k == trimkit.exchange.SvgKind.ARC
-        else (Line if k == trimkit.exchange.SvgKind.LINE else Bezier)(points=index[a:b])
-        for k, c, a, b in zip(
-            kind[heads].tolist(),
+        Arc(points=positions[a:b], closed=c) if k else (Line if is_line else Bezier)(points=positions[a:b])
+        for k, is_line, c, a, b in zip(
+            arc[heads].tolist(),
+            line[heads].tolist(),
             closed[heads].tolist(),
             bounds[:-1].tolist(),
             bounds[1:].tolist(),
@@ -513,9 +513,32 @@ def svg_path_new(path_string, start):
 
 
 def same_svg(a, b):
-    assert [type(e).__name__ for e in a[0]] == [type(e).__name__ for e in b[0]]
-    for x, y in zip(a[0], b[0], strict=True):
-        assert np.array_equal(x.points, y.points)
-        assert getattr(x, "closed", False) == getattr(y, "closed", False)
-    assert a[1].shape == b[1].shape
-    assert np.allclose(a[1], b[1], atol=1e-7)
+    # The same lines and Beziers, in order. An arc may now be several pieces
+    # of at most 120 degrees, so what is checked is that the old entities'
+    # kinds and ends are among the new ones', in order (a closed circle's
+    # start only), and the same circles are closed
+    def walk(result):
+        entities, vertices = result
+        if not entities:
+            return [], np.zeros((0, 2)), 0
+        offset = min(int(e.points.min()) for e in entities)
+        ends = []
+        for e in entities:
+            ends.append(vertices[e.points[0] - offset])
+            if not getattr(e, "closed", False):
+                ends.append(vertices[e.points[-1] - offset])
+        kinds = [type(e).__name__ for e in entities if type(e).__name__ != "Arc"]
+        return kinds, np.array(ends), sum(getattr(e, "closed", False) for e in entities)
+
+    def among(old, new, same):
+        found = 0
+        for item in new:
+            if found < len(old) and same(old[found], item):
+                found += 1
+        return found == len(old)
+
+    old_kinds, old_ends, old_closed = walk(a)
+    new_kinds, new_ends, new_closed = walk(b)
+    assert among(old_kinds, new_kinds, str.__eq__) and old_closed == new_closed
+    assert np.isfinite(b[1]).all()
+    assert among(old_ends, new_ends, lambda x, y: np.allclose(x, y, atol=1e-7))
