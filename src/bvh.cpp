@@ -60,8 +60,6 @@ using Points = trimkit::In<double, -1, 3>;
 using RaysArg = trimkit::RaysArgument;
 using Rays = trimkit::Rays;
 using FacesArg = trimkit::Array<std::int64_t, -1, 3>;
-using BoundsArg = trimkit::Array<double, -1, 2, -1>;
-using Bounds = trimkit::In<double, -1, 2, -1>;
 
 using BoxQueriesArgument = trimkit::BoxQueriesArgument;
 
@@ -118,6 +116,34 @@ bool overlaps(const Vec& a_lo, const Vec& a_hi, const Vec& b_lo, const Vec& b_hi
     }
     return true;
 }
+
+// the squared distance between the boxes [a_lo, a_hi] and [b_lo, b_hi], zero
+// where they overlap: each axis's gap squared, summed in axis order, so its
+// sqrt is numpy's to the bit (the build never contracts it into an fma)
+double gap_squared(const Vec& a_lo, const Vec& a_hi, const Vec& b_lo, const Vec& b_hi) {
+    double total = 0.0;
+    for (std::int32_t axis = 0; axis < 3; axis++) {
+        const double gap = std::max({b_lo[axis] - a_hi[axis], a_lo[axis] - b_hi[axis], 0.0});
+        total += gap * gap;
+    }
+    return total;
+}
+
+// One box as `nearest` keeps it: ordered by distance and then box, so the
+// lower index wins a tie
+struct NearestBox {
+    double distance;
+    std::uint64_t box;
+    bool operator<(const NearestBox& other) const {
+        return distance < other.distance || (distance == other.distance && box < other.box);
+    }
+};
+
+// A node `nearest` has yet to visit, with its squared gap from the query
+struct NearestNode {
+    std::uint64_t node;
+    double gap;
+};
 
 // A traversal stack of node indices for the box overlap walk: one per chunk
 // of queries, reused for every query in it, so it allocates once and grows
@@ -242,6 +268,7 @@ private:
 using Hits = std::tuple<trimkit::Out<std::int64_t>, trimkit::Out<std::int64_t>, trimkit::Out<std::int64_t>,
                         trimkit::Out<double>>;
 using MaximumHits = std::optional<trimkit::Number<std::int64_t>>;
+using NearestHits = std::tuple<trimkit::Out<std::int64_t>, trimkit::Out<double>>;
 
 // A query's instances built into a top level, never changed once built: the
 // instances as they were read, which a later query's arrays are compared
@@ -786,15 +813,12 @@ private:
 // nodes; 2D boxes are stored with a zero z extent.
 class Boxes {
 public:
-    explicit Boxes(const BoundsArg& boxes_argument) : Boxes(trimkit::read(boxes_argument, "boxes")) {}
-
-    explicit Boxes(const Bounds& boxes) : dimension_(dimension_of(boxes)) {
-        if (dimension_ != 2 && dimension_ != 3) {
-            trimkit::value_error("boxes must be (n, 2, 2) or (n, 2, 3), not (n, 2, " + std::to_string(dimension_) +
-                                 ")");
-        }
+    explicit Boxes(const trimkit::BoxesArgument& argument) {
+        // read before the GIL is released, so it is let go of after it is held again
+        const trimkit::BoxQueries boxes = trimkit::read_box_queries(argument.object, 0, "boxes");
+        dimension_ = boxes.dimension;
         const trimkit::GilReleased release;
-        build(corners_of(boxes.data(), boxes.shape(0), "boxes"));
+        build(corners_of(boxes, "boxes"));
     }
 
     // 3D boxes as (minimum, maximum) corner pairs, already checked
@@ -843,21 +867,13 @@ public:
     // every box overlapping each query, touching included like rtree: one
     // query, (2d,) or (2, d), answers its sorted boxes, (n,), and many,
     // (q, 2d) or (q, 2, d), their [query, box] rows, (k, 2). Every form is
-    // (q, 2, d) in memory, so they read as it and share one traversal; the
-    // last extent tells the layouts apart, as 2d is never d
+    // (q, 2, d) in memory, so they read as it and share one traversal
     trimkit::Out<std::int64_t> intersection(const BoxQueriesArgument& argument) const {
-        const trimkit::BoxQueries queries = trimkit::read_box_queries(argument, dimension_, "queries");
-        return answer(queries.data, queries.count, queries.one);
-    }
-
-private:
-    // `count` queries of (2, d) corners at `data`: their sorted boxes for
-    // `one` query, else [query, box] rows in query order
-    trimkit::Out<std::int64_t> answer(const double* data, std::size_t count, bool one) const {
-        const std::vector<Vec> corners = corners_of(data, count, "queries");
-        trimkit::Gathered<std::int64_t> pairs;
+        const trimkit::BoxQueries queries = trimkit::read_box_queries(argument.object, dimension_, "queries");
+        const std::vector<Vec> corners = corners_of(queries, "queries");
+        trimkit::Gathered<std::int64_t> gathered;
         trimkit::gather_in_parallel<std::int64_t>(
-            count, &pairs, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& rows) {
+            queries.count, &gathered, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& hits) {
                 Stack stack = make_stack();
                 std::vector<std::int64_t> boxes_hit;
                 for (std::size_t q = begin; q < end; q++) {
@@ -867,24 +883,67 @@ private:
                     // ascending boxes, so the same query always reads the same
                     std::sort(boxes_hit.begin(), boxes_hit.end());
                     for (const std::int64_t box : boxes_hit) {
-                        rows.push_back(static_cast<std::int64_t>(q));
-                        rows.push_back(box);
+                        if (!queries.one) {
+                            hits.push_back(static_cast<std::int64_t>(q));
+                        }
+                        hits.push_back(box);
                     }
                 }
             });
-        auto rows = trimkit::gathered_rows(pairs);
-        if (!one) {
-            return trimkit::to_numpy_rows<std::int64_t>(std::move(rows), {2});
+        auto hits = trimkit::gathered_rows(gathered);
+        if (queries.one) {
+            return trimkit::to_numpy<std::int64_t>(std::move(hits), {hits.size()});
         }
-        // one query: its column of boxes
-        const std::int64_t* row = trimkit::elements(rows);
-        std::vector<std::int64_t> boxes(rows.size() / 2);
-        for (std::size_t i = 0; i < boxes.size(); i++) {
-            boxes[i] = row[(2 * i) + 1];
-        }
-        return trimkit::to_numpy(std::move(boxes), {boxes.size()});
+        return trimkit::to_numpy_rows<std::int64_t>(std::move(hits), {2});
     }
 
+    // the `maximum_hits` nearest boxes to each query, as many as there are
+    // up to that, by distance and then box: one query answers its boxes,
+    // (n,), and many their [query, box] rows, (k, 2), with each row's
+    // distance. Every query has exactly that many, so each writes its own
+    // rows in place
+    NearestHits nearest(const BoxQueriesArgument& argument, const trimkit::Number<std::int64_t>& maximum_hits) const {
+        if (maximum_hits < 1) {
+            trimkit::value_error("maximum_hits must be at least 1");
+        }
+        const trimkit::BoxQueries queries = trimkit::read_box_queries(argument.object, dimension_, "queries");
+        const std::vector<Vec> corners = corners_of(queries, "queries");
+        const std::size_t most = std::min(static_cast<std::size_t>(std::int64_t{maximum_hits}), size());
+        const std::size_t rows = most * queries.count;
+        // one query's hits are its boxes, many queries' are [query, box]
+        const std::size_t width = queries.one ? 1 : 2;
+        std::vector<trimkit::Unset<std::int64_t>> hits(width * rows);
+        std::vector<trimkit::Unset<double>> distances(rows);
+        std::int64_t* hits_out = trimkit::elements(hits);
+        double* distances_out = trimkit::elements(distances);
+        // no rows, no walk: a tree without boxes has no root to start at
+        trimkit::in_parallel(rows == 0 ? 0 : queries.count, [&](std::size_t begin, std::size_t end) {
+            std::vector<NearestNode> stack;
+            stack.reserve(std::size_t{2} * TINYBVH_STACK_SIZE);
+            std::vector<NearestBox> best;
+            best.reserve(most);
+            for (std::size_t q = begin; q < end; q++) {
+                nearest_of(corners[2 * q], corners[(2 * q) + 1], most, stack, best);
+                std::int64_t* hit = hits_out + (width * most * q);
+                double* distance = distances_out + (most * q);
+                for (const NearestBox& found : best) {
+                    if (!queries.one) {
+                        *hit++ = static_cast<std::int64_t>(q);
+                    }
+                    *hit++ = static_cast<std::int64_t>(found.box);
+                    *distance++ = found.distance;
+                }
+            }
+        });
+        if (queries.one) {
+            return {trimkit::to_numpy<std::int64_t>(std::move(hits), {rows}),
+                    trimkit::to_numpy<double>(std::move(distances), {rows})};
+        }
+        return {trimkit::to_numpy_rows<std::int64_t>(std::move(hits), {2}),
+                trimkit::to_numpy<double>(std::move(distances), {rows})};
+    }
+
+private:
     void build(std::vector<Vec>&& corners) {
         boxes_ = std::move(corners);
         for (std::size_t corner = 0; corner < boxes_.size(); corner += 2) {
@@ -899,17 +958,13 @@ private:
         }
     }
 
-    static std::size_t dimension_of(const trimkit::In<double, -1, 2, -1>& bounds) {
-        return bounds.ndim() == 3 ? bounds.shape(2) : 0;
-    }
-
-    // `n` (min, max) corner pairs of the boxes' dimension at `b`, as 3D
-    // points, each pair checked to be ordered
-    std::vector<Vec> corners_of(const double* b, std::size_t n, const char* name) const {
-        const std::size_t d = dimension_;
-        std::vector<Vec> corners(2 * n);
-        for (std::size_t i = 0; i < n; i++) {
-            const double* lo = b + (2 * d * i);
+    // boxes as read, a tree's own or its queries, as 3D (minimum, maximum)
+    // corner pairs, each pair checked to be ordered
+    static std::vector<Vec> corners_of(const trimkit::BoxQueries& boxes, const char* name) {
+        const std::size_t d = boxes.dimension;
+        std::vector<Vec> corners(2 * boxes.count);
+        for (std::size_t i = 0; i < boxes.count; i++) {
+            const double* lo = boxes.data + (2 * d * i);
             const double* hi = lo + d;
             for (std::size_t a = 0; a < d; a++) {
                 if (lo[a] > hi[a]) {
@@ -947,6 +1002,61 @@ private:
                 }
             }
         }
+    }
+
+    // The `most` nearest boxes to [lo, hi] into `best`, sorted, with `most` at
+    // least 1 and at most the boxes there are. `best` is a max-heap of the
+    // nearest so far, and once it is full a node or box is skipped only when
+    // its distance is past the worst kept: one at that distance is looked at,
+    // as its index may be lower. The walk steps into the nearer child and
+    // stacks the farther, which is 10-25% faster than stacking both
+    void nearest_of(const Vec& lo, const Vec& hi, std::size_t most, std::vector<NearestNode>& stack,
+                    std::vector<NearestBox>& best) const {
+        const tinybvh::BVH_Double::BVHNode* nodes = bvh_->bvhNode;
+        best.clear();
+        double worst = INF;
+        // true only when sqrt(gap) > worst: the first test only saves the sqrt
+        const auto too_far = [&](double gap) { return gap > worst * worst && std::sqrt(gap) > worst; };
+        stack.push_back({0, 0.0});
+        while (!stack.empty()) {
+            NearestNode next = stack.back();
+            stack.pop_back();
+            while (!too_far(next.gap)) {
+                const tinybvh::BVH_Double::BVHNode& node = nodes[next.node];
+                if (node.isLeaf()) {
+                    for (std::uint64_t j = node.leftFirst; j < node.leftFirst + node.triCount; j++) {
+                        const std::uint64_t box = bvh_->primIdx[j];
+                        const double gap = gap_squared(lo, hi, boxes_[2 * box], boxes_[(2 * box) + 1]);
+                        if (too_far(gap)) {
+                            continue;
+                        }
+                        const NearestBox found{std::sqrt(gap), box};
+                        if (best.size() == most) {
+                            if (!(found < best.front())) {
+                                continue;
+                            }
+                            std::pop_heap(best.begin(), best.end());
+                            best.pop_back();
+                        }
+                        best.push_back(found);
+                        std::push_heap(best.begin(), best.end());
+                        if (best.size() == most) {
+                            worst = best.front().distance;
+                        }
+                    }
+                    break;
+                }
+                const std::uint64_t left = node.leftFirst;
+                NearestNode nearer{left, gap_squared(lo, hi, nodes[left].aabbMin, nodes[left].aabbMax)};
+                NearestNode farther{left + 1, gap_squared(lo, hi, nodes[left + 1].aabbMin, nodes[left + 1].aabbMax)};
+                if (farther.gap < nearer.gap) {
+                    std::swap(nearer, farther);
+                }
+                stack.push_back(farther);
+                next = nearer;
+            }
+        }
+        std::sort_heap(best.begin(), best.end());
     }
 
     std::size_t dimension_ = 0;
@@ -1133,14 +1243,15 @@ Examples
 [True])");
 
     trimkit::picklable_class<Boxes>(m, "Boxes",
-                                    R"(Axis-aligned boxes built into a BVH for overlap queries: a static,
-numpy-native replacement for a bulk-loaded R-tree.
+                                    R"(Axis-aligned boxes built into a BVH for overlap and nearest queries: a
+static, numpy-native replacement for a bulk-loaded R-tree.
 
 Parameters
 ----------
-boxes : (n, 2, d) float64
-  Each box's minimum and maximum corner, in 2 or 3 dimensions. Copied
-  into the tree the object owns, so the boxes can't change under it.
+boxes : (n, 2d) or (n, 2, d) float64
+  Each box's minimum and maximum corner, in 2 or 3 dimensions: flat,
+  (min..., max...), or as two corners. Copied into the tree the object
+  owns, so the boxes can't change under it.
 
 Examples
 --------
@@ -1149,7 +1260,7 @@ Examples
 >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
 >>> len(tree)
 2)")
-        .def(nb::init<const BoundsArg&>(), nb::arg("boxes"))
+        .def(nb::init<const trimkit::BoxesArgument&>(), nb::arg("boxes"))
         .def("__len__", &Boxes::size, R"(How many boxes it holds.
 
 Returns
@@ -1174,7 +1285,7 @@ Examples
 >>> bounds.tolist()
 [[0.0, 0.0], [3.0, 3.0]])")
         .def("boxes", &Boxes::boxes,
-             R"(Every box, exactly as given.
+             R"(Every box's two corners, with exactly the values given.
 
 Returns
 -------
@@ -1218,5 +1329,41 @@ Examples
 >>> hits.tolist()
 [0, 1]
 >>> tree.intersection(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
-[[0, 0], [0, 1]])");
+[[0, 0], [0, 1]])")
+        .def("nearest", &Boxes::nearest, nb::arg("queries"), nb::kw_only(), nb::arg("maximum_hits") = 1,
+             R"(The nearest boxes to one query box or each of many, nearest first.
+
+A point is a query box with equal corners, and a box overlapping or
+touching a query is at distance 0. Each query gets exactly
+`maximum_hits` boxes, or every box when there are fewer. Of boxes at
+the same distance, the lowest index comes first.
+
+Parameters
+----------
+queries : (2d,), (2, d), (m, 2d) or (m, 2, d) float64
+  One query's or each query's minimum and maximum corner, in the
+  boxes' dimension d: flat, (min..., max...), or as two corners.
+maximum_hits : int, default 1
+  How many of the nearest boxes to answer per query, at least 1.
+
+Returns
+-------
+hits : (n,) or (k, 2) int64
+  For one query, its nearest boxes. For many, rows of [query, box],
+  sorted by query, then distance, then box.
+distances : (n,) or (k,) float64
+  The distance from each hit's query to its box. On each axis the gap
+  is how far apart they are, or 0 where they overlap. The distance is
+  the square root of the squared gaps summed in axis order, the same
+  float64 numpy computes. A gap under about 1e-162 squares to 0, so
+  boxes that close but apart are at distance 0 too.
+
+Examples
+--------
+>>> import numpy as np
+>>> import trimkit
+>>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+>>> hits, distances = tree.nearest(np.array([4.0, 3.0, 4.0, 3.0]), maximum_hits=2)
+>>> hits.tolist(), distances.tolist()
+([1, 0], [1.0, 3.605551275463989]))");
 }

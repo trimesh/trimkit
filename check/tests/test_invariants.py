@@ -114,6 +114,7 @@ _SLOW_CALLS = {
     "Boxes.bounds": (_big_boxes, lambda b: trimkit.Boxes(b).bounds),
     "Boxes.boxes": (_big_boxes, lambda b: trimkit.Boxes(b).boxes()),
     "Boxes.intersection": (_big_boxes, lambda b: trimkit.Boxes(b).intersection(b)),
+    "Boxes.nearest": (_big_boxes, lambda b: trimkit.Boxes(b).nearest(b, maximum_hits=4)),
     "CollisionScene.boxes": (_many_instances, lambda i: trimkit.CollisionScene([box()]).boxes(*i).boxes()),
     "CollisionResult": (
         _near_spheres,
@@ -210,6 +211,7 @@ def empty_calls():
         "Boxes.bounds": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).bounds,
         "Boxes.boxes": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).boxes(),
         "Boxes.intersection": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).intersection(np.zeros((0, 2, 3))),
+        "Boxes.nearest": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).nearest(np.zeros((0, 2, 3))),
         "CollisionScene.boxes": lambda: trimkit.CollisionScene([]).boxes().boxes(),
         "CollisionResult": lambda: len(trimkit.CollisionResult(np.zeros((0, 2), dtype=np.int64))),
         "CollisionResult.pairs": lambda: trimkit.CollisionScene([]).collides().pairs,
@@ -260,7 +262,10 @@ def pickled_objects() -> dict:
                 {"boxes": np.ascontiguousarray(boxes[:, :, :2])},
                 {"boxes": np.zeros((0, 2, 3))},
             ],
-            lambda tree: tree.intersection(np.zeros((1, 2, tree.bounds.shape[1]))),
+            lambda tree: (
+                tree.intersection(np.zeros((1, 2, tree.bounds.shape[1]))),
+                *tree.nearest(np.zeros((1, 2, tree.bounds.shape[1])), maximum_hits=5),
+            ),
         ),
         "RayScene": (
             [
@@ -564,6 +569,7 @@ def _array_arguments(big: bool = False) -> dict:
         ("Boxes.bounds", lambda: trimkit.Boxes(bounds).bounds, {}),
         ("Boxes.boxes", trimkit.Boxes(bounds).boxes, {}),
         ("Boxes.intersection", trimkit.Boxes(bounds).intersection, {"queries": bounds}),
+        ("Boxes.nearest", trimkit.Boxes(bounds).nearest, {"queries": bounds, "maximum_hits": 4}),
         (
             "CollisionScene",
             trimkit.CollisionScene,

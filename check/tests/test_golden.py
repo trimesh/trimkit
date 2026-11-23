@@ -137,6 +137,7 @@ def golden() -> dict:
     tree = trimkit.Boxes(scene.boxes(matrices, index).boxes())
     origins, _ = exact_rays()
     answers["Boxes.intersection"] = [tree.intersection(np.stack([origins - 0.25, origins + 0.25], axis=1))]
+    answers["Boxes.nearest"] = list(tree.nearest(np.tile(origins, 2), maximum_hits=3))
     return {name: digest(arrays) for name, arrays in answers.items()}
 
 

@@ -1,13 +1,20 @@
 """
 # `trimkit` UR10 Example
 
-Like many people who don't understand how motion planning works, I always wondered why it isn't just "scipy.optimize on a b-spline" for simple robot arm motion. I think the short answer was "because that's gonna be untenably slow, and there's no gradient."
+Like many people who don't understand how motion planning works, I always wondered why it
+isn't just "scipy.optimize on a b-spline" for simple robot arm motion. I think the short
+answer was "because that's gonna be untenably slow, and there's no gradient."
 
 But with the march of ecosystem progress I think that might be less true:
 
 - `yourdfpy` loads a model nicely
-- `trimesh.transformations.rotation_matrix` has supported `sympy.Symbol` angles for years! So you can multiply your 6+ rotation matrices symbolically, then use `sympy.lambdify` to make a single numpy-fast function that gives you forward kinematics.
-- And now the last piece in the house of cards: `trimkit.CollisionScene` binds `coal` which fixed `fcl`'s convex distances and is fast(er than Mujoco, almost always, by a hair). This example runs a scipy optimizer on a spline, in around 30ms on a contrived UR10 scene finds a collision-free path.
+- `trimesh.transformations.rotation_matrix` has supported `sympy.Symbol` angles for years!
+  So you can multiply your 6+ rotation matrices symbolically, then use `sympy.lambdify` to
+  make a single numpy-fast function that gives you forward kinematics.
+- And now the last piece in the house of cards: `trimkit.CollisionScene` binds `coal` which
+  fixed `fcl`'s convex distances and is fast(er than Mujoco, almost always, by a hair). This
+  example runs a scipy optimizer on a spline, in around 30ms on a contrived UR10 scene finds
+  a collision-free path.
 """
 
 import time

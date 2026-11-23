@@ -8,11 +8,11 @@ backend-path = ["scripts"]
 
 [project]
 name = "trimkit"
-version = "0.3.1"
+version = "0.3.2"
 description = "Thin stable-ABI numpy bindings to mature geometry libraries: rays and boxes, collision, triangulation, convex decomposition, UV atlases, simplification, draco and SVG paths."
 readme = "README.md"
 requires-python = ">=3.12"
-# what a wheel contains: ours, then every upstream compiled in (`check` derives it from trimkit.toml)
+# includes every upstream compiled in
 license = "MIT AND Apache-2.0 AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR BSL-1.0) AND BSD-3-Clause AND ISC AND (MIT OR Apache-2.0 OR BSL-1.0) AND MPL-2.0"
 license-files = ["LICENSE", "vendor/*/LICENSE*", "vendor/*/COPYING*"]
 authors = [{ name = "Michael Dawson-Haggerty", email = "mikedh@kerfed.com" }]

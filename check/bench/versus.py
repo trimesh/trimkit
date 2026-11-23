@@ -220,6 +220,74 @@ row(
     note="build 100k boxes, query 20k",
 )
 
+# nearest boxes, queries only: the same boxes in 2D and 3D, each tree built
+# once here. rtree's `nearest_v` with `strict` trims ties, so both sides
+# answer exactly k per query; an rtree before 1.4 has only its per-query
+# `nearest`, the reference row's
+
+
+def rtree_of(boxes):
+    return rtree.index.Index(
+        ((i, (*b[0], *b[1]), None) for i, b in enumerate(boxes)),
+        properties=rtree.index.Property(dimension=boxes.shape[2]),
+    )
+
+
+def gap_distances(boxes, queries, hits):
+    # each [query, box] row's distance as `nearest` defines it, in axis order
+    query, box = queries[hits[:, 0]], boxes[hits[:, 1]]
+    gaps = np.maximum(np.maximum(box[:, 0] - query[:, 1], query[:, 0] - box[:, 1]), 0.0)
+    squared = gaps[:, 0] * gaps[:, 0]
+    for axis in range(1, gaps.shape[1]):
+        squared = squared + gaps[:, axis] * gaps[:, axis]
+    return np.sqrt(squared)
+
+
+def rtree_loop(index, lows, highs, k):
+    return [list(index.nearest((*lo, *hi), num_results=k)) for lo, hi in zip(lows, highs, strict=True)]
+
+
+VECTORIZED = hasattr(rtree.index.Index, "nearest_v")
+for d in (2, 3):
+    flat = np.ascontiguousarray(bounds[:, :, :d])
+    old_tree, new_tree = rtree_of(flat), trimkit.Boxes(flat)
+    near = rng.uniform(0, 100, (20_000, d))
+    for shape, size in (("points", 0.0), ("unit boxes", 1.0)):
+        lows, highs = near, near + size
+        nearest_queries = np.stack([lows, highs], axis=1)
+        for k in (1, 8):
+
+            def old(t=old_tree, lo=lows, hi=highs, k=k):
+                if VECTORIZED:
+                    return t.nearest_v(lo, hi, num_results=k, strict=True)
+                return rtree_loop(t, lo, hi, k)
+
+            if VECTORIZED:
+                # the same distances, sorted: the boxes may differ only within ties
+                ids, counts = old()
+                assert (counts == k).all()
+                rows = np.column_stack([np.repeat(np.arange(len(lows), dtype=np.int64), k), ids])
+                theirs = np.sort(gap_distances(flat, nearest_queries, rows).reshape((-1, k)), axis=1)
+                _, distances = new_tree.nearest(nearest_queries, maximum_hits=k)
+                assert np.array_equal(distances.reshape((-1, k)), theirs)
+            row(
+                "trimkit.Boxes.nearest",
+                "rtree.nearest_v" if VECTORIZED else "rtree.nearest",
+                old,
+                lambda t=new_tree, q=nearest_queries, k=k: t.nearest(q, maximum_hits=k),
+                repeat=3,
+                note=f"100k {d}D boxes, 20k {shape}, k={k}",
+            )
+        if d == 3 and shape == "points":
+            row(
+                "trimkit.Boxes.nearest",
+                "rtree.nearest",
+                lambda t=old_tree, lo=lows, hi=highs: rtree_loop(t, lo, hi, 1),
+                lambda t=new_tree, q=nearest_queries: t.nearest(q, maximum_hits=1),
+                repeat=2,
+                note="100k 3D boxes, 20k points, k=1, a call per query",
+            )
+
 # rays
 
 origins = rng.normal(size=(1_000_000, 3)) * 0.1

@@ -501,6 +501,7 @@ def small_calls() -> dict:
         "Boxes.bounds": lambda: trimkit.Boxes(boxes).bounds,
         "Boxes.boxes": lambda: trimkit.Boxes(boxes).boxes(),
         "Boxes.intersection": lambda: trimkit.Boxes(boxes).intersection(boxes),
+        "Boxes.nearest": lambda: trimkit.Boxes(boxes).nearest(boxes, maximum_hits=4),
         "CollisionResult": lambda: len(spheres().distances(apart, which)),
         "CollisionResult.pairs": lambda: spheres().collides(overlapping, which).pairs,
         "CollisionResult.faces": lambda: spheres().collides(overlapping, which, return_distance=True).faces,

@@ -97,6 +97,12 @@ struct BoxQueriesArgument {
     nb::handle object;
 };
 
+// A tree's own boxes as an argument: (n, 2d) or (n, 2, d), never one alone.
+// `read_box_queries` reads it with no dimension, and the signature shows both
+struct BoxesArgument {
+    nb::handle object;
+};
+
 // Voxels for `contour` as an argument: (n, 3) or (n, 4) int64 rows, or an
 // (X, Y, Z) bool or float64 volume, told apart by their dimensions. The
 // binding reads it, and the signature shows each form
@@ -115,7 +121,7 @@ struct Voxels {
     bool is_occupancy = false;
 };
 
-// What `read_box_queries` read: `count` queries of a minimum and a maximum
+// What `read_box_queries` read: `count` boxes of a minimum and a maximum
 // corner at `data`, each `dimension` float64, and whether it was given as
 // `one` query rather than a batch. Valid while it is: it holds the argument,
 // or its one copy
@@ -123,6 +129,7 @@ struct BoxQueries {
     AnyIn held;
     const double* data = nullptr;
     std::size_t count = 0;
+    std::size_t dimension = 0;
     bool one = false;
 };
 
@@ -487,15 +494,17 @@ inline Voxels read_voxels(const VoxelsArgument& argument, const std::string& nam
     return voxels;
 }
 
-// A box queries argument for boxes of `dimension`: one query, (2d,) flat as
-// (min..., max...) or (2, d) as two corners, or many, (q, 2d) or (q, 2, d),
-// told apart by the last extent as 2d is never d. Read as `read` takes any
-// array: its shape checked first, in place when exactly float64, else one
-// copy, converted with the warning when its dtype isn't, and its values
-// checked. Any other shape is the wrong type, as every argument's is
-inline BoxQueries read_box_queries(const BoxQueriesArgument& argument, std::size_t dimension, const std::string& name) {
+// A boxes argument. With the boxes' `dimension` it is queries: one, (2d,)
+// flat as (min..., max...) or (2, d) as two corners, or many, (q, 2d) or
+// (q, 2, d), told apart by the last extent as 2d is never d. With 0 it is a
+// tree's own boxes, many only, and the last extent says the dimension the
+// same way: 2 or 3. Read as `read` takes any array: its shape checked first,
+// in place when exactly float64, else one copy, converted with the warning
+// when its dtype isn't, and its values checked. Any other shape is the wrong
+// type, as every argument's is
+inline BoxQueries read_box_queries(nb::handle object, std::size_t dimension, const std::string& name) {
     // its shape as numpy sees it: none when it isn't array-like at all
-    const nb::object seen = detail::seen_as_array(argument.object);
+    const nb::object seen = detail::seen_as_array(object);
     std::vector<std::size_t> extents;
     if (seen.is_valid()) {
         for (const nb::handle extent : nb::borrow<nb::tuple>(seen.attr("shape"))) {
@@ -503,28 +512,33 @@ inline BoxQueries read_box_queries(const BoxQueriesArgument& argument, std::size
         }
     }
     const std::size_t last = extents.empty() ? 0 : extents.back();
+    // with none given, the batch's own: corners end in d and flat rows in 2d
+    const std::size_t d = dimension != 0 ? dimension : (extents.size() == 3 ? last : last / 2);
     BoxQueries queries;
-    queries.one =
-        (extents.size() == 1 && last == 2 * dimension) || (extents.size() == 2 && extents[0] == 2 && last == dimension);
-    const bool many =
-        (extents.size() == 2 && last == 2 * dimension) || (extents.size() == 3 && extents[1] == 2 && last == dimension);
+    queries.dimension = d;
+    queries.one = dimension != 0 &&
+                  ((extents.size() == 1 && last == 2 * d) || (extents.size() == 2 && extents[0] == 2 && last == d));
+    const bool many = (extents.size() == 2 && last == 2 * d) || (extents.size() == 3 && extents[1] == 2 && last == d);
     bool taken = false;
-    if (queries.one || many) {
-        taken = detail::any_readable(argument.object, &queries.held) && queries.held.dtype() == nb::dtype<double>();
+    if ((d == 2 || d == 3) && (queries.one || many)) {
+        taken = detail::any_readable(object, &queries.held) && queries.held.dtype() == nb::dtype<double>();
         if (!taken) {
-            const nb::object copy = detail::relaid(argument.object, seen, "float64", name);
+            const nb::object copy = detail::relaid(object, seen, "float64", name);
             taken = copy.is_valid() && detail::any_readable(copy, &queries.held) &&
                     queries.held.dtype() == nb::dtype<double>();
         }
     }
+    if (!taken && dimension == 0) {
+        type_error(name + " must be float64 of shape (*, 4), (*, 6), (*, 2, 2) or (*, 2, 3), not " + describe(object));
+    }
     if (!taken) {
-        type_error(name + " must be float64 of shape (" + std::to_string(2 * dimension) + ",) or (2, " +
-                   std::to_string(dimension) + ") for one query, or (*, " + std::to_string(2 * dimension) +
-                   ") or (*, 2, " + std::to_string(dimension) + ") for many, not " + describe(argument.object));
+        type_error(name + " must be float64 of shape (" + std::to_string(2 * d) + ",) or (2, " + std::to_string(d) +
+                   ") for one query, or (*, " + std::to_string(2 * d) + ") or (*, 2, " + std::to_string(d) +
+                   ") for many, not " + describe(object));
     }
     queries.data = static_cast<const double*>(queries.held.data());
     queries.count = queries.one ? 1 : extents[0];
-    check_values(queries.data, 2 * dimension * queries.count, COORDINATE_LIMIT, name);
+    check_values(queries.data, 2 * d * queries.count, COORDINATE_LIMIT, name);
     return queries;
 }
 
@@ -832,6 +846,15 @@ struct box_queries_shown {
 };
 template <>
 struct type_caster<trimkit::BoxQueriesArgument> : passed_through<trimkit::BoxQueriesArgument, box_queries_shown> {};
+
+// `BoxesArgument` shows up as each array shape it reads
+struct tree_boxes_shown {
+    // NOLINTNEXTLINE(readability-identifier-naming): the name nanobind reads
+    static constexpr auto Name = make_caster<trimkit::In<double, -1, -1>>::Name + const_name(" | ") +
+                                 make_caster<trimkit::In<double, -1, 2, -1>>::Name;
+};
+template <>
+struct type_caster<trimkit::BoxesArgument> : passed_through<trimkit::BoxesArgument, tree_boxes_shown> {};
 
 // `VoxelsArgument` shows up as each form it reads
 struct voxels_shown {

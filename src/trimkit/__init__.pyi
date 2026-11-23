@@ -219,14 +219,15 @@ class RayScene:
 
 class Boxes:
     """
-    Axis-aligned boxes built into a BVH for overlap queries: a static,
-    numpy-native replacement for a bulk-loaded R-tree.
+    Axis-aligned boxes built into a BVH for overlap and nearest queries: a
+    static, numpy-native replacement for a bulk-loaded R-tree.
 
     Parameters
     ----------
-    boxes : (n, 2, d) float64
-      Each box's minimum and maximum corner, in 2 or 3 dimensions. Copied
-      into the tree the object owns, so the boxes can't change under it.
+    boxes : (n, 2d) or (n, 2, d) float64
+      Each box's minimum and maximum corner, in 2 or 3 dimensions: flat,
+      (min..., max...), or as two corners. Copied into the tree the object
+      owns, so the boxes can't change under it.
 
     Examples
     --------
@@ -237,7 +238,7 @@ class Boxes:
     2
     """
 
-    def __init__(self, boxes: Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)]) -> None: ...
+    def __init__(self, boxes: Annotated[NDArray[numpy.float64], dict(shape=(None, None), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)]) -> None: ...
 
     def __reduce__(self) -> tuple:
         """
@@ -282,7 +283,7 @@ class Boxes:
 
     def boxes(self) -> NDArray[numpy.float64]:
         """
-        Every box, exactly as given.
+        Every box's two corners, with exactly the values given.
 
         Returns
         -------
@@ -330,6 +331,45 @@ class Boxes:
         [0, 1]
         >>> tree.intersection(np.array([[[0.5, 0.5], [2.5, 2.5]]])).tolist()
         [[0, 0], [0, 1]]
+        """
+
+    def nearest(self, queries: Annotated[NDArray[numpy.float64], dict(shape=(None,), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, None), order='C', device='cpu', writable=False)] | Annotated[NDArray[numpy.float64], dict(shape=(None, 2, None), order='C', device='cpu', writable=False)], *, maximum_hits: int | numpy.integer = 1) -> tuple[NDArray[numpy.int64], NDArray[numpy.float64]]:
+        """
+        The nearest boxes to one query box or each of many, nearest first.
+
+        A point is a query box with equal corners, and a box overlapping or
+        touching a query is at distance 0. Each query gets exactly
+        `maximum_hits` boxes, or every box when there are fewer. Of boxes at
+        the same distance, the lowest index comes first.
+
+        Parameters
+        ----------
+        queries : (2d,), (2, d), (m, 2d) or (m, 2, d) float64
+          One query's or each query's minimum and maximum corner, in the
+          boxes' dimension d: flat, (min..., max...), or as two corners.
+        maximum_hits : int, default 1
+          How many of the nearest boxes to answer per query, at least 1.
+
+        Returns
+        -------
+        hits : (n,) or (k, 2) int64
+          For one query, its nearest boxes. For many, rows of [query, box],
+          sorted by query, then distance, then box.
+        distances : (n,) or (k,) float64
+          The distance from each hit's query to its box. On each axis the gap
+          is how far apart they are, or 0 where they overlap. The distance is
+          the square root of the squared gaps summed in axis order, the same
+          float64 numpy computes. A gap under about 1e-162 squares to 0, so
+          boxes that close but apart are at distance 0 too.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import trimkit
+        >>> tree = trimkit.Boxes(np.array([[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]))
+        >>> hits, distances = tree.nearest(np.array([4.0, 3.0, 4.0, 3.0]), maximum_hits=2)
+        >>> hits.tolist(), distances.tolist()
+        ([1, 0], [1.0, 3.605551275463989])
         """
 
 def triangulate(exterior: Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)], interiors: Sequence[Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)]] = ()) -> tuple[NDArray[numpy.float64], NDArray[numpy.int64]]:

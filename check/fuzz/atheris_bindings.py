@@ -251,7 +251,11 @@ def case_collision(data: atheris.FuzzedDataProvider):
 
 def case_boxes(data: atheris.FuzzedDataProvider):
     d = data.ConsumeIntInRange(1, 4)
-    bounds = array(data, 2 * d).reshape((-1, 2, d)) if data.ConsumeBool() else array(data, None)
+    # as corners, flat, or any shape at all
+    form = data.ConsumeIntInRange(0, 2)
+    bounds = array(data, 2 * d) if form < 2 else array(data, None)
+    if form == 0:
+        bounds = bounds.reshape((-1, 2, d))
     tree = trimkit.Boxes(bounds)
     result = tree.intersection(array(data, 2 * d).reshape((-1, 2, d)))
     assert result.shape[1:] == (2,) and result[:, 1].max(initial=-1) < len(tree)
@@ -261,7 +265,24 @@ def case_boxes(data: atheris.FuzzedDataProvider):
     assert copy.tobytes() == np.ascontiguousarray(bounds, dtype=np.float64).tobytes()
     if len(copy):
         assert np.array_equal(tree.bounds, [copy[:, 0].min(axis=0), copy[:, 1].max(axis=0)])
-    return result, copy, tree.bounds
+    # the k nearest as brute force finds them, to the bit: each axis's gap
+    # squared, summed in axis order, then by distance and the lower box
+    asked = array(data, 2 * d).reshape((-1, 2, d))
+    k = data.ConsumeIntInRange(0, 5)
+    hits, distances = tree.nearest(asked, maximum_hits=k)
+    queries = np.asarray(asked, dtype=np.float64)
+    lows, highs = copy[None, :, 0], copy[None, :, 1]
+    gaps = np.maximum(np.maximum(lows - queries[:, None, 1], queries[:, None, 0] - highs), 0.0)
+    squared = gaps[..., 0] * gaps[..., 0]
+    for axis in range(1, d):
+        squared = squared + gaps[..., axis] * gaps[..., axis]
+    truth = np.sqrt(squared)
+    index = np.broadcast_to(np.arange(len(copy), dtype=np.int64), truth.shape)
+    order = np.lexsort((index, truth), axis=1)[:, :k]
+    rows = np.repeat(np.arange(len(queries), dtype=np.int64), order.shape[1])
+    assert np.array_equal(hits, np.column_stack([rows, order.ravel()]).reshape((-1, 2)))
+    assert distances.tobytes() == np.take_along_axis(truth, order, axis=1).tobytes()
+    return result, copy, tree.bounds, hits, distances
 
 
 def case_contour(data: atheris.FuzzedDataProvider):
@@ -310,6 +331,7 @@ CASES = {
     "Boxes.bounds": case_boxes,
     "Boxes.boxes": case_boxes,
     "Boxes.intersection": case_boxes,
+    "Boxes.nearest": case_boxes,
     "CollisionScene": case_collision,
     "CollisionScene.boxes": case_collision,
     "CollisionScene.collides": case_collision,

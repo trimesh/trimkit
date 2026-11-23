@@ -543,6 +543,7 @@ def test_no_leaks_and_shared_meshes():
             scene.boxes(*instances).boxes()
         boxes = trimkit.Boxes(np.zeros((4, 2, 3)))
         boxes.intersection(np.zeros((2, 2, 3)))
+        boxes.nearest(np.zeros((2, 2, 3)), maximum_hits=2)
         boxes.bounds, boxes.boxes()
         del scenes, boxes
         """
@@ -571,6 +572,26 @@ def overlapping(boxes, queries):
     return np.array(rows, dtype=np.int64).reshape((-1, 2))
 
 
+def nearest_rows(boxes, queries, k):
+    """
+    Brute force: [query, box] rows of each query's k nearest boxes by
+    distance and then box, and their distances, each axis's gap squared
+    summed in axis order as the contract says.
+    """
+    lo, hi = boxes[:, 0], boxes[:, 1]
+    rows, distances = [], []
+    for q, query in enumerate(queries):
+        gaps = np.maximum(np.maximum(lo - query[1], query[0] - hi), 0.0)
+        squared = gaps[:, 0] * gaps[:, 0]
+        for axis in range(1, boxes.shape[2]):
+            squared = squared + gaps[:, axis] * gaps[:, axis]
+        distance = np.sqrt(squared)
+        order = np.lexsort((np.arange(len(boxes), dtype=np.int64), distance))[:k]
+        rows.append(np.column_stack([np.full(len(order), q, dtype=np.int64), order]))
+        distances.append(distance[order])
+    return np.concatenate(rows).astype(np.int64).reshape((-1, 2)), np.concatenate(distances)
+
+
 def random_boxes(rng, n, d, scale=1.0):
     corner = rng.uniform(-10, 10, (n, d))
     return np.stack([corner, corner + rng.uniform(0, 3 * scale, (n, d))], axis=1)
@@ -590,6 +611,51 @@ def test_boxes_match_brute_force(d):
     assert np.array_equal(pairs, overlapping(boxes, queries))
     # some but not all queries hit something, so the comparison means something
     assert 0 < len(np.unique(pairs[:, 0])) < len(queries)
+    # the k nearest on integer boxes, where most distances tie: the same
+    # rows as brute force, the lower box first, and distances to the bit
+    corner = rng.integers(-4, 4, (2000, d)).astype(np.float64)
+    grid = np.stack([corner, corner + rng.integers(0, 2, (2000, d))], axis=1)
+    query_boxes = np.round(queries[:500])
+    tree = trimkit.Boxes(grid)
+    for k in (1, 3, 17, len(grid) + 5):
+        hits, distances = tree.nearest(query_boxes, maximum_hits=k)
+        truth_hits, truth_distances = nearest_rows(grid, query_boxes, k)
+        assert hits.dtype == np.int64 and distances.dtype == np.float64
+        assert np.array_equal(hits, truth_hits)
+        assert distances.tobytes() == truth_distances.tobytes()
+    # ties and overlaps, so the order means something
+    assert (distances == 0.0).any() and len(np.unique(distances)) < len(distances)
+
+
+@pytest.mark.parametrize("d", [2, 3])
+def test_boxes_moving_loop(d):
+    # what a simulation does: boxes and queries move along straight lines,
+    # crossing and touching, and each frame builds a new tree. Every frame
+    # both queries match brute force, and the boxes `intersection` finds are
+    # exactly those `nearest` puts at distance 0
+    rng = np.random.default_rng(20 + d)
+    start, velocity = rng.uniform(-10, 10, (300, d)), rng.normal(size=(300, d))
+    size = rng.uniform(0, 2, (300, 1))
+    query_start, query_velocity = rng.uniform(-10, 10, (40, d)), rng.normal(size=(40, d))
+    for frame in range(60):
+        corner = start + velocity * (0.25 * frame)
+        boxes = np.stack([corner, corner + size], axis=1)
+        query_corner = query_start + query_velocity * (0.25 * frame)
+        queries = np.stack([query_corner, query_corner + 0.5], axis=1)
+        # every other frame flat, through the same door
+        flat = frame % 2 == 1
+        tree = trimkit.Boxes(boxes.reshape((len(boxes), -1)) if flat else boxes)
+        asked = queries.reshape((len(queries), -1)) if flat else queries
+        truth_hits, truth_distances = nearest_rows(boxes, queries, len(boxes))
+        truth_hits = truth_hits.reshape((len(queries), len(boxes), 2))
+        truth_distances = truth_distances.reshape((len(queries), len(boxes)))
+        for k in (1, 5, len(boxes)):
+            hits, distances = tree.nearest(asked, maximum_hits=k)
+            assert np.array_equal(hits, truth_hits[:, :k].reshape((-1, 2)))
+            assert distances.tobytes() == truth_distances[:, :k].tobytes()
+        touching = truth_hits[truth_distances == 0.0]
+        touching = touching[np.lexsort((touching[:, 1], touching[:, 0]))]
+        assert np.array_equal(tree.intersection(asked), touching)
 
 
 def test_boxes_every_query_form():
@@ -614,6 +680,19 @@ def test_boxes_every_query_form():
         # one empty query is an empty column, an empty batch empty pairs
         assert tree.intersection(np.full(2 * dimension, 1e6)).shape == (0,)
         assert tree.intersection(np.zeros((0, 2 * dimension))).shape == (0, 2)
+        # the nearest: every form the same rows, and one query its batch's row
+        hits, distances = tree.nearest(queries, maximum_hits=4)
+        flat_hits, flat_distances = tree.nearest(queries.reshape((-1, 2 * dimension)), maximum_hits=4)
+        assert np.array_equal(flat_hits, hits) and flat_distances.tobytes() == distances.tobytes()
+        for query_index, query in enumerate(queries):
+            for single_query in (query, query.reshape(2 * dimension)):
+                found, near = tree.nearest(single_query, maximum_hits=4)
+                assert found.dtype == np.int64 and found.shape == (4,) and near.shape == (4,)
+                assert np.array_equal(found, hits[4 * query_index : 4 * query_index + 4, 1])
+                assert near.tobytes() == distances[4 * query_index : 4 * query_index + 4].tobytes()
+        assert np.array_equal(hits[:, 0], np.repeat(np.arange(len(queries), dtype=np.int64), 4))
+        empty = tree.nearest(np.zeros((0, 2 * dimension)))
+        assert empty[0].shape == (0, 2) and empty[1].shape == (0,)
 
 
 def test_boxes_query_shapes_refused():
@@ -629,6 +708,17 @@ def test_boxes_query_shapes_refused():
     # a shape that fits but a value that doesn't is a ValueError
     with pytest.raises(ValueError, match="finite"):
         tree.intersection(np.full(6, np.nan))
+    with pytest.raises(ValueError, match="finite"):
+        tree.nearest(np.full(6, np.inf))
+    with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
+        tree.nearest(np.zeros(4))
+    # fewer than one is refused as RayScene refuses it, and only an int is one
+    for hits in (0, -1):
+        with pytest.raises(ValueError, match="maximum_hits must be at least 1"):
+            tree.nearest(np.zeros(6), maximum_hits=hits)
+    for hits in (1.5, None):
+        with pytest.raises(TypeError):
+            tree.nearest(np.zeros(6), maximum_hits=hits)
 
 
 def test_boxes_touching_and_degenerate():
@@ -641,6 +731,16 @@ def test_boxes_touching_and_degenerate():
     tree = trimkit.Boxes(np.concatenate([boxes, points]))
     assert tree.intersection(boxes[:1]).tolist() == [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4]]
     assert tree.intersection(points).tolist() == [[0, 0], [0, 4], [1, 5]]
+    # every box it touches or overlaps is at 0, in ascending order, and a
+    # point inside one is at 0 from it
+    hits, distances = tree.nearest(boxes[:1], maximum_hits=6)
+    assert hits.tolist() == [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5]]
+    assert distances[:5].tolist() == [0.0] * 5 and distances[5] == np.sqrt(48.0)
+    hits, distances = tree.nearest(points[0], maximum_hits=3)
+    assert hits.tolist() == [0, 4, 1] and distances.tolist() == [0.0, 0.0, 0.5]
+    # of a box given twice, the lower index is nearer, whichever is asked for
+    twice = trimkit.Boxes(np.concatenate([boxes[3:], boxes[:3], boxes[3:]]))
+    assert twice.nearest(np.full(3, 9.0).repeat(2), maximum_hits=2)[0].tolist() == [0, 4]
 
 
 def test_boxes_deeply_nested():
@@ -650,6 +750,8 @@ def test_boxes_deeply_nested():
     bounds = np.stack([np.zeros((1000, 3)), np.repeat(sizes[:, None], 3, axis=1)], axis=1)
     pairs = trimkit.Boxes(bounds).intersection(np.zeros((1, 2, 3)))
     assert pairs[:, 1].tolist() == list(range(1000))
+    hits, distances = trimkit.Boxes(bounds).nearest(np.zeros((1, 2, 3)), maximum_hits=2000)
+    assert hits[:, 1].tolist() == list(range(1000)) and not distances.any()
 
 
 @pytest.mark.parametrize("d", [2, 3])
@@ -663,6 +765,12 @@ def test_boxes_round_trip(d):
     assert not np.shares_memory(copy, tree.boxes())
     assert np.array_equal(tree.bounds, [boxes[:, 0].min(axis=0), boxes[:, 1].max(axis=0)])
     assert np.array_equal(trimkit.Boxes(copy).intersection(boxes), tree.intersection(boxes))
+    again = trimkit.Boxes(copy).nearest(boxes, maximum_hits=3)
+    for mine, theirs in zip(again, tree.nearest(boxes, maximum_hits=3), strict=True):
+        assert mine.tobytes() == theirs.tobytes()
+    # flat, (min..., max...), is the same tree
+    flat = trimkit.Boxes(boxes.reshape((-1, 2 * d)))
+    assert flat.boxes().shape == boxes.shape and flat.boxes().tobytes() == boxes.tobytes()
 
 
 def test_boxes_empty():
@@ -671,15 +779,20 @@ def test_boxes_empty():
     assert tree.boxes().shape == (0, 2, 3)
     assert tree.bounds.tolist() == [[np.inf] * 3, [-np.inf] * 3]
     assert trimkit.Boxes(np.zeros((0, 2, 2))).bounds.tolist() == [[np.inf] * 2, [-np.inf] * 2]
+    # flat and empty still says its dimension
+    assert trimkit.Boxes(np.zeros((0, 6))).boxes().shape == (0, 2, 3)
+    assert trimkit.Boxes(np.zeros((0, 4))).boxes().shape == (0, 2, 2)
     assert tree.intersection(np.zeros((3, 2, 3))).shape == (0, 2)
     pairs = trimkit.Boxes(np.ones((2, 2, 2))).intersection(np.zeros((0, 2, 2)))
     assert pairs.shape == (0, 2)
+    # nothing is nearest in an empty tree, for one query or many
+    assert [a.shape for a in tree.nearest(np.zeros(6), maximum_hits=3)] == [(0,), (0,)]
+    assert [a.shape for a in tree.nearest(np.zeros((3, 2, 3)))] == [(0, 2), (0,)]
 
 
 def test_boxes_bad_input():
     good = np.zeros((1, 2, 3))
     for bounds, match in [
-        (np.zeros((1, 2, 4)), r"\(n, 2, 2\) or \(n, 2, 3\)"),
         (np.array([[[1.0, 0, 0], [0, 1, 1]]]), "minimum above its maximum"),
         (good * np.nan, "finite"),
     ]:
@@ -687,8 +800,10 @@ def test_boxes_bad_input():
             trimkit.Boxes(bounds)
     with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
         trimkit.Boxes(good).intersection(np.zeros((1, 2, 2)))
-    with pytest.raises(TypeError):
-        trimkit.Boxes(np.zeros((1, 3, 3)))
+    # a shape of no 2D or 3D boxes is the wrong type, and one box alone too
+    for shape in [(1, 2, 4), (1, 3, 3), (6,), (2, 3), (1, 5), ()]:
+        with pytest.raises(TypeError, match=r"boxes must be float64 of shape \(\*, 4\), \(\*, 6\)"):
+            trimkit.Boxes(np.zeros(shape))
 
 
 @pytest.mark.parametrize("scale", [1e-170, 1e-5, 1.0, 1e5, 1e30])
