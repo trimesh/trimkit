@@ -370,9 +370,9 @@ The tests are built so that a bug shows up on made-up inputs before anyone meets
 
 CI (the automatic checks on GitHub) runs the same commands:
 
-- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, then publishes the version `pyproject.toml` names. A version PyPI already has is left alone.
+- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, then publishes the version `pyproject.toml` names, in under an hour. A version PyPI already has is left alone.
 - A push to `release/*` does all of that except the upload.
-- Once a week, if main has moved, `.github/workflows/fuzz.yml` fuzzes for ten minutes per fuzzer. A fuzzer feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding.
+- Once a week, if main has moved, `.github/workflows/gate.yml` runs the whole gate on GitHub's 4-core machines, one job per stage, with ten minutes per fuzzer. A fuzzer feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding. The benchmark only reports there: a shared machine's timings can't gate.
 - Once a month, if main has moved, `.github/workflows/big-endian.yml` builds and tests the Debian package on s390x (an IBM mainframe chip that stores numbers in the opposite byte order, under an emulator: `distro --run --machine s390x`). It takes hours, so releases don't wait for it.
 
 `trimkit.toml` is the one build file edited by hand. It lists every upstream library (its pinned version, its patches, how it compiles, and the reason for anything unusual), every part of the extension, the wheel-size budget, and the compilers a release accepts. There is no CMake. A wheel is one shared library made from a fixed list of sources, so `scripts/builder.py` writes that list as one file for ninja, a small build tool. To see exactly what a build does, read its `build.ninja`.

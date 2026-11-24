@@ -37,8 +37,9 @@ none of these are otherwise documented.
 
 CI runs these same commands. A push to main runs `lint`, `static`, `sdist`
 and `wheel` exactly as they run here, then publishes, the one CI-only step,
-as it needs GitHub's token for PyPI; when main has moved, CI runs `fuzz` for
-longer once a week and `distro --run --machine s390x` once a month. `check` is the gate, run
+as it needs GitHub's token for PyPI, all in under an hour; when main has
+moved, CI runs every stage of `check` once a week (fuzzing for longer) and
+`distro --run --machine s390x` once a month. `check` is the gate, run
 before pushing. Everything but what ON_HOST names re-runs itself inside the
 image built from scripts/docker/Dockerfile, with the repository mounted
 read-only at /src (writable for `generate`) and builds under `build/docker/`,
