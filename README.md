@@ -6,7 +6,7 @@
 pip install trimkit
 ```
 
-It's small (~2MB wheels!), fast, and has simple and strict `numpy`-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as numpy arrays of `(n, 3) float64` vertices and `(m, 3) int64` faces.
+It's small (~2MB wheels!), fast, and has simple and strict `numpy`-only interfaces for users who know exactly what they want. The idea is that `f(numpy) -> numpy` interfaces to well proven and mostly unchanging C/C++ implementations are likely to age better than other options. It isn't `trimesh` specific in any way, and the only dependency is `numpy`. Meshes are accepted as `numpy` arrays of `(n, 3) float64` vertices and `(m, 3) int64` faces.
 
 
 ### Motivation
@@ -17,7 +17,7 @@ The regularly scheduled GitHub Actions compromise and overall threat environment
 
 Most of the Python packaging ecosystem churn has finally stabilized into `cibuildwheel`, `nanobind`, and `abi3`. The geometry implementations used here are also mostly stable, and `trimesh` currently calls one or more package options that bind them to Python. `trimkit` offers lowest common denominator interfaces to [coal](https://github.com/coal-library/coal) for collision detection, [tinybvh](https://github.com/jbikker/tinybvh) for ray checks and AABB queries, [earcut.hpp](https://github.com/mapbox/earcut.hpp) for polygon tessellation, [VHACD](https://github.com/kmammou/v-hacd) for convex decomposition, [meshoptimizer](https://github.com/zeux/meshoptimizer) for mesh simplification, [xatlas](https://github.com/jpcy/xatlas) for UV atlases, [draco](https://github.com/google/draco) for buffer compression, and a hand rolled SVG path string to buffer parser.
 
-Implementations that are new to the trimesh dependency tree are `tinybvh`, `coal`, `meshoptimizer`, the SVG path string parser, and the marching cubes implementation. `tinybvh` is the biggest change, and was picked because it looks well written, benchmarks look good, packaging embree has been a continuous source of pain, and it also provides an `rtree` alternative that benchmarks about 10x faster on numpy arrays. `coal` is an actively maintained fork of the flexible collision library (currently used by trimesh as `python-fcl`), that has more accurate convex distances. `meshoptimizer` is well-regarded, small, and easier to package than `open3d` or `fast-simplification`.
+Implementations that are new to the trimesh dependency tree are `tinybvh`, `coal`, `meshoptimizer`, the SVG path string parser, and the marching cubes implementation. `tinybvh` is the biggest change, and was picked because it looks well written, benchmarks look good, packaging embree has been a continuous source of pain, and it also provides an `rtree` alternative that benchmarks about 10x faster on `numpy` arrays. `coal` is an actively maintained fork of the flexible collision library (currently used by trimesh as `python-fcl`), that has more accurate convex distances. `meshoptimizer` is well-regarded, small, and easier to package than `open3d` or `fast-simplification`.
 
 ### Example
 
@@ -69,6 +69,7 @@ This is a bundle of nice carefully picked upstream libraries, packaged into a si
 |---|---|---|
 | `bvh` | [jbikker/tinybvh](https://github.com/jbikker/tinybvh), [KhronosGroup/Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | MIT, Apache-2.0 OR MIT |
 | `earcut` | [mapbox/earcut.hpp](https://github.com/mapbox/earcut.hpp) | ISC |
+| `triangulate` | [artem-ogre/CDT](https://github.com/artem-ogre/CDT) | MPL-2.0 |
 | `vhacd` | [kmammou/v-hacd](https://github.com/kmammou/v-hacd) | BSD-3-Clause |
 | `xatlas` | [jpcy/xatlas](https://github.com/jpcy/xatlas) | MIT |
 | `draco` | [google/draco](https://github.com/google/draco) | Apache-2.0 |
@@ -369,9 +370,10 @@ The tests are built so that a bug shows up on made-up inputs before anyone meets
 
 CI (the automatic checks on GitHub) runs the same commands:
 
-- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, and the Debian package on s390x (an IBM mainframe chip that stores numbers in the opposite byte order, under an emulator: `distro --run --machine s390x`), then publishes the version `pyproject.toml` names. A version PyPI already has is left alone.
+- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, then publishes the version `pyproject.toml` names, in under an hour. A version PyPI already has is left alone.
 - A push to `release/*` does all of that except the upload.
-- Once a week, if main has moved, `.github/workflows/fuzz.yml` fuzzes for ten minutes per fuzzer. A fuzzer feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding.
+- Once a week, if main has moved, `.github/workflows/gate.yml` runs the whole gate on GitHub's 4-core machines, one job per stage, with ten minutes per fuzzer. A fuzzer feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding. The benchmark only reports there: a shared machine's timings can't gate.
+- Once a month, if main has moved, `.github/workflows/big-endian.yml` builds and tests the Debian package on s390x (an IBM mainframe chip that stores numbers in the opposite byte order, under an emulator: `distro --run --machine s390x`). It takes hours, so releases don't wait for it.
 
 `trimkit.toml` is the one build file edited by hand. It lists every upstream library (its pinned version, its patches, how it compiles, and the reason for anything unusual), every part of the extension, the wheel-size budget, and the compilers a release accepts. There is no CMake. A wheel is one shared library made from a fixed list of sources, so `scripts/builder.py` writes that list as one file for ninja, a small build tool. To see exactly what a build does, read its `build.ninja`.
 

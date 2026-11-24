@@ -806,6 +806,39 @@ def test_all_hits_on_axis_aligned_rays_far_out(x):
     assert same_answers((every[0], every[1], every[2], every[3]), (ray, first[0], first[1], first[2]))
 
 
+@pytest.mark.parametrize("exponent", range(1, 15))
+def test_far_origins_keep_parity(exponent):
+    # Found by review: past a far hit the step was 2^-40 of its distance,
+    # about 9 at 1e13, and jumped a unit cube's far face. From as far as
+    # doubles still tell the faces apart (an ulp of 1e14 is 1/64), a ray
+    # through the cube crosses it twice, each within a few ulps of its face
+    z = 10.0**exponent
+    scene = ray_scene([box()])
+    rays, _, _, distances = scene.intersect(np.array([[0.3, 0.4, z]]), np.array([[0.0, 0.0, -1.0]]))
+    assert rays.tolist() == [0, 0]
+    assert np.abs(distances - [z - 1.0, z]).max() <= 4 * np.spacing(z)
+
+
+@pytest.mark.parametrize("length", [2.0**-1000, 1e-300, 1e-280, 1e-150, 2.0**-20, 1e-20, 3.0, 1e20, 1e30])
+def test_direction_length_changes_nothing(length):
+    # Found by review: tinybvh measures t in the direction's units, against
+    # 1e300 for no hit, so (0, 0, -1e-280) from 1e20 missed what (0, 0, -1)
+    # hits. Any length crosses at the same faces and distances: the same
+    # bits when the length is a power of two, a power of two only moving the
+    # exponent, and within a rounding otherwise
+    scene = ray_scene([box()])
+    origins = np.array([[0.3, 0.4, 3.0], [0.3, 0.4, 1e20], [-2.0, 0.45, 0.55]])
+    unit = np.array([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0], [1.0, 0.125, -0.0625]])
+    expected = scene.intersect(origins, unit)
+    given = scene.intersect(origins, unit * length)
+    assert all(np.array_equal(a, b) for a, b in zip(given[:3], expected[:3], strict=True))
+    if np.log2(length).is_integer():
+        assert np.array_equal(given[3], expected[3])
+    else:
+        assert np.allclose(given[3], expected[3], rtol=4 * np.finfo(np.float64).eps, atol=0)
+    assert scene.intersect_any(origins, unit * length).tolist() == [True, True, True]
+
+
 def test_one_row_is_every_rays():
     # a (3,) origin or direction is every ray's: the answers of the array that
     # repeats it; one row of a (1, 3) is one ray, never every ray's

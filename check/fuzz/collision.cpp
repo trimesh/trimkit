@@ -1,7 +1,8 @@
 // Property: for two small triangle meshes in any rigid poses, coal's
 // bounding-volume traversal, called as src/collision.cpp calls it, agrees
 // with testing every pair of triangles with the same leaf tests (its
-// closed-form overlap for a query without contacts or margin, else GJK): it
+// closed-form overlap for two triangles with area, else the exact triangle
+// distance, as vendor/coal's patched leafCollides tests them): it
 // never reports a collision they don't, and misses none they find but a
 // contact at zero distance, where bounding-volume rounding may fall either
 // way; and it finds the same minimum distance. A bounding volume that
@@ -143,8 +144,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     // the leaf's own tests, on the triangles as the traversal places them:
     // the closed-form overlap for two triangles with area, on the second
     // mesh's carried into the first's frame by the node's relative transform
-    // (so the arithmetic is the traversal's exactly), else GJK's distance
-    coal::GJKSolver solver(collision_request);
+    // (so the arithmetic is the traversal's exactly), else the exact triangle
+    // distance there, as the leaf measures a pair without area. Not GJK in
+    // the scene's frame, whose tolerance (1e-6) signed a point 5e-7 from a
+    // sliver as 5e-7 inside it, which exact arithmetic says it isn't
     bool any_touch = false;
     // how deep the deepest touching pair interpenetrates, by EPA: a miss is
     // only allowed when every touching pair merely touches
@@ -179,16 +182,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                 }
                 continue;
             }
-            const coal::TriangleP one(p0, p1, p2);
-            const coal::TriangleP two(q0, q1, q2);
             coal::Vec3s w1;
             coal::Vec3s w2;
-            coal::Vec3s normal;
-            const double distance = coal::internal::ShapeShapeDistance<coal::TriangleP, coal::TriangleP>(
-                &one, first_pose, &two, second_pose, &solver, false, w1, w2, normal);
+            const double distance = std::sqrt(coal::TriangleDistance::sqrTriDistance(
+                p0, p1, p2, q0, q1, q2, collision_node.RT._R(), collision_node.RT._T(), w1, w2));
             if (distance <= collision_request.collision_distance_threshold) {
                 any_touch = true;
-                deepest = std::max(deepest, depth(one, two));
+                deepest = std::max(deepest, depth(coal::TriangleP(p0, p1, p2), coal::TriangleP(q0, q1, q2)));
             }
         }
     }

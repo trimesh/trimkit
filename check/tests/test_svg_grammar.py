@@ -14,7 +14,7 @@ import re
 import pytest
 import svg_reference as ref
 from helpers import check_svg_segments, svg_round_trip, svg_rows
-from hypothesis import HealthCheck, given, reject, settings
+from hypothesis import HealthCheck, example, given, reject, settings
 from hypothesis import strategies as st
 from hypothesis.extra.lark import from_lark
 
@@ -201,6 +201,9 @@ def test_matches_svg_path(d):
 
 @SETTINGS
 @given(paths())
+# found on CI: written back turned 90 degrees, a quarter turn in radians was
+# not one (its cosine 6e-17, the short radius' size), and read back as 4 pieces
+@example(d="M 0.0 0.0M 0.0 0.0A 2.220446049250313e-16 2.0 0.0 00 0.0 4.0")
 def test_string_round_trips(d):
     # whatever the grammar allows, writing the segments back and parsing
     # them again gives the same segments (`svg_round_trip`), and what is

@@ -1,0 +1,91 @@
+# The whole gate once a week, and only when main has moved since the last
+# run: every stage of `uv run scripts check`, each as its own job on a 4-core
+# runner (the fewest that show every planted bug), so no stage waits on
+# another and none nears GitHub's 6-hour limit. The fuzzers run ten minutes
+# each instead of seconds, from the seeds in the repository, keeping nothing
+# between runs, so a run is the commit and nothing else. A failure fails the
+# run, and the fuzzers' findings are uploaded; nothing is published. `bench`
+# reports its numbers without gating: its verdict re-measures a slow cell,
+# which a shared runner can't make mean anything.
+# Actions are pinned to the commit of their release; `uv run scripts update`
+# moves them.
+name: gate
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch: # by hand: always runs
+
+permissions: {}
+
+# one gate at a time, never cancelled partway
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  changed:
+    name: anything new to check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # this workflow's last successful run
+    outputs:
+      check: ${{ steps.last.outputs.check }}
+    steps:
+      # main's head against the commit the last successful run checked (or
+      # found nothing new at): the same commit is never checked twice
+      - id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          last=$(gh run list --repo "$REPOSITORY" --workflow gate.yml --branch main --status success \
+            --limit 1 --json headSha --jq '.[0].headSha // ""')
+          if [ "$EVENT" = workflow_dispatch ] || [ "$last" != "$HEAD" ]; then
+            echo "check=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "check=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  stage:
+    name: ${{ matrix.stage }}
+    needs: changed
+    if: needs.changed.outputs.check == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { stage: lint, arguments: "" }
+          - { stage: static, arguments: "" }
+          - { stage: test, arguments: "--cores 4" } # with every planted bug, which 4 cores show
+          - { stage: asan, arguments: "" }
+          - { stage: tsan, arguments: "" }
+          - { stage: fuzz, arguments: "--seconds 600" }
+          - { stage: genmc, arguments: "" }
+          - { stage: model, arguments: "" }
+          - { stage: bench, arguments: "--quick --cores 4", reports: true }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    continue-on-error: ${{ matrix.reports == true }}
+    permissions:
+      contents: read # check out the repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - env:
+          STAGE: ${{ matrix.stage }}
+          ARGUMENTS: ${{ matrix.arguments }}
+        # word-split on purpose: ARGUMENTS is the matrix's own flags
+        run: uv run scripts "$STAGE" $ARGUMENTS
+      - if: ${{ failure() && matrix.stage == 'fuzz' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-findings
+          path: build/docker/fuzz/findings

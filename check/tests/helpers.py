@@ -2618,8 +2618,7 @@ def check_svg_arc(pieces: np.ndarray, ellipse, sweep_positive: bool, large: bool
     exactly when asked (or a half ellipse, from radii scaled up to reach).
     An arc's center is the circle's.
     """
-    center, radius_x, radius_y, phi = ellipse[:4]
-    cos, sin = math.cos(phi), math.sin(phi)
+    center, radius_x, radius_y, (cos, sin) = ellipse[:4]
     # rounding is relative to the coordinates, so in the unit frame it is
     # each axis' extent over its radius: the tolerance follows a needle-thin
     # ellipse far from the origin, but stays tight for an upright one

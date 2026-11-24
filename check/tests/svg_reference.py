@@ -107,13 +107,26 @@ def parse(grammar: Lark, d: str):
     return commands
 
 
+def turn(rotation: float) -> tuple[float, float]:
+    """
+    The cosine and sine of `rotation` degrees, exact at every multiple of 90
+    as the degrees the spec gives are: math.radians(90) is not a quarter turn
+    in doubles, and its cosine of 6e-17 would tilt a needle-thin ellipse.
+    """
+    turned = math.remainder(rotation, 360.0)
+    quarters = round(turned / 90.0)
+    rest = math.radians(turned - 90.0 * quarters)
+    c, s = math.cos(rest), math.sin(rest)
+    return ((c, s), (-s, c), (-c, -s), (s, -c))[quarters % 4]
+
+
 def _drawable(start, end, rx, ry, rotation) -> bool:
     # F.6.5.1 and F.6.6: the radii, scaled up when too small, are finite and,
     # when scaled, normal: subnormal ones can't be written back precisely
-    phi = math.radians(rotation)
+    cos, sin = turn(rotation)
     dx, dy = (start[0] - end[0]) / 2.0, (start[1] - end[1]) / 2.0
-    x1 = math.cos(phi) * dx + math.sin(phi) * dy
-    y1 = -math.sin(phi) * dx + math.cos(phi) * dy
+    x1 = cos * dx + sin * dy
+    y1 = -sin * dx + cos * dy
     reach = math.hypot(x1 / abs(rx), y1 / abs(ry))
     if reach <= 1.0:
         return True
@@ -125,13 +138,13 @@ def _drawable(start, end, rx, ry, rotation) -> bool:
 def ellipse(start, end, rx, ry, rotation, *, large: bool, sweep: bool):
     """
     The ellipse an arc lies on, F.6.5 with F.6.6: its center, radii,
-    rotation, and the arc's start angle and signed sweep, in radians. None
+    rotation as its `turn`, and the arc's start angle and signed sweep, in
+    radians. None
     when the chord is too short against the radii to place a center at all.
     Written in the ratios x1 / rx, y1 / ry, which neither overflow nor
     underflow where the squares of the radii do.
     """
-    phi = math.radians(rotation)
-    cos, sin = math.cos(phi), math.sin(phi)
+    cos, sin = turn(rotation)
     dx, dy = (start[0] - end[0]) / 2.0, (start[1] - end[1]) / 2.0
     x1, y1 = cos * dx + sin * dy, -sin * dx + cos * dy
     rx, ry = abs(rx), abs(ry)
@@ -152,16 +165,16 @@ def ellipse(start, end, rx, ry, rotation, *, large: bool, sweep: bool):
     delta = (math.atan2((-y1 - cy) / ry, (-x1 - cx) / rx) - theta) % (2.0 * math.pi)
     if not sweep:
         delta -= 2.0 * math.pi
-    return center, rx, ry, phi, theta, delta
+    return center, rx, ry, (cos, sin), theta, delta
 
 
 def arc_point(arc, angle: float):
     """
     The point at `angle` on an ellipse `ellipse` returned, F.6.3.
     """
-    (cx, cy), rx, ry, phi = arc[:4]
+    (cx, cy), rx, ry, (cos, sin) = arc[:4]
     x, y = rx * math.cos(angle), ry * math.sin(angle)
-    return (cx + math.cos(phi) * x - math.sin(phi) * y, cy + math.sin(phi) * x + math.cos(phi) * y)
+    return (cx + cos * x - sin * y, cy + sin * x + cos * y)
 
 
 def evaluate(commands) -> list[dict]:

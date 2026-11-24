@@ -139,7 +139,7 @@ def test_arcs_split_at_120_degrees(degrees, pieces, radii):
     s = rows(f"M{width!r} 0 A{radii} 0 {int(degrees > 180)} 1 {end[0]!r} {end[1]!r}")
     assert len(s) == pieces
     assert (s["kind"] == (ARC if width == 1 else CONIC)).all()
-    check_svg_arc(s, ((0.0, 0.0), width, 1.0, 0.0), True, degrees > 180)
+    check_svg_arc(s, ((0.0, 0.0), width, 1.0, (1.0, 0.0)), True, degrees > 180)
 
 
 @pytest.mark.parametrize(
@@ -271,6 +271,9 @@ def test_conics_are_affine():
         "M1 0 A1e30 12 0 0 1 1 14",  # a radius at the bound stays there
         "M0 0 A1e30 1e30 0 0 1 1 0",  # its middle 1.25e-31 off the chord, near 0 still a double
         "M1 0 A1e-300 1e-300 0 0 1 1 14",
+        # found by hypothesis: written back turned 90 degrees, whose cosine in
+        # radians (6e-17) is the short radius' size, tilting it into 4 pieces
+        "M0 0 A2.220446049250313e-16 2 0 0 0 0 4",
         "M0 0 L1e-300 -0.0 L1e300 5e-324",
         "M 0 0 L 1 1 L 2 x L 3 3",  # malformed: the parsed prefix
     ],
@@ -387,7 +390,7 @@ def test_string_hand_built_arcs():
     assert written.count("A") == 4
     s = rows(written)
     assert len(s) == 4 and s["end"][-1].tolist() == [0, -1]
-    check_svg_arc(s, ((0.0, 0.0), 1.0, 1.0, 0.0), True, True)
+    check_svg_arc(s, ((0.0, 0.0), 1.0, 1.0, (1.0, 0.0)), True, True)
     # and 90 degrees is one
     assert X.svg_string(vertices, segment(ARC, [0, 5, -1, 1])).count("A") == 1
     with pytest.raises(

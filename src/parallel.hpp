@@ -513,6 +513,28 @@ inline void park(std::atomic<std::uint32_t>& word, std::uint32_t expected, std::
     platform::wait_while_equal(word, expected, timeout_ms);
 }
 
+// Counted builds only: a check may hold idle workers parked. Held, a parked
+// worker sleeps on the wake with no timeout and doesn't exit, so what the
+// check sees of sleeping workers no schedule decides (check/fuzz/parallel.cpp).
+// Let go, the wake is bumped as well as woken, so a worker that read the hold
+// and hasn't slept yet finds the word moved: none sleeps on unbounded
+inline std::atomic<bool> idle_held{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+inline bool idle_workers_held() {
+    if constexpr (COUNTED) {
+        return idle_held.load(std::memory_order_seq_cst);
+    }
+    return false;
+}
+inline void hold_idle_workers(bool hold) {
+    if constexpr (COUNTED) {
+        idle_held.store(hold, std::memory_order_seq_cst);
+        if (!hold) {
+            pool.wake.fetch_add(1, std::memory_order_seq_cst);
+            platform::wake_all(pool.wake);
+        }
+    }
+}
+
 // -- Traced builds: each step of the protocol, logged for the model to replay ---
 
 // Traced builds (TRIMKIT_TRACE: check/verify/tla/trace.cpp alone) log each step
@@ -1203,7 +1225,12 @@ inline bool park_worker(std::uint32_t observed, std::int64_t idle_until) {
         if (now >= idle_until) {
             return false;
         }
-        park(pool.wake, observed, static_cast<std::uint32_t>(((idle_until - now) / 1'000'000) + 1));
+        auto timeout_ms = static_cast<std::uint32_t>(((idle_until - now) / 1'000'000) + 1);
+        // cppcheck-suppress knownConditionTrueFalse ; held only in a counted build's checks
+        if (idle_workers_held()) {
+            timeout_ms = platform::FOREVER;
+        }
+        park(pool.wake, observed, timeout_ms);
     }
 }
 
@@ -1355,6 +1382,12 @@ inline void* worker_main(void* /*unused*/) {
             }
             case WorkerStep::Park:
                 step = park_worker(observed, idle_until) ? WorkerStep::Scan : WorkerStep::Exit;
+                // cppcheck-suppress knownConditionTrueFalse ; held only in a counted build's checks
+                if (step == WorkerStep::Exit && idle_workers_held()) {
+                    // held (a counted build's check): idle as long again, parked again
+                    idle_until = platform::monotonic_ns() + (std::int64_t{IDLE_EXIT_MS} * 1'000'000);
+                    step = WorkerStep::Park;
+                }
                 break;
             case WorkerStep::Exit: {
                 holding.uncount();

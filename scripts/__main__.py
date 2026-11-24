@@ -8,8 +8,8 @@ The one way to build, test and check this package, locally and in CI alike:
                              licenses, shaders and cppcheck
   uv run scripts test        the strict build and the tests, in 2 GB, on the
                              last 2 cores (--cores N, or all)
-  uv run scripts static      the checks that need a build: clang-tidy, the
-                             sdist, stubs and the wheel audit
+  uv run scripts static      the checks that need a build: clang-tidy, a
+                             32-bit compile, the sdist, stubs, the wheel audit
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
   uv run scripts genmc       model check src/parallel.hpp itself with GenMC,
                              and that each bug planted in it and each memory
@@ -35,10 +35,11 @@ is a command: the stages and their parts exist for debugging one failure,
 and `fetch` and `outdated` re-vendor and audit trimkit.toml's upstreams;
 none of these are otherwise documented.
 
-CI runs these same commands. A push to main runs `lint`, `static`, `sdist`,
-`wheel` and `distro --run --machine s390x` exactly as they run here, then
-publishes, the one CI-only step, as it needs GitHub's token for PyPI; once a
-week, when main has moved, CI runs `fuzz` for longer. `check` is the gate, run
+CI runs these same commands. A push to main runs `lint`, `static`, `sdist`
+and `wheel` exactly as they run here, then publishes, the one CI-only step,
+as it needs GitHub's token for PyPI, all in under an hour; when main has
+moved, CI runs every stage of `check` once a week (fuzzing for longer) and
+`distro --run --machine s390x` once a month. `check` is the gate, run
 before pushing. Everything but what ON_HOST names re-runs itself inside the
 image built from scripts/docker/Dockerfile, with the repository mounted
 read-only at /src (writable for `generate`) and builds under `build/docker/`,
@@ -68,6 +69,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import xml.etree.ElementTree
 from pathlib import Path
 from typing import NamedTuple
 
@@ -288,50 +290,83 @@ def planted_wheels(root: Path) -> dict[str, Path]:
         (kept / name).mkdir(parents=True)
         wheels[name] = Path(shutil.copy(build.wheel, kept / name))
         (source / path).write_text((ROOT / path).read_text())
+    # and the build with no bug in it: the control the suite must pass under
+    # the same command (planted_bugs_tested)
+    build.install(PYTHON, source=source, strict=True)
+    (kept / "unplanted").mkdir(parents=True)
+    wheels["unplanted"] = Path(shutil.copy(build.wheel, kept / "unplanted"))
     return wheels
+
+
+def failing_tests(report: Path) -> list[str]:
+    # the node of each test a JUnit report says failed or errored
+    if not report.exists():
+        return []
+    failed = []
+    # pytest's own report of the run just made, not untrusted input
+    for case in xml.etree.ElementTree.parse(report).iter("testcase"):  # noqa: S314
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed.append(f"{case.get('classname', '')}::{case.get('name', '')}")
+    return failed
 
 
 def planted_bugs_tested(root: Path) -> bool:
     """
     The suite, as the stage runs it but stopping at its first failure, on
     each planted bug's wheel (`planted_wheels`, which `build --planted`
-    made), one at a time, must fail: its timing tests too, which are what
-    see Ctrl-C ignored or the GIL held, and which never flake. Returns
-    whether every bug was caught.
+    made), one at a time, must fail: its timing tests too, which see Ctrl-C
+    ignored or the GIL held. The unplanted build's wheel goes first, under
+    the same command, and must pass, so a failure says something of its bug.
+    A catch is a test failing (pytest's 1, the test read from its JUnit
+    report, matching the bug's test_verdict when it names one), a crash
+    (a signal), or a hang for a bug whose verdict is HANG; never an error
+    collecting or running the suite, or a hang of any other. Each prints the
+    test that caught it. Returns whether every bug was caught.
     """
     build = Build(root, "planted")
-    caught = {}
-    for name in code_mutants("test"):
+    report = build.dir / "planted.xml"
+
+    def suite(name: str) -> tuple[str, list[str], str]:
+        # how the suite ended on `name`'s wheel, the tests that failed, and its last line
         (wheel,) = (build.dir / "kept" / name).glob("*.whl")
-        run(
-            tool("uv"),
-            "pip",
-            "install",
-            "-q",
-            "--python",
-            build.python,
-            "--no-deps",
-            "--reinstall-package",
-            "trimkit",
-            wheel,
-        )
-        command = [build.python, "-m", "pytest", "-q", "-x", "--device-required", *test_files()]
+        run(tool("uv"), "pip", "install", "-q", "--python", build.python, "--no-deps", "--reinstall-package",
+            "trimkit", wheel)  # fmt: skip
+        report.unlink(missing_ok=True)
+        command = [build.python, "-m", "pytest", "-q", "-x", "--device-required", f"--junitxml={report}",
+                   *test_files()]  # fmt: skip
         try:
             tested = subprocess.run(
                 command, cwd=ROOT, capture_output=True, text=True, check=False, timeout=PLANTED_TEST_SECONDS
             )
         except subprocess.TimeoutExpired:
-            # hung: what a bug that deadlocks the pool does, past every test's own bound
-            caught[name] = True
-            print(f"  pass  planted bug {name}: hung past {PLANTED_TEST_SECONDS} s", flush=True)
-            continue
-        # a test failed (1), or the bug crashed the process (a signal): what
-        # catches it. Not an error collecting or running the suite (2 to 4),
-        # or no test run (5), which says nothing of the bug
-        caught[name] = tested.returncode == 1 or tested.returncode < 0
-        last = tested.stdout.strip().splitlines()[-1:] or [""]
-        verdict = "pass" if caught[name] else f"FAIL ({tested.returncode})"
-        print(f"  {verdict}  planted bug {name}: {last[0]}", flush=True)
+            return "hung", [], f"hung past {PLANTED_TEST_SECONDS} s"
+        last = (tested.stdout.strip().splitlines()[-1:] or [""])[0]
+        failed = failing_tests(report)
+        if tested.returncode == 0:
+            return "passed", failed, last
+        if tested.returncode == 1 and failed:
+            return "failed", failed, last
+        if tested.returncode < 0:
+            return "crashed", failed, last
+        return f"errored ({tested.returncode})", failed, last
+
+    ended, failed, last = suite("unplanted")
+    if ended != "passed":
+        sys.exit(
+            f"the suite {ended} on the unplanted build, beside the planted bugs: no catch counts\n  {last}"
+        )
+    caught = {}
+    for name in code_mutants("test"):
+        verdict = CODE_MUTANTS[name].test_verdict
+        ended, failed, last = suite(name)
+        if verdict == HANG:
+            caught[name] = ended == "hung"
+        elif ended == "failed":
+            caught[name] = not verdict or any(re.search(verdict, test) for test in failed)
+        else:
+            caught[name] = ended == "crashed" and not verdict
+        shown = ", ".join(failed) or last
+        print(f"  {'pass' if caught[name] else f'FAIL ({ended})'}  planted bug {name}: {shown}", flush=True)
     return all(caught.values())
 
 
@@ -445,6 +480,8 @@ def cmd_fuzz(args) -> None:
     directory = Build(args.root, "fuzz-env").install(PYTHON, fuzz=True).build_dir
     corpus = args.root / "fuzz" / "corpus"
     findings = args.root / "fuzz" / "findings"
+    # from the seeds alone, every run, as CI's: a run is the commit and nothing else
+    shutil.rmtree(corpus, ignore_errors=True)
     for name in MANIFEST.harnesses:
         (corpus / name).mkdir(parents=True, exist_ok=True)
     findings.mkdir(parents=True, exist_ok=True)
@@ -492,11 +529,18 @@ PLANTED_SECONDS = 30
 def planted_bugs_fuzzed(root: Path, corpus: Path) -> bool:
     """
     check/fuzz/parallel.cpp, built on src/parallel.hpp with each bug planted
-    for the fuzzer (CODE_MUTANTS), must crash or hang on it: so the harness
-    is shown able to fail on the real code. Returns whether every one did.
+    for the fuzzer (CODE_MUTANTS), must catch it with its own verdict: print
+    the `expect` message the bug names, or hang for a lost wake (HANG), and
+    nothing else counts (a timeout of a bug that names a message, a build that
+    fails, another check). The header as it is runs beside them, under the
+    same load, and must pass: so the harness is shown able to fail on the real
+    code. Returns whether every bug was caught.
     """
+    harness = CHECK / "fuzz" / "parallel.cpp"
 
-    def caught(planted: tuple[str, str]) -> tuple[str, bool]:
+    def ran(planted: tuple[str, str]) -> tuple[str, str, str]:
+        # (name, how it ended: "passed", "hung" or "failed", what it printed
+        # of its checks)
         name, source = planted
         here = root / "fuzz" / "planted" / name
         shutil.rmtree(here, ignore_errors=True)
@@ -505,7 +549,7 @@ def planted_bugs_fuzzed(root: Path, corpus: Path) -> bool:
         for header in (ROOT / "src").glob("*.hpp"):
             shutil.copy(header, here / "src")
         (here / "src" / "parallel.hpp").write_text(source)
-        shutil.copy(CHECK / "fuzz" / "parallel.cpp", here / "check" / "fuzz")
+        shutil.copy(harness, here / "check" / "fuzz")
         shutil.copytree(corpus, here / "corpus")
         binary = here / "fuzz_parallel"
         subprocess.run(
@@ -517,26 +561,39 @@ def planted_bugs_fuzzed(root: Path, corpus: Path) -> bool:
         try:
             done = subprocess.run(
                 [*no_aslr(), str(binary), str(here / "corpus"), f"-max_total_time={PLANTED_SECONDS}",
-                 "-timeout=10", f"-artifact_prefix={here}/"],
-                cwd=here, capture_output=True, check=False, timeout=PLANTED_SECONDS + 30,
+                 "-seed=1", "-timeout=10", f"-artifact_prefix={here}/"],
+                cwd=here, capture_output=True, text=True, check=False, timeout=PLANTED_SECONDS + 30,
             )  # fmt: skip
-        except subprocess.TimeoutExpired:
-            return name, True  # hung in a fixed check, before libFuzzer's own timeout applies
-        return name, done.returncode != 0
+        except subprocess.TimeoutExpired as hung:
+            said = hung.stderr or ""
+            said = said.decode(errors="replace") if isinstance(said, bytes) else said
+            return name, "hung", said
+        if "ERROR: libFuzzer: timeout" in done.stderr:
+            return name, "hung", done.stderr  # an input that waited past -timeout: hung all the same
+        return name, "passed" if done.returncode == 0 else "failed", done.stderr
+
+    def checks_said(output: str) -> list[str]:
+        return [line for line in output.splitlines() if line.startswith("check/fuzz/parallel.cpp: ")]
 
     planted = {name: source for name, (_, source) in code_mutants("fuzz").items()}
-    # and the header as it is, run beside them under the same load: it must
-    # survive, or a crash or hang of a planted one says nothing of its bug
     control = ("unplanted", (ROOT / "src" / "parallel.hpp").read_text())
     with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
-        (_, failed), *results = pool.map(caught, [control, *planted.items()])
-    if failed:
+        (_, ended, said), *results = pool.map(ran, [control, *planted.items()])
+    if ended != "passed":
         sys.exit(
-            "the fuzz harness failed src/parallel.hpp as it is, beside the planted bugs: no catch counts"
+            f"the fuzz harness {ended} on src/parallel.hpp as it is, beside the planted bugs:"
+            " no catch counts\n  " + "\n  ".join(checks_said(said))
         )
-    for name, found in results:
-        print(f"  {'pass' if found else 'FAIL'}  planted bug {name}", flush=True)
-    return all(found for _, found in results)
+    caught = True
+    for name, ended, said in results:
+        verdict = CODE_MUTANTS[name].fuzz_verdict
+        lines = checks_said(said)
+        found = ended == "hung" if verdict == HANG else f"check/fuzz/parallel.cpp: {verdict}" in lines
+        caught = caught and found
+        why = "hung" if ended == "hung" else (lines[-1] if lines else f"{ended}, saying nothing")
+        expected = "" if found else f" (its verdict: {verdict})"
+        print(f"  {'pass' if found else 'FAIL'}  planted bug {name}: {why}{expected}", flush=True)
+    return caught
 
 
 def replay_32bit(root: Path, corpus: Path, findings: Path) -> bool:
@@ -605,6 +662,35 @@ def cmd_tidy(args) -> None:
     header_filter = f"--header-filter=^({'|'.join(ours)})/"
     config = f"--config-file={ROOT / 'scripts' / 'clang-tidy.yaml'}"
     run(tool("clang-tidy"), "--quiet", config, header_filter, "-p", dev(args.root).build_dir, *sources)
+
+
+def cmd_syntax32(args) -> None:
+    """
+    Our Python-free sources compiled again as a 32-bit program, syntax only,
+    with exactly the flags the dev build used (the release warnings and
+    -Werror): what the win32 wheel's -Wshorten-64-to-32 and the i686
+    packages see, a size_t of 32 bits, which no build of this machine's
+    has. The binding (trimkit.cpp) needs 32-bit Python headers, so the win32
+    wheel job is its check.
+    """
+    build = dev(args.root)
+    compile_commands(args.root)
+    entries = json.loads((build.build_dir / "compile_commands.json").read_text())
+    ours = {str(p) for p in compile_commands(args.root) if p.name != "trimkit.cpp"}
+    for entry in entries:
+        if entry["file"] not in ours:
+            continue
+        given = shlex.split(entry["command"])
+        command, skip = [given[0], "-m32", "-fsyntax-only"], False
+        for word in given[1:]:
+            if skip:
+                skip = False
+            elif word in ("-o", "-MF"):
+                skip = True  # and the path after it
+            elif word not in ("-c", "-MD") and not word.startswith(("-flto", "-fprofile")):
+                command.append(word)
+        run(*command, cwd=entry["directory"])
+    print(f"ok: {len(ours)} sources compile as a 32-bit program with the release warnings")
 
 
 def cmd_cppcheck(args) -> None:
@@ -1302,7 +1388,16 @@ _TWO_JOBS = (
     "orders the last job's last leave before the next reservation of its slot: two jobs, which GenMC can't"
     " reach here (some 170 million executions). Argued only"
 )
+_COUNTED_ONLY = (
+    "holds idle workers for check/fuzz/parallel.cpp's checks, in counted builds alone, which GenMC never"
+    " builds. seq_cst because letting go is a store, then a bump of the wake, both before a worker's"
+    " seq_cst look at the wake and then at the hold: one order, so a worker woken by the bump sees the"
+    " hold let go, and never parks again without a timeout"
+)
 GENMC_MUTANTS_SURVIVING: dict[str, str] = {
+    "return idle_held.load(std::memory_order_seq_cst);  [seq_cst -> acquire]": _COUNTED_ONLY,
+    "idle_held.store(hold, std::memory_order_seq_cst);  [seq_cst -> release]": _COUNTED_ONLY,
+    "pool.wake.fetch_add(1, std::memory_order_seq_cst);  [seq_cst -> acq_rel]": _COUNTED_ONLY,
     "if ((held_indexes[index / 64].fetch_or(bit, std::memory_order_acquire) & bit) == 0) {  [acquire -> relaxed]": _TWO_HOLDERS,  # noqa: E501
     "held_indexes[index / 64].fetch_and(~(std::uint64_t{1} << (index % 64)), std::memory_order_release);  [release -> relaxed]": _TWO_HOLDERS,  # noqa: E501
     "std::memory_order_acquire, std::memory_order_relaxed)) {  [acquire -> relaxed]": _TWO_JOBS,
@@ -1322,9 +1417,10 @@ GENMC_MUTANTS_SURVIVING: dict[str, str] = {
 }
 
 
-# how GenMC words what it found in the code: its verdicts, never a compiler's
-# error (lowercase) or a time limit
-GENMC_FOUND = re.compile(r"Error|FAILURE|violation|race")
+# how GenMC words what it found in the code, its one verdict line ("Error:
+# Safety violation!", "Error: Non-atomic race!"): never a compiler's error,
+# GenMC's own INTERNAL FAILURE, a time limit, or "trace" in some other line
+GENMC_FOUND = re.compile(r"^Error: ")
 
 
 def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
@@ -1544,6 +1640,18 @@ class PlantedBug(NamedTuple):
     caught_by: tuple[str, ...]
     edits: tuple[tuple[str, str], ...]
     path: str = "src/parallel.hpp"
+    # What catching it looks like, so a failure for any other reason (a build
+    # error, a timeout, an unrelated check under load) is no catch. For the
+    # fuzzer: the `expect` message check/fuzz/parallel.cpp must print, or HANG
+    # for a bug whose only sign is a wait that never ends (a lost wake), which
+    # checked builds never time out of. For the suite: a pattern the failing
+    # test's node id must match, or "" for any test the unplanted build passes
+    fuzz_verdict: str = ""
+    test_verdict: str = ""
+
+
+# the verdict of a planted bug that only shows as a wait that never ends
+HANG = "hang"
 
 
 # Bugs planted one at a time, each with the checks that must fail on it. A
@@ -1698,10 +1806,12 @@ CODE_MUTANTS = {
                 "",
             ),
         ),
+        fuzz_verdict=HANG,
     ),
     "leave_never_wakes": PlantedBug(
         ("fuzz",),
         (("        platform::wake_all(slot.left);\n", ""),),
+        fuzz_verdict=HANG,
     ),
     "never_wake_sleepers": PlantedBug(
         ("fuzz",),
@@ -1711,6 +1821,7 @@ CODE_MUTANTS = {
                 "const std::uint32_t woken = 0;",
             ),
         ),
+        fuzz_verdict="a call worth sharing woke no sleeping worker",
     ),
     "failure_not_stopping": PlantedBug(
         ("fuzz",),
@@ -1721,14 +1832,17 @@ CODE_MUTANTS = {
                 "}\n\n// Items [begin, end) run on this thread",
             ),
         ),
+        fuzz_verdict="an item that threw left the job running to the end",
     ),
     "fork_fails_nothing": PlantedBug(
         ("fuzz",),
         (("        held->job->forked.store(true, std::memory_order_relaxed);\n", ""),),
+        fuzz_verdict="a fork left a shared call to answer",
     ),
     "fork_closes_wiped_slot": PlantedBug(
         ("fuzz",),
         (("        if (generation_ == platform::fork_generation()) {", "        if (slot_ != nullptr) {"),),
+        fuzz_verdict="a call forked from its poll answered in the child",
     ),
     # the idle respawn the pool once had: a parked worker gave up at its
     # timeout without comparing the wake, and an exit seeing the wake moved
@@ -1779,10 +1893,12 @@ CODE_MUTANTS = {
                 "                return nullptr;\n",
             ),
         ),
+        fuzz_verdict="P3: a thread started with no call running",
     ),
     "exit_refusal_forgotten": PlantedBug(
         ("fuzz",),
         (("        job.refused_at_exit.store(true, std::memory_order_relaxed);\n", ""),),
+        fuzz_verdict="a job stopped at exit returned without saying so",
     ),
     # RayScene.intersect's loop handed a Stop that never stops: Ctrl-C can't land in it
     "intersect_ignores_stop": PlantedBug(
@@ -2080,6 +2196,8 @@ def code_mutants(checker: str) -> dict[str, tuple[str, str]]:
         unknown = set(bug.caught_by) - {"genmc", "trace", "fuzz", "test"}
         if unknown or (bug.path != "src/parallel.hpp" and bug.caught_by != ("test",)):
             sys.exit(f"CODE_MUTANTS: {name} can't be caught by {bug.caught_by}")
+        if ("fuzz" in bug.caught_by) != bool(bug.fuzz_verdict):
+            sys.exit(f"CODE_MUTANTS: {name} must name its fuzz_verdict exactly when the fuzzer catches it")
         if checker in bug.caught_by:
             mutated[name] = (bug.path, source)
     return mutated
@@ -2298,6 +2416,7 @@ def cmd_static(args) -> None:
         cmd_stubs,
         cmd_audit,
         cmd_tidy,
+        cmd_syntax32,
         cmd_threads,
     ):
         command(args)
@@ -2492,6 +2611,17 @@ STAGES = ["lint", "test", "static", "asan", "tsan", "fuzz", "bench", "genmc", "m
 
 
 def cmd_check(args) -> None:
+    # a gate that can't show every planted bug says so, rather than passing
+    # without them
+    if (os.cpu_count() or 1) < PLANTED_TEST_CORES:
+        sys.exit(
+            f"check shows every planted bug on {PLANTED_TEST_CORES} cores, of which this machine has fewer"
+        )
+    # a pass is of a commit, never of a tree still changing: what it passed is
+    # what can be pushed, and an edit after it is ungated
+    if run(tool("git"), "status", "--porcelain", "--untracked-files=no", capture=True).strip():
+        sys.exit("check gates a commit: commit or stash the changes first")
+    tree = run(tool("git"), "rev-parse", "HEAD^{tree}", capture=True).strip()
     results = []
     for stage in STAGES:
         command = [sys.executable, str(ROOT / "scripts"), "--root", str(args.root), stage]
@@ -2515,6 +2645,10 @@ def cmd_check(args) -> None:
     if failed:
         rerun = "\n".join(f"  uv run scripts {stage}" for stage in failed)
         sys.exit(f"check failed; rerun a stage on its own with:\n{rerun}")
+    if run(tool("git"), "rev-parse", "HEAD^{tree}", capture=True).strip() != tree:
+        sys.exit("check passed a tree that has since changed: nothing is gated")
+    (args.root / "check-passed").write_text(tree + "\n")
+    print(f"check passed tree {tree}, written to {args.root / 'check-passed'}")
 
 
 IMAGE = "trimkit-dev"
@@ -2530,8 +2664,10 @@ CORES = 2
 # checkers and nothing that measures time (the traced driver pins itself to
 # TRACE_CORES): half the machine, or they are most of an hour on two cores.
 # And `fuzz`, which measures no time either, and whose pool harness shows an
-# idle respawn (CODE_MUTANTS) only with more than one worker to go idle
-VERIFY_CORES = max(CORES, (os.cpu_count() or CORES) // 2)
+# idle respawn (CODE_MUTANTS) only with more than one worker to go idle: at
+# least PLANTED_TEST_CORES, as the suite's planted bugs need, so a 4-core
+# runner checks everything a 32-core machine does
+VERIFY_CORES = min(os.cpu_count() or CORES, max(PLANTED_TEST_CORES, (os.cpu_count() or CORES) // 2))
 HALF_MACHINE = VERIFIES | {"fuzz"}
 
 
@@ -2634,7 +2770,7 @@ def main() -> None:
         "check": "the gate: lint, test, static, ASan, TSan, fuzz, bench --quick, genmc and model",
         "lint": "the fast deterministic checks, nothing compiled",
         "test": "the strict build and the tests in 2 GB, on the last 2 cores (--cores N or all)",
-        "static": "the checks that need a build: clang-tidy, the sdist, stubs and the wheel audit",
+        "static": "the checks that need a build: clang-tidy, a 32-bit compile, the sdist, stubs, wheel audit",
         "bench": "the pool against hand-written pools, 144 cells (--quick: the short calls)",
         "distro": "Debian and Fedora packaging (--run: build, test and lint them; --machine i686|s390x)",
         "genmc": "model check src/parallel.hpp itself with GenMC, and its weakened memory orders",

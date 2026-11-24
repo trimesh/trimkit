@@ -79,8 +79,7 @@ public:
         for (std::size_t f = 0; f < face_count_; f++) {
             triangles[f] = coal::Triangle32(mesh.faces[3 * f], mesh.faces[(3 * f) + 1], mesh.faces[(3 * f) + 2]);
         }
-        const PointBounds bounds = bounds_of(mesh.vertices, mesh.vertex_count);
-        center_half(bounds.lowest, bounds.highest, box_.data());
+        bounds_ = bounds_of(mesh.vertices, mesh.vertex_count);
         model_ = std::make_shared<Model>();
         model_->beginModel(static_cast<unsigned int>(face_count_), static_cast<unsigned int>(mesh.vertex_count));
         model_->addSubModel(vertices, triangles);
@@ -120,14 +119,14 @@ public:
     // the root's oriented box and rectangle swept sphere, both, as coal's
     // traversals test them
     const coal::OBBRSS& root() const { return model_->getBV(0).bv; }
-    // the box of its vertices: (center, half extent) per axis
-    const std::array<double, 6>& box() const { return box_; }
+    // the box of its vertices, its least and greatest value on each axis
+    const PointBounds& corners() const { return bounds_; }
 
 private:
     std::size_t face_count_ = 0;
     // the vertices of a mesh without faces, which no model holds
     std::vector<double> loose_vertices_;
-    std::array<double, 6> box_{};
+    PointBounds bounds_{};
     std::shared_ptr<Model> model_;
     std::unique_ptr<Convex> convex_;
 };
@@ -142,7 +141,8 @@ using trimkit::CollisionRow;
 struct Placed {
     const CollisionMesh* mesh = nullptr;
     coal::Transform3s transform;
-    std::array<double, 6> box{};
+    std::array<double, 6> box{};     // (center, half extent) per axis, as the culls test it
+    trimkit::PointBounds corners{};  // the same box as its two corners, exactly as computed
 };
 
 // what a cull pads a placed box by: BOX_SLACK of its farthest coordinate,
@@ -197,22 +197,36 @@ bool may_touch(const Placed& a, const Placed& b, const coal::CollisionRequest& r
                                               request, lower);
 }
 
-// Whether two placed meshes may be at most `bound` apart: their world
+// How far a measurement of two placed meshes runs to settle whether they
+// are within `bound`: past it by their boxes' slack, and by at least one
+// double. Every lower bound that culls or stops a measurement early (the
+// boxes', the roots', GJK's) rounds like a box does, so one held to the bare
+// bound loses pairs exactly that far; whether a pair is within is decided
+// after, exactly, on the distance measured (`distance_pair`)
+double cutoff_for(const Placed& a, const Placed& b, double bound) {
+    if (std::isinf(bound)) {
+        return std::numeric_limits<double>::max();
+    }
+    return std::max(std::nextafter(bound, std::numeric_limits<double>::infinity()),
+                    bound + slack(a.box) + slack(b.box));
+}
+
+// Whether two placed meshes may be within `cutoff_for` of them: their world
 // boxes, then their roots' rectangle swept spheres, a lower bound on their
 // distance, as coal's distance traversal prunes. False only when they can't.
 // Worth up to 7% of a bounded query between convex solids, and nothing
 // between meshes (2026-11-12, the same three robots, answers identical)
-bool may_be_within(const Placed& a, const Placed& b, double bound) {
-    if (a.mesh->empty() || b.mesh->empty() || box_gap(a.box, b.box) > bound) {
+bool may_be_within(const Placed& a, const Placed& b, double cutoff) {
+    if (a.mesh->empty() || b.mesh->empty() || box_gap(a.box, b.box) > cutoff) {
         return false;
     }
-    if (std::isinf(bound)) {
+    if (cutoff == std::numeric_limits<double>::max()) {
         return true;
     }
     coal::Matrix3s rotation;
     coal::Vec3s translation;
     relative(a, b, rotation, translation);
-    return coal::distance(rotation, translation, a.mesh->root(), b.mesh->root()) <= bound;
+    return coal::distance(rotation, translation, a.mesh->root(), b.mesh->root()) <= cutoff;
 }
 
 // coal warm-starts every support search from the solver's last run (`set`
@@ -296,12 +310,10 @@ bool swapped_for(const Placed& a, const Placed& b) {
 // farther apart than `upper_bound` is left as it is, infinitely far with no
 // points or direction, and coal stops measuring it as soon as it can tell:
 // GJK by its own early stop, a hierarchy by never descending into boxes
-// farther than the closest distance so far, which starts at the bound.
+// farther than the closest distance so far, which starts at `cutoff`
+// (`cutoff_for` the bound): neither stops on a pair exactly that far.
 void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest& request, double upper_bound,
-                   coal::GJKSolver& solver, coal::DistanceResult& result, CollisionRow* row) {
-    // just past the bound, so a pair exactly that far is still measured
-    const double past = std::isinf(upper_bound) ? std::numeric_limits<double>::max()
-                                                : std::nextafter(upper_bound, std::numeric_limits<double>::infinity());
+                   double cutoff, coal::GJKSolver& solver, coal::DistanceResult& result, CollisionRow* row) {
     result.clear();
     const Convex* solid_a = a.mesh->convex();
     const Convex* solid_b = b.mesh->convex();
@@ -311,7 +323,7 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
     if (solid_a != nullptr && solid_b != nullptr) {
         start_solver(solver, request);
         solver.gjk_initial_guess = coal::GJKInitialGuess::BoundingVolumeGuess;  // as collide_pair
-        solver.distance_upper_bound = past;
+        solver.distance_upper_bound = cutoff;
         measured = coal::ShapeShapeDistance<coal::ConvexBase32, coal::ConvexBase32>(
             solid_a, a.transform, solid_b, b.transform, &solver, request, result);
         if (solver.gjk.status == coal::details::GJK::NoCollisionEarlyStopped) {
@@ -322,14 +334,14 @@ void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest
         const Placed& surface = swapped ? b : a;
         const Placed& solid = swapped ? a : b;
         start_solver(solver, request);
-        result.min_distance = past;
+        result.min_distance = cutoff;
         MeshConvexDistance node;
         coal::initialize(node, surface.mesh->model(), surface.transform, solid.mesh->convex()->base(), solid.transform,
                          &solver, request, result);
         coal::distance(&node);
         measured = result.min_distance;
     } else {
-        result.min_distance = past;
+        result.min_distance = cutoff;
         coal::MeshDistanceTraversalNodeOBBRSS node;
         coal::initialize(node, a.mesh->model(), a.transform, b.mesh->model(), b.transform, request, result);
         coal::distance(&node);
@@ -397,27 +409,39 @@ std::vector<Placed> place(const std::vector<std::unique_ptr<CollisionMesh>>& mes
             translation[r] = m[(4 * r) + 3];
         }
         // a mesh without faces never touches anything: a point where it is placed
-        std::array<double, 6> box{translation[0], translation[1], translation[2], 0.0, 0.0, 0.0};
+        trimkit::PointBounds corners = {{translation[0], translation[1], translation[2]},
+                                        {translation[0], translation[1], translation[2]}};
         if (!mesh->empty()) {
+            // The vertices' box carried corner by corner, as tinybvh carries
+            // a ray scene's: a box rebuilt from a center and half extent
+            // loses its small end beside a far one ([-1, 1e17] would start
+            // at 0), and an identity placement here is exact. Then narrowed
+            // by the oriented root box, which coal holds as a center and half
+            // extent, so it is padded by its own rounding first
+            const trimkit::PointBounds& vertex = mesh->corners();
             const coal::OBB& oriented = mesh->bounds();
-            const std::array<double, 6>& vertex_box = mesh->box();
             const coal::Vec3s oriented_center = (rotation * oriented.To) + translation;
             const coal::Matrix3s oriented_axes = rotation * oriented.axes;
-            const coal::Vec3s vertex_center =
-                (rotation * coal::Vec3s(vertex_box[0], vertex_box[1], vertex_box[2])) + translation;
-            const coal::Vec3s vertex_half(vertex_box[3], vertex_box[4], vertex_box[5]);
-            double lowest[3];
-            double highest[3];
             for (Eigen::Index r = 0; r < 3; r++) {
+                double low = translation[r];
+                double high = translation[r];
+                for (Eigen::Index c = 0; c < 3; c++) {
+                    const double from = rotation(r, c) * vertex.lowest[c];
+                    const double to = rotation(r, c) * vertex.highest[c];
+                    low += std::min(from, to);
+                    high += std::max(from, to);
+                }
                 const double oriented_half = oriented_axes.row(r).cwiseAbs().dot(oriented.extent);
-                const double vertex_extent = rotation.row(r).cwiseAbs().dot(vertex_half);
-                lowest[r] = std::max(oriented_center[r] - oriented_half, vertex_center[r] - vertex_extent);
-                highest[r] = std::min(oriented_center[r] + oriented_half, vertex_center[r] + vertex_extent);
+                const double rounding = trimkit::BOX_SLACK * (std::abs(oriented_center[r]) + oriented_half);
+                const auto axis = static_cast<std::size_t>(r);
+                corners.lowest[axis] = std::max(oriented_center[r] - oriented_half - rounding, low);
+                corners.highest[axis] = std::min(oriented_center[r] + oriented_half + rounding, high);
             }
-            trimkit::refuse_placed_beyond(lowest, highest, i);
-            trimkit::center_half(lowest, highest, box.data());
+            trimkit::refuse_placed_beyond(corners.lowest, corners.highest, i);
         }
-        placed[i] = {mesh, coal::Transform3s(rotation, translation), box};
+        std::array<double, 6> box{};
+        trimkit::center_half(corners.lowest, corners.highest, box.data());
+        placed[i] = {mesh, coal::Transform3s(rotation, translation), box, corners};
     }
     return placed;
 }
@@ -516,8 +540,8 @@ std::vector<double> trimkit::CollisionMeshes::boxes(const Instances& instances) 
     std::vector<double> boxes(6 * placed.size());
     for (std::size_t i = 0; i < placed.size(); i++) {
         for (std::size_t axis = 0; axis < 3; axis++) {
-            boxes[(6 * i) + axis] = placed[i].box[axis] - placed[i].box[3 + axis];
-            boxes[(6 * i) + 3 + axis] = placed[i].box[axis] + placed[i].box[3 + axis];
+            boxes[(6 * i) + axis] = placed[i].corners.lowest[axis];
+            boxes[(6 * i) + 3 + axis] = placed[i].corners.highest[axis];
         }
     }
     return boxes;
@@ -528,7 +552,7 @@ void trimkit::CollisionMeshes::collides(const Instances& instances,
                                         std::int64_t maximum_contacts, const parallel::Stop& stop,
                                         std::vector<Unset<std::int64_t>>* touching,
                                         std::vector<Unset<CollisionRow>>* contacts) const {
-    // negated, so not a number is refused too
+    // NOLINTNEXTLINE(readability-simplify-boolean-expr): negated, so NaN is refused too
     if (!(margin >= 0.0 && margin <= COORDINATE_LIMIT)) {
         refuse(std::string("margin must be at least 0 and within ") + COORDINATE_LIMIT_TEXT);
     }
@@ -565,12 +589,20 @@ void trimkit::CollisionMeshes::collides(const Instances& instances,
                         continue;
                     }
                     const bool swapped = swapped_for(a, b);
+                    // coal signs two crossing triangles by how deep each
+                    // reaches as a solid, but a surface has no inside: two of
+                    // them are 0 apart once they touch, with no direction, as
+                    // distance_pair measures them
+                    const bool surfaces = a.mesh->convex() == nullptr && b.mesh->convex() == nullptr;
                     for (const coal::Contact& contact : result.getContacts()) {
                         CollisionRow& row = kept.emplace_back();
                         row.pair[0] = rows[2 * p];
                         row.pair[1] = rows[(2 * p) + 1];
-                        write_witness(swapped, contact.b1, contact.b2, contact.nearest_points, contact.normal,
-                                      contact.penetration_depth, &row);
+                        const bool crossing = surfaces && !(contact.penetration_depth > 0.0);
+                        const coal::Vec3s normal =
+                            crossing ? coal::Vec3s::Constant(std::numeric_limits<double>::quiet_NaN()) : contact.normal;
+                        write_witness(swapped, contact.b1, contact.b2, contact.nearest_points, normal,
+                                      crossing ? 0.0 : contact.penetration_depth, &row);
                     }
                 }
             },
@@ -647,8 +679,9 @@ std::vector<trimkit::Unset<trimkit::CollisionRow>> trimkit::CollisionMeshes::dis
                 out[p].pair[1] = static_cast<std::int64_t>(second);
                 const Placed& a = placed[first];
                 const Placed& b = placed[second];
-                if (may_be_within(a, b, upper_bound)) {
-                    distance_pair(a, b, request, upper_bound, solver, result, &out[p]);
+                const double cutoff = cutoff_for(a, b, upper_bound);
+                if (may_be_within(a, b, cutoff)) {
+                    distance_pair(a, b, request, upper_bound, cutoff, solver, result, &out[p]);
                 } else {
                     write_far(&out[p]);
                 }

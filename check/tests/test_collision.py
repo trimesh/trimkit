@@ -4,6 +4,8 @@ difference between convex solids and triangle surfaces, exact answers on
 boxes, and agreement with an exact separating-axis test over random poses.
 """
 
+import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -120,6 +122,17 @@ def test_every_pair_past_memory_is_memory_error():
     # 300,000 instances have 4.5e10 pairs, more than any memory holds: a 32-bit
     # size_t wrapped their count, and gave too few rows back
     count = 300_000
+    scene = trimkit.CollisionScene([box()])
+    with pytest.raises(MemoryError):
+        scene.distances(np.tile(np.eye(4), (count, 1, 1)), np.zeros(count, np.int64))
+
+
+@pytest.mark.skipif(sys.maxsize > 2**32, reason="only a 32-bit vector's max_size is below these rows")
+def test_rows_past_a_vectors_size_are_memory_error():
+    # Found by review: 6,500 instances have 2.1e7 pairs, 2.2 GB of rows,
+    # more than a 32-bit vector's max_size of PTRDIFF_MAX bytes, whose
+    # std::length_error nanobind raised as ValueError
+    count = 6_500
     scene = trimkit.CollisionScene([box()])
     with pytest.raises(MemoryError):
         scene.distances(np.tile(np.eye(4), (count, 1, 1)), np.zeros(count, np.int64))
@@ -425,6 +438,20 @@ def test_boxes_bound_tightly():
     assert bars.distances(matrices).distances == pytest.approx([2.9])
 
 
+@pytest.mark.parametrize("convex", [False, True])
+def test_boxes_hold_far_and_tiny_meshes(convex):
+    # Found by review: a box rebuilt from its center and half extent lost
+    # its small end beside a far one ([-1, 1e17] came back starting at 0) and
+    # a needle's tip. Placed where they are, each box is exactly its
+    # vertices' least and greatest
+    faces = np.array([[0, 1, 2]], dtype=np.int64)
+    far = np.array([[-1.0, 0.0, 0.0], [1e17, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    needle = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1e-300, 0.0]])
+    for vertices in (far, needle):
+        (corners,) = scene(convex, (vertices, faces)).boxes().boxes()
+        assert corners.tolist() == [vertices.min(axis=0).tolist(), vertices.max(axis=0).tolist()]
+
+
 @pytest.mark.parametrize("convex", [(False, False), (False, True), (True, False), (True, True)])
 def test_upper_bound_is_exact(convex):
     # two spheres whose boxes come within the bound while the spheres don't:
@@ -448,6 +475,45 @@ def test_upper_bound_is_exact(convex):
         assert near.tolist() == measured.tolist()
         assert np.array_equal(near_points, points) and np.array_equal(near_normals, normals)
     assert two.distances(matrices, upper_bound=np.nextafter(gap, 0.0)).distances.tolist() == [np.inf]
+
+
+def exact_rotation(rng) -> np.ndarray:
+    # a rotation from a uniform quaternion with only +, *, / and a square
+    # root, each correctly rounded, so every platform builds the same bits
+    # (QR goes through LAPACK, and normal draws through libm)
+    w, x, y, z = (float(v) for v in rng.uniform(-1.0, 1.0, 4))
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+@pytest.mark.parametrize("convex", [False, True])
+def test_upper_bound_at_the_distance_measures_it(convex):
+    # Found by review: the cull and coal's early stops held rounded lower
+    # bounds to the bare bound, so about 5% of convex pairs exactly that far
+    # came back infinitely far. Over many poses, a bound of exactly the
+    # distance measures the pair as no bound does, and the double just below
+    # it doesn't
+    rng = np.random.default_rng(7)
+    two = scene(convex, box(), box())
+    for _ in range(300):
+        offset = rng.uniform(-3.0, 3.0, 3)
+        matrices = placed(0.0, offset, rotations=[exact_rotation(rng), exact_rotation(rng)])
+        unbounded = two.distances(matrices)
+        gap = unbounded.distances[0]
+        if not gap > 0:
+            continue  # overlapping: no bound below it to ask about
+        at = two.distances(matrices, upper_bound=gap)
+        assert at.distances.tolist() == [gap], offset.tolist()
+        assert np.array_equal(at.points, unbounded.points) and np.array_equal(at.normals, unbounded.normals)
+        below = two.distances(matrices, upper_bound=np.nextafter(gap, 0.0))
+        assert below.distances.tolist() == [np.inf], offset.tolist()
 
 
 @pytest.mark.parametrize("offset", [1.7, 0.6], ids=["apart", "penetrating"])
@@ -599,7 +665,10 @@ def test_contact_depth_is_the_separating_axis_overlap():
 
 def test_mesh_contacts_name_real_faces():
     # two triangle surfaces crossing: every contact names a real triangle of
-    # each mesh, and each witness point lies on its own triangle's plane
+    # each mesh, and each witness point lies on its own triangle's plane. A
+    # surface has no inside, so a contact is never negative: crossing, it is
+    # 0 apart with a NaN normal, as `distances` measures it, never coal's
+    # depth of two crossing triangles taken as solids
     rng = np.random.default_rng(12)
     meshes = [sphere(10, 20), box()]
     surfaces = scene(False, *meshes)
@@ -609,6 +678,8 @@ def test_mesh_contacts_name_real_faces():
         matrices = placed(center, 0.0, rotations=[rotation(rng), np.eye(3)])
         result = surfaces.collides(matrices, return_distance=True, maximum_contacts=50)
         assert len(result) > 0
+        touching = result.distances == 0
+        assert (result.distances >= 0).all() and touching.any() and np.isnan(result.normals[touching]).all()
         for side in range(2):
             vertices, faces = meshes[side]
             assert ((result.faces[:, side] >= 0) & (result.faces[:, side] < len(faces))).all()

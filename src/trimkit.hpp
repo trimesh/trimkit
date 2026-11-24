@@ -12,7 +12,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -142,7 +141,7 @@ inline PointBounds bounds_of(const double* points, std::size_t count) {
 // inputs within the bound, by matrices within it, stay far from overflow)
 inline void refuse_placed_beyond(const double* lowest, const double* highest, std::size_t instance) {
     for (std::size_t axis = 0; axis < 3; axis++) {
-        // negated, so not a number is refused too
+        // NOLINTNEXTLINE(readability-simplify-boolean-expr): negated, so NaN is refused too
         if (!(std::abs(lowest[axis]) <= COORDINATE_LIMIT && std::abs(highest[axis]) <= COORDINATE_LIMIT)) {
             refuse("instance " + std::to_string(instance) + " is placed beyond " + COORDINATE_LIMIT_TEXT);
         }
