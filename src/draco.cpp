@@ -193,7 +193,8 @@ void trimkit::draco_decode_mesh(const std::uint8_t* buffer, std::size_t size, co
         }
         const auto stride = static_cast<std::size_t>(stride_given);
         const auto offset = static_cast<std::size_t>(offset_given);
-        const std::size_t held = std::min<std::size_t>(a->size(), (bytes - offset) / stride);
+        // at most a->size(), so it fits a size_t
+        const auto held = static_cast<std::size_t>(std::min<std::uint64_t>(a->size(), (bytes - offset) / stride));
         std::vector<std::uint8_t>& values = (*attributes)[w].values;
         values.resize(points * stride);
         if (a->is_mapping_identity()) {

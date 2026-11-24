@@ -381,7 +381,7 @@ struct trimkit::BoxBvh {
                 const tinybvh::BVH_Double::BVHNode& node = nodes[next.node];
                 if (node.isLeaf()) {
                     for (std::uint64_t j = node.leftFirst; j < node.leftFirst + node.triCount; j++) {
-                        const std::uint64_t box = bvh->primIdx[j];
+                        const auto box = static_cast<std::size_t>(bvh->primIdx[j]);
                         const double gap = gap_squared(lo, hi, boxes[2 * box], boxes[(2 * box) + 1]);
                         if (too_far(gap)) {
                             continue;
@@ -933,7 +933,7 @@ void trimkit::BoxTree::nearest(const double* queries, std::size_t count, bool on
     const std::size_t rows = element_count(most, count);
     // one query's hits are its boxes, many queries' are [query, box]
     const std::size_t width = one ? 1 : 2;
-    hits->resize(element_count(width, rows));
+    hits->resize(element_count(rows, width));
     distances->resize(rows);
     std::int64_t* hits_out = elements(*hits);
     double* distances_out = elements(*distances);

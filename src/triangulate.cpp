@@ -128,7 +128,8 @@ void trimkit::triangulate_polygon(const std::vector<PolygonRing>& rings, Triangu
         for (std::size_t row = 0; row < count; row++) {
             const double x = vertices[2 * row];
             const double y = vertices[(2 * row) + 1];
-            for (std::size_t slot = mix(bits(x) ^ mix(bits(y))) & (slots - 1);; slot = (slot + 1) & (slots - 1)) {
+            for (auto slot = static_cast<std::size_t>(mix(bits(x) ^ mix(bits(y))) & (slots - 1));;
+                 slot = (slot + 1) & (slots - 1)) {
                 const std::uint32_t held = table[slot];
                 if (held == 0) {
                     table[slot] = static_cast<std::uint32_t>(row + 1);
@@ -207,6 +208,7 @@ void trimkit::triangulate_polygon(const std::vector<PolygonRing>& rings, Triangu
         earcut.indices.reserve(3 * (count + (2 * holes)));
         earcut(polygon);
         faces = std::move(earcut.indices);
-        std::transform(faces.begin(), faces.end(), faces.begin(), [&](std::uint64_t index) { return first[index]; });
+        std::transform(faces.begin(), faces.end(), faces.begin(),
+                       [&](std::uint64_t index) { return first[static_cast<std::size_t>(index)]; });
     }
 }
