@@ -424,9 +424,8 @@ public:
           }()) {}
 
     // `count` 3D boxes as a scene culls by them, 6 values each, minimum then
-    // maximum corner: always finite, as products of two inputs within
-    // COORDINATE_LIMIT, though a box may reach past it, as it holds what the
-    // scene holds
+    // maximum corner: always within COORDINATE_LIMIT, as a scene refuses an
+    // instance placed past it (refuse_placed_beyond)
     Boxes(const double* boxes, std::size_t count)
         : tree_([&] {
               const trimkit::GilReleased release;
@@ -653,8 +652,9 @@ thing rays are cast against.
 Every query names its instances (which mesh, placed where), as a
 CollisionScene's do, so a bare query casts at each mesh once, where it
 is. `intersect` answers where each ray crosses the surface, nearest first
-and as many as asked; `intersect_any` only whether it does. Instances are placed under a top-level BVH built from exactly the
-arrays a query gives; the scene remembers the last one, so a query naming
+and as many as asked; `intersect_any` only whether it does. Instances
+are placed under a top-level BVH built from exactly the arrays a query
+gives; the scene remembers the last one, so a query naming
 the same instances again (the same bytes) costs only comparing them, and
 moving anything costs that top level, never a mesh. Answers never depend
 on what was asked before.

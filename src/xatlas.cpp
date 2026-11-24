@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 // xatlas's task groups, on the one pool (vendor/patches/xatlas-one-pool.patch):
@@ -97,9 +98,10 @@ void trimkit::parametrize_mesh(const double* vertices, std::size_t vertex_count,
     if (error != xatlas::AddMeshError::Success) {
         refuse(xatlas::StringForEnum(error));
     }
-    // one mesh went in, so one comes out: anything else is not an answer
+    // one mesh went in, so one comes out: anything else is xatlas failing,
+    // not the input being wrong
     if (atlas->meshCount != 1) {
-        refuse("xatlas produced no atlas for the mesh");
+        throw std::runtime_error("xatlas produced no atlas for the mesh");
     }
     const xatlas::Mesh& out = atlas->meshes[0];
     // xatlas reports texels: normalize into the unit square as float64.
