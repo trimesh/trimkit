@@ -86,7 +86,7 @@ IN_PROCESS = """
     btowc wctob mbrtowc wcrtomb iswctype wctype towlower towupper wcscoll wcsftime wcslen wcsxfrm
     wmemchr wmemcpy wmemmove wmemset
     acosf atan2 atan2f ceil ceilf cos cosf exp2 floor floorf fmod frexp hypot ldexp log log2
-    nextafter nextafterf pow round sin sinf sqrt sqrtf
+    nearbyint nextafter nextafterf pow remainder round sin sinf sqrt sqrtf
     pthread_create pthread_attr_init pthread_attr_destroy pthread_attr_setdetachstate
     pthread_attr_setstacksize
     pthread_self pthread_setname_np pthread_sigmask sigfillset sigdelset pthread_atfork __register_atfork
