@@ -111,8 +111,12 @@ shared uint shared_stack[STACK_SIZE * GROUP];
 const double BVH_DBL_FAR = 1e300LF;
 const double RCP_FAR = 1.0715086071862673e301LF;  // 0x1p1000, tinybvh_safercp's bound
 const uint MISS = 0xffffffffu;
-// the step past a crossing, in units of the scene's size or the distance reached: 2^-40
+// the step past a crossing: 2^-40 of the scene's size or the distance reached, the
+// distance only up to NEAR_HITS scenes away, and at least 2^-50 of the farthest of the
+// ray's origin and the crossing: about the rounding the moved origin carries
 const double RELATIVE_STEP = 9.094947017729282e-13LF;
+const double NEAR_HITS = 1024.0LF;
+const double ROUNDING_STEP = 8.881784197001252e-16LF;
 const uint INTERIOR = 0x80000000u;
 const uint TIE_MASK = 0x3fu;
 const int REJECT = 0, ACCEPT = 1, AMBIGUOUS = 2;
@@ -715,6 +719,35 @@ bool trace_top(uint lane, const Ray ray, bool occlusion, inout Best best) {
     ((stride) == 3u ? double(uintBitsToFloat(words[(r) * 3u + (c)]))                                      \
                   : packDouble2x32(uvec2(words[(r) * (stride) + 2u * (c)], words[(r) * (stride) + 2u * (c) + 1u])))
 
+// 2^k, k within [-1022, 1023], from its exponent's bits
+double power_of_two(int k) { return packDouble2x32(uvec2(0u, uint(k + 1023) << 20u)); }
+
+// The direction scaled by an exact power of two so its largest component is in [1, 2),
+// as src/bvh.cpp's `normalize_exponent` does it, operation for operation: tinybvh's t
+// is in the direction's units, so a tiny direction would meet its 1e300 and 2^1000
+// bounds, and a power of two only moves the exponent
+void normalize_exponent(inout double dx, inout double dy, inout double dz) {
+    precise double largest = max(max(abs(dx), abs(dy)), abs(dz));
+    if (largest == 0.0LF) {
+        return;
+    }
+    if (largest < 2.2250738585072014e-308LF) {
+        // a subnormal's exponent bits are 0: normal first
+        const double factor = power_of_two(600);
+        dx *= factor;
+        dy *= factor;
+        dz *= factor;
+        largest *= factor;
+    }
+    const int exponent = int((unpackDouble2x32(largest).y >> 20u) & 0x7ffu) - 1023;
+    if (exponent != 0) {
+        const double factor = power_of_two(-exponent);
+        dx *= factor;
+        dy *= factor;
+        dz *= factor;
+    }
+}
+
 double direction_length(double dx, double dy, double dz) {
     const double x = abs(dx), y = abs(dy), z = abs(dz);
     const double largest = x < y ? (y < z ? z : y) : (x < z ? z : x);
@@ -741,8 +774,9 @@ void main() {
     const vec3 B = root_box(top ? top_node32[0] : node32[meshes[mesh].x]);
     const double ox = RAY_VALUE(origins, origin_stride, r, 0u), oy = RAY_VALUE(origins, origin_stride, r, 1u);
     const double oz = RAY_VALUE(origins, origin_stride, r, 2u);
-    const double dx = RAY_VALUE(directions, direction_stride, r, 0u), dy = RAY_VALUE(directions, direction_stride, r, 1u);
-    const double dz = RAY_VALUE(directions, direction_stride, r, 2u);
+    precise double dx = RAY_VALUE(directions, direction_stride, r, 0u), dy = RAY_VALUE(directions, direction_stride, r, 1u);
+    precise double dz = RAY_VALUE(directions, direction_stride, r, 2u);
+    normalize_exponent(dx, dy, dz);
     // the direction's length, as src/bvh.cpp's `length` measures it (libstdc++'s
     // hypot written out: the same IEEE operations here and there), which the
     // scene's size and the distances are in
@@ -821,7 +855,11 @@ void main() {
         last_instance = instance;
         last_face = best.face;
         last_t = t;
-        step = RELATIVE_STEP * max(scene, abs(t));
+        // past the crossing by 2^-40 of the scene or of the distance (held to NEAR_HITS
+        // scenes), or by the rounding of a far crossing's moved origin, as the CPU steps
+        precise double reach = max(max(max(abs(ox), abs(oy)), abs(oz)), abs(t));
+        precise double near = min(abs(t), NEAR_HITS * scene);
+        step = max(RELATIVE_STEP * max(scene, near), ROUNDING_STEP * reach);
         along = t + step;
     }
     counts[r] = emitted;

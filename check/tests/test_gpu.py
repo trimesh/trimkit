@@ -162,6 +162,24 @@ def test_one_origin_or_direction_is_every_rays(device_required):
             assert same_answers(cpu.intersect_any(*repeated), scene.intersect_any(*one))
 
 
+def test_device_scales_directions_and_steps_as_the_cpu(device_required):
+    # the device scales each direction by the same power of two and steps
+    # past a far crossing by the same rounding as the CPU (test_bvh's far
+    # origins and direction lengths), so it answers them to the byte
+    mesh = box()
+    cpu = trimkit.RayScene([mesh])
+    gpu = device_scene([mesh], device_required)
+    far = np.array([[0.3, 0.4, 10.0**k] for k in range(1, 15)])
+    lengths = np.array([2.0**-1000, 1e-300, 1e-280, 1e-20, 3.0, 1e20, 1e30])
+    tilted = np.array([1.0, 0.125, -0.0625])
+    origins = np.vstack([far, np.tile([-2.0, 0.45, 0.55], (len(lengths), 1))])
+    directions = np.vstack([np.tile([0.0, 0.0, -1.0], (len(far), 1)), lengths[:, None] * tilted])
+    expected = cpu.intersect(origins, directions)
+    assert np.bincount(expected[0], minlength=len(origins)).tolist() == [2] * len(origins)
+    assert same_answers(expected, gpu.intersect(origins, directions))
+    assert gpu.intersect_any(origins, directions).tolist() == cpu.intersect_any(origins, directions).tolist()
+
+
 def test_device_answers_many_crossings_per_ray(device_required):
     # rays through a stack of twenty boxes cross forty surfaces each, through
     # instances

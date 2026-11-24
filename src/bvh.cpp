@@ -188,6 +188,39 @@ double length(const double* d) {
     return largest * std::sqrt(((u * u) + (v * v)) + (w * w));
 }
 
+// A direction scaled by an exact power of two so its largest component is in
+// [1, 2). tinybvh measures t in the direction's units, against 1e300 for no
+// hit and with reciprocals capped at 2^1000, so a direction as short as
+// 1e-280 missed what (0, 0, -1) hits; and a power of two only moves the
+// exponent, so every other ray's distances (t times the length) are the same
+// bits as unscaled. The factor is built from the exponent's bits: the same IEEE
+// operations as src/vulkan/trace.comp's `normalize_exponent`
+void normalize_exponent(double* d) {
+    double largest = std::max({std::abs(d[0]), std::abs(d[1]), std::abs(d[2])});
+    if (largest == 0.0) {
+        return;
+    }
+    // times 2^k, k within [-1022, 1023]: exact unless a component goes subnormal
+    const auto times_power_of_two = [d, &largest](int k) {
+        const std::uint64_t bits = static_cast<std::uint64_t>(k + 1023) << 52U;
+        double factor = 0.0;
+        std::memcpy(&factor, &bits, sizeof(factor));
+        for (std::size_t axis = 0; axis < 3; axis++) {
+            d[axis] *= factor;
+        }
+        largest *= factor;
+    };
+    if (largest < std::numeric_limits<double>::min()) {
+        times_power_of_two(600);  // a subnormal's exponent bits are 0: normal first
+    }
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &largest, sizeof(bits));
+    const int exponent = static_cast<int>((bits >> 52U) & 0x7FFU) - 1023;
+    if (exponent != 0) {
+        times_power_of_two(-exponent);
+    }
+}
+
 // The values of rays refused as every input's are, naming them: a block at
 // a time on the pool, float32 ones held to the same bound as float64 ones.
 // Only the CPU needs it: the device looks at each value as it copies it
@@ -255,8 +288,13 @@ private:
     std::unique_ptr<MeshBvh> bvh_;
 };
 
-// the step past a hit, in units of the scene's size or the distance reached
-constexpr double RELATIVE_STEP = 9.094947017729282e-13;  // 2^-40
+// the step past a hit: 2^-40 of the scene's size or the distance reached,
+// the distance only up to NEAR_HITS scenes away, and at least 2^-50 of the
+// farthest of the ray's origin and the hit, a few ulps of either: about the
+// rounding the moved origin carries
+constexpr double RELATIVE_STEP = 9.094947017729282e-13;
+constexpr double NEAR_HITS = 1024.0;
+constexpr double ROUNDING_STEP = 8.881784197001252e-16;
 
 }  // namespace
 
@@ -497,8 +535,8 @@ bool place_instances(const RayMeshTrees& trees, RayTopLevel* top) {
 // count of hits is its count of crossings, which tells inside from
 // outside. The moved origin is rounded, so the triangle just crossed can
 // come back at about zero distance: then the step past it doubles, from
-// about 1e-12 of the scene (what the nodes are padded by), and two
-// surfaces closer than that step count once. Each hit's distance is then
+// about 1e-12 of the scene (what the nodes are padded by), or a few ulps of
+// a far hit, and two surfaces closer than that step count once. Each hit's distance is then
 // measured again from the ray's own origin, by tinybvh's triangle test on
 // the triangle found: exactly what a cap of one hit reports for it,
 // whatever else the ray crossed first.
@@ -563,7 +601,16 @@ void crossings(const RayMeshTrees& trees, const RayTopLevel& level, const double
         last_instance = instance;
         last_face = face;
         last_t = t;
-        step = RELATIVE_STEP * std::max(scene, std::abs(t));
+        // past the hit by 2^-40 of the scene or of the distance reached, the
+        // distance held to NEAR_HITS scenes, or by the rounding of a far
+        // hit's moved origin when that is more (refinding the hit doubles
+        // it). 2^-40 of a far hit's own distance (about 9 at 1e13) jumped
+        // surfaces that doubles still tell apart; within NEAR_HITS scenes
+        // the rounding term is always the smaller, so every step there is
+        // the bits it was
+        const double reach = std::max({std::abs(o[0]), std::abs(o[1]), std::abs(o[2]), std::abs(t)});
+        step =
+            std::max(RELATIVE_STEP * std::max(scene, std::min(std::abs(t), NEAR_HITS * scene)), ROUNDING_STEP * reach);
         along = t + step;
     }
 }
@@ -796,6 +843,7 @@ std::string trimkit::RayMeshes::intersect_any(const RayTopLevel& top, const RayV
                     double d[3];
                     ray_row(origins, i, o);
                     ray_row(directions, i, d);
+                    normalize_exponent(d);
                     // every ray written, whatever a device left there
                     const tinybvh::RayEx ray = make_tinybvh_ray(o, d);
                     out[i] = !still(d) && bvh->IsOccluded(ray) ? 1 : 0;
@@ -832,6 +880,7 @@ std::string trimkit::RayMeshes::intersect(const RayTopLevel& top, const RayVecto
                         if (still(d)) {
                             continue;
                         }
+                        normalize_exponent(d);
                         const std::int64_t ray = static_cast<std::int64_t>(i);
                         // distances in the scene's units rather than the direction's
                         const double scale = length(d);

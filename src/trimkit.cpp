@@ -746,7 +746,10 @@ rays : (h,) int64
   A ray through a shared edge or vertex crosses the surface once there
   and gets one hit, so a closed mesh is crossed an odd number of times
   from inside and an even number from outside, whatever the ray's
-  direction.
+  direction. Two surfaces closer together than about 1e-12 of the hit's
+  distance or of the scene's farthest coordinate, whichever is more, count
+  once; past a thousand times the scene, closer than a few ulps of the
+  ray's origin or the hit.
 instances : (h,) int64
   Instance of each hit.
 faces : (h,) int64
