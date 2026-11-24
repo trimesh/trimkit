@@ -8,8 +8,8 @@ The one way to build, test and check this package, locally and in CI alike:
                              licenses, shaders and cppcheck
   uv run scripts test        the strict build and the tests, in 2 GB, on the
                              last 2 cores (--cores N, or all)
-  uv run scripts static      the checks that need a build: clang-tidy, the
-                             sdist, stubs and the wheel audit
+  uv run scripts static      the checks that need a build: clang-tidy, a
+                             32-bit compile, the sdist, stubs, the wheel audit
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
   uv run scripts genmc       model check src/parallel.hpp itself with GenMC,
                              and that each bug planted in it and each memory
@@ -662,6 +662,35 @@ def cmd_tidy(args) -> None:
     header_filter = f"--header-filter=^({'|'.join(ours)})/"
     config = f"--config-file={ROOT / 'scripts' / 'clang-tidy.yaml'}"
     run(tool("clang-tidy"), "--quiet", config, header_filter, "-p", dev(args.root).build_dir, *sources)
+
+
+def cmd_syntax32(args) -> None:
+    """
+    Our Python-free sources compiled again as a 32-bit program, syntax only,
+    with exactly the flags the dev build used (the release warnings and
+    -Werror): what the win32 wheel's -Wshorten-64-to-32 and the i686
+    packages see, a size_t of 32 bits, which no build of this machine's
+    has. The binding (trimkit.cpp) needs 32-bit Python headers, so the win32
+    wheel job is its check.
+    """
+    build = dev(args.root)
+    compile_commands(args.root)
+    entries = json.loads((build.build_dir / "compile_commands.json").read_text())
+    ours = {str(p) for p in compile_commands(args.root) if p.name != "trimkit.cpp"}
+    for entry in entries:
+        if entry["file"] not in ours:
+            continue
+        given = shlex.split(entry["command"])
+        command, skip = [given[0], "-m32", "-fsyntax-only"], False
+        for word in given[1:]:
+            if skip:
+                skip = False
+            elif word in ("-o", "-MF"):
+                skip = True  # and the path after it
+            elif word not in ("-c", "-MD") and not word.startswith(("-flto", "-fprofile")):
+                command.append(word)
+        run(*command, cwd=entry["directory"])
+    print(f"ok: {len(ours)} sources compile as a 32-bit program with the release warnings")
 
 
 def cmd_cppcheck(args) -> None:
@@ -2387,6 +2416,7 @@ def cmd_static(args) -> None:
         cmd_stubs,
         cmd_audit,
         cmd_tidy,
+        cmd_syntax32,
         cmd_threads,
     ):
         command(args)
@@ -2587,6 +2617,11 @@ def cmd_check(args) -> None:
         sys.exit(
             f"check shows every planted bug on {PLANTED_TEST_CORES} cores, of which this machine has fewer"
         )
+    # a pass is of a commit, never of a tree still changing: what it passed is
+    # what can be pushed, and an edit after it is ungated
+    if run(tool("git"), "status", "--porcelain", "--untracked-files=no", capture=True).strip():
+        sys.exit("check gates a commit: commit or stash the changes first")
+    tree = run(tool("git"), "rev-parse", "HEAD^{tree}", capture=True).strip()
     results = []
     for stage in STAGES:
         command = [sys.executable, str(ROOT / "scripts"), "--root", str(args.root), stage]
@@ -2610,6 +2645,10 @@ def cmd_check(args) -> None:
     if failed:
         rerun = "\n".join(f"  uv run scripts {stage}" for stage in failed)
         sys.exit(f"check failed; rerun a stage on its own with:\n{rerun}")
+    if run(tool("git"), "rev-parse", "HEAD^{tree}", capture=True).strip() != tree:
+        sys.exit("check passed a tree that has since changed: nothing is gated")
+    (args.root / "check-passed").write_text(tree + "\n")
+    print(f"check passed tree {tree}, written to {args.root / 'check-passed'}")
 
 
 IMAGE = "trimkit-dev"
@@ -2731,7 +2770,7 @@ def main() -> None:
         "check": "the gate: lint, test, static, ASan, TSan, fuzz, bench --quick, genmc and model",
         "lint": "the fast deterministic checks, nothing compiled",
         "test": "the strict build and the tests in 2 GB, on the last 2 cores (--cores N or all)",
-        "static": "the checks that need a build: clang-tidy, the sdist, stubs and the wheel audit",
+        "static": "the checks that need a build: clang-tidy, a 32-bit compile, the sdist, stubs, wheel audit",
         "bench": "the pool against hand-written pools, 144 cells (--quick: the short calls)",
         "distro": "Debian and Fedora packaging (--run: build, test and lint them; --machine i686|s390x)",
         "genmc": "model check src/parallel.hpp itself with GenMC, and its weakened memory orders",
