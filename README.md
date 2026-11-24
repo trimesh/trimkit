@@ -69,6 +69,7 @@ This is a bundle of nice carefully picked upstream libraries, packaged into a si
 |---|---|---|
 | `bvh` | [jbikker/tinybvh](https://github.com/jbikker/tinybvh), [KhronosGroup/Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | MIT, Apache-2.0 OR MIT |
 | `earcut` | [mapbox/earcut.hpp](https://github.com/mapbox/earcut.hpp) | ISC |
+| `triangulate` | [artem-ogre/CDT](https://github.com/artem-ogre/CDT) | MPL-2.0 |
 | `vhacd` | [kmammou/v-hacd](https://github.com/kmammou/v-hacd) | BSD-3-Clause |
 | `xatlas` | [jpcy/xatlas](https://github.com/jpcy/xatlas) | MIT |
 | `draco` | [google/draco](https://github.com/google/draco) | Apache-2.0 |
