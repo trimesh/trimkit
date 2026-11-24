@@ -15,7 +15,7 @@ Collision, between every pair of the 72 instances at once: which touch, which
 come within a millimetre, how far apart those within ten millimetres are, and
 how far apart every pair is, each the best of five calls in milliseconds.
 
-Prints two Markdown tables. Needs trimkit and numpy only.
+Prints two Markdown tables. Needs trimkit, numpy and pytest (check/tests/helpers.py).
 """
 
 import sys
@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
-from helpers import camera, cycloidal, exploded, same
+from helpers import camera, cycloidal, exploded, same_answers
 
 import trimkit
 
@@ -102,7 +102,7 @@ def bench() -> list[Row]:
             for name in QUERIES:
                 query = queries[name]
                 # once each first, compared: neither is timed on its first use
-                same(query(cpu, *rays[0]), query(device, *rays[0]))
+                assert same_answers(query(cpu, *rays[0]), query(device, *rays[0]))
                 on_cpu = median_milliseconds(lambda o, d, query=query: query(cpu, o, d), rays)
                 on_device = median_milliseconds(lambda o, d, query=query: query(device, o, d), rays)
                 timings.append(Timing(cpu=on_cpu, device=on_device))

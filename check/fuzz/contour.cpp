@@ -174,7 +174,12 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         const std::size_t count = input.volume_shape[0] * input.volume_shape[1] * input.volume_shape[2];
         for (std::size_t i = 0; i < count; i++) {
             if (form == contour::VoxelForm::OCCUPANCY_VOLUME) {
-                occupancy.push_back(provider.ConsumeBool() ? 1 : 0);
+                // numpy bool bytes, sometimes not 0 or 1 (a uint8 array viewed as
+                // bool), which must read as occupied, never as a C++ bool
+                const bool occupied = provider.ConsumeBool();
+                occupancy.push_back(!occupied                ? 0
+                                    : provider.ConsumeBool() ? 1
+                                                             : provider.ConsumeIntegralInRange<std::uint8_t>(2, 255));
                 source_inside.push_back(occupancy.back() != 0 && 1.0 > threshold);
             } else {
                 weights.push_back(weight());
@@ -182,8 +187,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             }
             inside = inside || source_inside.back();
         }
-        static_assert(sizeof(bool) == sizeof(std::uint8_t));
-        input.occupancy = reinterpret_cast<const bool*>(occupancy.data());
+        input.occupancy = occupancy.data();
         input.volume_weights = weights.data();
     }
 
@@ -219,7 +223,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         std::vector<double> voxel_weights;
         std::vector<std::int64_t> flat;
         for (std::size_t i = 0; i < source_inside.size(); i++) {
-            const double each = form == contour::VoxelForm::OCCUPANCY_VOLUME ? occupancy[i] : weights[i];
+            const double each =
+                form == contour::VoxelForm::OCCUPANCY_VOLUME ? (occupancy[i] != 0 ? 1.0 : 0.0) : weights[i];
             if (each == 0.0) {
                 continue;
             }

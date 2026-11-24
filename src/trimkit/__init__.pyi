@@ -30,10 +30,11 @@ True
 
 Notes
 -----
-Built from: mapbox/earcut.hpp 2fbafad +patches, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float 8ec5968, jk-jeon/dragonbox beeeef9, google/draco 80bd29b +patches, jbikker/tinybvh c9be310 +patches, KhronosGroup/Vulkan-Headers b26454f, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1.
+Built from: mapbox/earcut.hpp 2fbafad +patches, artem-ogre/CDT d66c202, kmammou/v-hacd f900e42 +patches, jpcy/xatlas f700c77 +patches, fastfloat/fast_float 8ec5968, jk-jeon/dragonbox beeeef9, google/draco 80bd29b +patches, jbikker/tinybvh c9be310 +patches, KhronosGroup/Vulkan-Headers b26454f, zeux/meshoptimizer 9e1f07b, coal-library/coal 83cdaa6 +patches, libeigen/eigen f6db5ea, wjakob/nanobind 68480a9, Tessil/robin-map 4ec1bf1.
 """
 
 from collections.abc import Sequence
+import enum
 from typing import Annotated, TypeAlias
 
 import numpy
@@ -63,7 +64,7 @@ class RayScene:
     meshes : sequence of Mesh
       The meshes to place, each a (vertices, faces) pair of (n, 3) float64
       vertices and (m, 3) int64 triangle indices into them. Copied once
-      into tinybvh's padded float layout, which the scene owns, so a mesh
+      into tinybvh's float64 layout, which the scene owns, so a mesh
       can never change under the threads sharing the scene.
     use_gpu : bool, default False
       Trace on a Vulkan device (the first GPU that computes in double
@@ -372,7 +373,29 @@ class Boxes:
         ([1, 0], [1.0, 3.605551275463989])
         """
 
-def triangulate(exterior: Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)], interiors: Sequence[Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)]] = ()) -> tuple[NDArray[numpy.float64], NDArray[numpy.int64]]:
+class TriangulateEngine(enum.IntEnum):
+    """
+    How `triangulate` fills a polygon.
+
+    Attributes
+    ----------
+    EARCUT
+      mapbox/earcut.hpp's ear clipping, the default: fastest on convex rings, and never refuses a ring.
+    CDT
+      CDT's constrained Delaunay triangulation: tiles exactly with any holes, is faster on long concave rings, and refuses rings whose edges cross.
+    """
+
+    EARCUT = 0
+    """
+    mapbox/earcut.hpp's ear clipping, the default: fastest on convex rings, and never refuses a ring.
+    """
+
+    CDT = 1
+    """
+    CDT's constrained Delaunay triangulation: tiles exactly with any holes, is faster on long concave rings, and refuses rings whose edges cross.
+    """
+
+def triangulate(exterior: Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)], interiors: Sequence[Annotated[NDArray[numpy.float64], dict(shape=(None, 2), order='C', device='cpu', writable=False)]] = (), *, engine: TriangulateEngine | None = None) -> tuple[NDArray[numpy.float64], NDArray[numpy.int64]]:
     """
     Triangulate a polygon with holes.
 
@@ -383,13 +406,20 @@ def triangulate(exterior: Annotated[NDArray[numpy.float64], dict(shape=(None, 2)
       closing vertex is fine.
     interiors : sequence of (n_i, 2) float64
       Each hole's ring, as shapely's `interiors[i].coords`.
+    engine : None or TriangulateEngine
+      EARCUT, the default, is fastest on convex rings and never refuses a
+      ring, but can leave out or overlap area with many holes. CDT is a
+      constrained Delaunay triangulation: it tiles the polygon exactly with
+      any holes, in either winding, and raises ValueError where ring edges
+      cross.
 
     Returns
     -------
     vertices : (N, 2) float64
       Every ring stacked in order, the exterior then each interior.
     faces : (t, 3) int64
-      Triangle indices into `vertices`.
+      Counter-clockwise triangles indexing `vertices`. Of exactly equal
+      vertices, such as a repeated closing vertex, only the first is used.
 
     Examples
     --------

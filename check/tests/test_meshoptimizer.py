@@ -50,12 +50,18 @@ def test_lock_border_keeps_the_boundary():
 def test_power_of_two_scales_are_exact(extent):
     # positions are centered and scaled by a power of two inside, which is
     # exact: the same mesh at any such scale within the 1e30 bound simplifies
-    # identically
+    # identically, to a face count or to an error that is a length, so
+    # scaled with it
     vertices, faces = sphere(20, 40)
-    reference = trimkit.simplify(vertices, faces, 100)
-    scaled = trimkit.simplify(vertices * extent, faces, 100)
-    assert np.array_equal(reference[0] * extent, scaled[0])
-    assert np.array_equal(reference[1], scaled[1]) and np.array_equal(reference[2], scaled[2])
+    for target, error in ((100, None), (0, 1e-2)):
+        bound = {} if error is None else {"maximum_error": error}
+        reference = trimkit.simplify(vertices, faces, target, **bound)
+        scaled = trimkit.simplify(
+            vertices * extent, faces, target, **{k: v * extent for k, v in bound.items()}
+        )
+        assert np.array_equal(reference[0] * extent, scaled[0])
+        assert np.array_equal(reference[1], scaled[1]) and np.array_equal(reference[2], scaled[2])
+        assert 0 < len(reference[1]) < len(faces)
 
 
 @pytest.mark.parametrize(("offset", "extent"), [(1e7, 1.0), (-1e12, 1e3), (0.0, 1e-6), (5.0, 1e29)])
@@ -79,12 +85,7 @@ def test_nothing_to_do():
     assert len(kept_faces) == len(faces)
 
 
-def test_bad_input():
+def test_faces_must_index_the_vertices():
     vertices, faces = box()
     with pytest.raises(ValueError, match="out of range"):
         trimkit.simplify(vertices, faces + len(vertices), 4)
-    with pytest.raises(ValueError, match="face_count"):
-        trimkit.simplify(vertices, faces, -1)
-    for bad in (-1.0, float("nan")):
-        with pytest.raises(ValueError, match="maximum_error"):
-            trimkit.simplify(vertices, faces, 4, maximum_error=bad)

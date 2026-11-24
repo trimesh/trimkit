@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
                 call(items, static_cast<int>((c + static_cast<std::uint32_t>(k + round)) % 3), stopping);
             }
             // round 0 waits past IDLE_EXIT_MS, so its workers exit idle, and
-            // calls again, so their replacements start
+            // calls again, so its wake starts workers anew
             if (round == 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(parallel::IDLE_EXIT_MS + 500));
                 call(items, 0, false);

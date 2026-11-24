@@ -24,12 +24,6 @@ def test_parametrize_sphere():
     assert areas.sum() <= 1.0
 
 
-def test_bad_input():
-    vertices, faces = sphere(6, 8)
-    with pytest.raises(ValueError):
-        trimkit.parametrize(vertices, faces + len(vertices))
-
-
 def test_no_faces_is_empty():
     # without indices xatlas reads vertices as a triangle list: no faces means nothing
     vertex_sources, faces, uv = trimkit.parametrize(np.zeros((9, 3)), np.zeros((0, 3), dtype=np.int64))

@@ -8,7 +8,10 @@
 //               from one atomic counter
 //
 // Every item spins for a calibrated cost, and each cell's costs are one of:
-// even, every 64th item 50 times the cost, or the first eighth 20 times (a
+// even; scattered, heavy items at pseudo-random places in pseudo-random
+// clusters and of pseudo-random weight from 2 to 128 times, small ones far
+// likelier (no period or size a branch predictor, a prefetcher or a policy
+// tuned by measuring could learn); or the first eighth 20 times (a
 // front-loaded mesh). `callers` threads make the same call at once, each its
 // own job; `noise` threads of another process spin the whole time, as other
 // work on a busy machine would. The ways take turns within each of 7 rounds,
@@ -42,7 +45,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -72,27 +77,53 @@ void calibrate() {
     spins_per_ns = static_cast<double>(ITERATIONS) / ns;
 }
 
-enum class Skew : std::uint8_t { Even, EverySixtyFourth, FrontLoaded };
-constexpr const char* SKEW_NAMES[] = {"even", "every 64th 50x", "first 1/8 20x"};
+enum class Skew : std::uint8_t { Even, Scattered, FrontLoaded };
+constexpr const char* SKEW_NAMES[] = {"even", "random 2-128x", "first 1/8 20x"};
+
+// splitmix64, whose multiplies wrap by design (the overflow builtins say so)
+std::uint64_t splitmix(std::uint64_t z) {
+    std::uint64_t product = 0;
+    __builtin_add_overflow(z, std::uint64_t{0x9e3779b97f4a7c15ULL}, &z);
+    __builtin_mul_overflow(z ^ (z >> 30U), std::uint64_t{0xbf58476d1ce4e5b9ULL}, &product);
+    __builtin_mul_overflow(product ^ (product >> 27U), std::uint64_t{0x94d049bb133111ebULL}, &product);
+    return product ^ (product >> 31U);
+}
+
+// What each item costs, in spins, decided once per cell, so the timed loop is
+// the same lookup whatever the skew. Scattered: each block of 256 items has a
+// density, none, 1/256, 1/64 or 1/16 alike (so heavy items come in clusters
+// and gaps, as a mesh's dense regions do), and each heavy item a weight of
+// 2**k for k from 1 to 7 alike (2 times as often as 128): the same items,
+// pseudo-random by index, for every way and round
+std::vector<std::uint64_t> item_spins(std::size_t count, double item_ns, Skew skew) {
+    constexpr std::uint64_t DENSITY_PER_4096[] = {0, 16, 64, 256};
+    std::vector<std::uint64_t> spins(count);
+    for (std::size_t i = 0; i < count; i++) {
+        double weight = 1.0;
+        if (skew == Skew::Scattered) {
+            const std::uint64_t block = splitmix(i / 256);
+            const std::uint64_t item = splitmix(~std::uint64_t{i});
+            if (item % 4096 < DENSITY_PER_4096[block % 4]) {
+                weight = std::ldexp(1.0, 1 + static_cast<int>((item >> 12U) % 7));
+            }
+        }
+        if (skew == Skew::FrontLoaded && i < count / 8) {
+            weight = 20.0;
+        }
+        spins[i] = static_cast<std::uint64_t>(weight * item_ns * spins_per_ns);
+    }
+    return spins;
+}
 
 struct Work {
     std::size_t count = 0;
     double item_ns = 0;
     Skew skew = Skew::Even;
+    const std::vector<std::uint64_t>* spins = nullptr;  // each item's cost (item_spins)
     std::vector<std::atomic<std::uint32_t>>* ran = nullptr;
 
     double costliest() const {
-        return skew == Skew::EverySixtyFourth ? 50 * item_ns : skew == Skew::FrontLoaded ? 20 * item_ns : item_ns;
-    }
-
-    double cost(std::size_t i) const {
-        if (skew == Skew::EverySixtyFourth && i % 64 == 0) {
-            return 50 * item_ns;
-        }
-        if (skew == Skew::FrontLoaded && i < count / 8) {
-            return 20 * item_ns;
-        }
-        return item_ns;
+        return spins->empty() ? 0.0 : static_cast<double>(*std::max_element(spins->begin(), spins->end())) / spins_per_ns;
     }
 
     // the pool's thread indexes that ran an item, a bit each (index 63 and up share one)
@@ -101,12 +132,16 @@ struct Work {
     void run(std::size_t begin, std::size_t end) const {
         std::uint64_t sink = 0;
         for (std::size_t i = begin; i < end; i++) {
-            sink += spin(static_cast<std::uint64_t>(cost(i) * spins_per_ns));
+            sink += spin((*spins)[i]);
             (*ran)[i].fetch_add(1, std::memory_order_relaxed);
         }
+        // which of the pool's threads ran items: written once a thread, so the
+        // pool pays no contended write a range that the hand-written ways don't
         if (indexes != nullptr) {
-            indexes->fetch_or(std::uint64_t{1} << std::min(63U, trimkit::parallel::thread_index()),
-                              std::memory_order_relaxed);
+            const std::uint64_t bit = std::uint64_t{1} << std::min(63U, trimkit::parallel::thread_index());
+            if ((indexes->load(std::memory_order_relaxed) & bit) == 0) {
+                indexes->fetch_or(bit, std::memory_order_relaxed);
+            }
         }
         if (sink == 42) {
             std::puts("");
@@ -378,7 +413,8 @@ int main(int argc, char** argv) {
                 if (only_skew >= 0 && (count != only_items || item_ns != only_ns || skew != only_skew)) {
                     continue;
                 }
-                const Work shape{count, item_ns, static_cast<Skew>(skew), nullptr};
+                const std::vector<std::uint64_t> spins = item_spins(count, item_ns, static_cast<Skew>(skew));
+                const Work shape{count, item_ns, static_cast<Skew>(skew), &spins, nullptr};
                 const Cell cell = measure(shape, callers, 7);
                 std::printf(
                     "{\"items\": %zu, \"item_ns\": %.0f, \"skew\": \"%s\", \"skew_index\": %d, \"threads\": %u, "

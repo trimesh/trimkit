@@ -17,9 +17,10 @@
 // values or an object that isn't array-like, is a TypeError (or for values,
 // a ValueError) naming the argument.
 // Read-only, mmap'd and buffer-protocol inputs are all fine. Call them with
-// the GIL held; long scans release it themselves. The one copy always made
-// is `read_indices`': faces arrive as int64 and each library takes its own
-// index type, so they are checked and narrowed into a vector as they're read.
+// the GIL held; long scans release it themselves. Two reads always copy:
+// `read_indices`, as faces arrive as int64 and each library takes its own
+// index type, so they are checked and narrowed into a vector as they're read,
+// and `read_instances`, a query's instances, checked as they are copied.
 //
 // Out: `to_numpy` moves a std::vector into a capsule-owned numpy array: a
 // fresh, writable array that owns its memory and shares none with an input.
@@ -30,7 +31,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -46,21 +46,6 @@
 namespace nb = nanobind;
 
 namespace trimkit {
-
-// Every float64 input lies within +-1e30, so no arithmetic downstream can
-// overflow: the deepest products in any module are degree 6 (an instance
-// transform times a coordinate, cubed by the watertight ray test, or squared
-// twice by tinybvh's surface areas), and 1e180 is far from DBL_MAX. Unbounded,
-// rays silently missed everything past ~5.6e102 and tinybvh's builder cast
-// NaN to int near 1e300. No real geometry is near it: the observable universe
-// is ~8.8e29 mm across.
-constexpr double COORDINATE_LIMIT = 1e30;
-// how messages name it: the UTF-8 bytes of the plus-minus sign, as bytes so
-// the source stays ASCII, split so `1e3` isn't read as more hex digits
-constexpr const char* COORDINATE_LIMIT_TEXT =
-    "\xc2\xb1"
-    "1e30";
-static_assert(COORDINATE_LIMIT == 1e30, "COORDINATE_LIMIT_TEXT names the limit");
 
 // a C-contiguous input view with a fixed trailing dimension
 template <typename T, nb::ssize_t... Shape>
@@ -133,25 +118,12 @@ struct BoxQueries {
     bool one = false;
 };
 
-// What `read_rays` read: `count` rows of three, or one row that is every
-// ray's (`one`, with a count of 1), float64 or, for a float32 array taken as
-// it is, float32. Valid while it is: it holds the argument, or its one copy
+// What `read_rays` read, as the unit takes it (trimkit.hpp). Valid while it
+// is: it holds the argument, or its one copy
 struct Rays {
     AnyIn held;
-    const void* data = nullptr;
-    std::size_t count = 0;
-    bool is_float32 = false;
-    bool one = false;
+    RayVectors vectors;
 };
-
-// row `i` of rays as float64: a float32 widens to exactly itself
-inline void ray_row(const Rays& rays, std::size_t i, double* row) {
-    const std::size_t first = rays.one ? 0 : 3 * i;
-    for (std::size_t k = 0; k < 3; k++) {
-        row[k] = rays.is_float32 ? static_cast<double>(static_cast<const float*>(rays.data)[first + k])
-                                 : static_cast<const double*>(rays.data)[first + k];
-    }
-}
 
 // A bool argument: Python's, or numpy's scalar, which is what `array.all()` and
 // every other numpy test returns. Nothing else counts as one: not 0, 1 or None
@@ -179,8 +151,8 @@ using AnyOuts = nb::typed<nb::tuple, AnyOut, nb::ellipsis>;
 // numpy's objects kept for every call after: called once, by NB_MODULE
 inline void init_numpy();
 
-// raise a Python exception from a built-up message
-[[noreturn]] inline void value_error(const std::string& message) { throw nb::value_error(message.c_str()); }
+// raise a Python exception from a built-up message: a bad value is refuse's
+// ValueError (trimkit.hpp), the one way, here as in every part
 [[noreturn]] inline void type_error(const std::string& message) { throw nb::type_error(message.c_str()); }
 // what this machine can't do at all, whatever the input (nanobind maps no C++
 // exception to NotImplementedError, so it is set as CPython's own)
@@ -244,34 +216,18 @@ inline bool aligned(const void* data, std::size_t alignment) {
 
 }  // namespace detail
 
-// The one scan of values there is. How many of `count` values are not within
-// `limit`: beyond it, an infinity or not a number, one comparison that is
-// false for all three, counted without branching so it vectorizes. Each value
-// is written to `copy` as it is read, when there is one. Python-free
-template <typename T>
-std::size_t count_beyond(const T* values, std::size_t count, double limit, T* copy) {
-    std::size_t beyond = 0;
-    for (std::size_t i = 0; i < count; i++) {
-        const T value = values[i];
-        if (copy != nullptr) {
-            copy[i] = value;
-        }
-        beyond += !(static_cast<double>(std::abs(value)) <= limit) ? 1U : 0U;
-    }
-    return beyond;
-}
-
-// how many of `values` are not within `limit`, counted on the pool without
-// the GIL: defined in common.hpp, the one door to threads
-template <typename T>
-std::size_t count_beyond_on_pool(const T* values, std::size_t count, double limit);
-
-// refuse values not within `limit`, naming the argument
+// refuse values not within `limit`, naming the argument: scanned on the
+// pool with the GIL released
 template <typename T>
 void check_values(const T* values, std::size_t count, double limit, const std::string& name) {
-    if (count_beyond_on_pool<T>(values, count, limit) != 0) {
-        value_error(name + " must be finite" +
-                    (limit == COORDINATE_LIMIT ? std::string(" and within ") + COORDINATE_LIMIT_TEXT : std::string()));
+    std::size_t beyond = 0;
+    {
+        const GilReleased release;
+        beyond = count_beyond_in_parallel<T>(values, count, limit);
+    }
+    if (beyond != 0) {
+        refuse(name + " must be finite" +
+               (limit == COORDINATE_LIMIT ? std::string(" and within ") + COORDINATE_LIMIT_TEXT : std::string()));
     }
 }
 
@@ -357,6 +313,14 @@ inline nb::object relaid(nb::handle object, const nb::object& array, const char*
         return {};
     }
     const std::string source = is_array ? text(array.attr("dtype")) : "a " + text(object.type().attr("__name__"));
+    // its own dtype, but in the other byte order: the same values copied once
+    // into this machine's, as a typed read converts it (nanobind reads only
+    // native ones)
+    if (dtype == nullptr && is_array && !nb::cast<bool>(array.attr("dtype").attr("isnative"))) {
+        const nb::object native = array.attr("dtype").attr("newbyteorder")("=");
+        warn_converted(name, source, text(native).c_str());
+        return numpy.array(array, nb::arg("dtype") = native, nb::arg("copy") = true, nb::arg("order") = "C");
+    }
     if (dtype == nullptr || array.attr("dtype").equal(numpy.dtype(dtype))) {
         if (!is_array) {
             warn_converted(name, source, dtype);
@@ -436,8 +400,8 @@ inline bool holds_rays(const AnyIn& array) {
 // ray, read in place when it is already that (no Python is called at all)
 // and otherwise as `read` takes any array: its shape checked first, then one
 // copy, converted with the warning when its dtype isn't one of the two. Its
-// values are not checked here: a device checks them as it copies them
-// (src/vulkan/scene.hpp), and anything else calls `check_rays`
+// values are not checked here: the unit checks them, or a device as it
+// copies them (src/vulkan/scene.hpp)
 inline Rays read_rays(const RaysArgument& argument, const std::string& name) {
     Rays rays;
     bool taken = detail::any_readable(argument.object, &rays.held) && detail::holds_rays(rays.held);
@@ -452,21 +416,11 @@ inline Rays read_rays(const RaysArgument& argument, const std::string& name) {
     if (!taken) {
         type_error(name + " must be float64 or float32 of shape (*, 3) or (3,), not " + describe(argument.object));
     }
-    rays.data = rays.held.data();
-    rays.is_float32 = rays.held.dtype() == nb::dtype<float>();
-    rays.one = rays.held.ndim() == 1;
-    rays.count = rays.one ? 1 : rays.held.shape(0);
+    rays.vectors.data = rays.held.data();
+    rays.vectors.is_float32 = rays.held.dtype() == nb::dtype<float>();
+    rays.vectors.one = rays.held.ndim() == 1;
+    rays.vectors.count = rays.vectors.one ? 1 : rays.held.shape(0);
     return rays;
-}
-
-// the values of rays `read_rays` read, refused as `read` refuses them:
-// float32 ones are held to the same bound as float64 ones
-inline void check_rays(const Rays& rays, const std::string& name) {
-    if (rays.is_float32) {
-        check_values(static_cast<const float*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
-    } else {
-        check_values(static_cast<const double*>(rays.data), 3 * rays.count, COORDINATE_LIMIT, name);
-    }
 }
 
 // A voxels argument, told apart by its dimensions as numpy sees them: two
@@ -513,7 +467,10 @@ inline BoxQueries read_box_queries(nb::handle object, std::size_t dimension, con
     }
     const std::size_t last = extents.empty() ? 0 : extents.back();
     // with none given, the batch's own: corners end in d and flat rows in 2d
-    const std::size_t d = dimension != 0 ? dimension : (extents.size() == 3 ? last : last / 2);
+    std::size_t d = dimension;
+    if (d == 0) {
+        d = extents.size() == 3 ? last : last / 2;
+    }
     BoxQueries queries;
     queries.dimension = d;
     queries.one = dimension != 0 &&
@@ -553,7 +510,8 @@ In<T, Shape...> view(const Array<T, Shape...>& argument, const std::string& name
 // A bool array's values as bytes: a byte other than 0 or 1 in a numpy bool
 // array (a uint8 array viewed as bool can hold one) is undefined as a C++
 // bool, so they are read as uint8 and tested `!= 0`, never as bool
-inline const std::uint8_t* mask_bytes(const In<bool, -1>& mask) {
+template <nb::ssize_t... Shape>
+const std::uint8_t* mask_bytes(const In<bool, Shape...>& mask) {
     return reinterpret_cast<const std::uint8_t*>(mask.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
 }
 
@@ -566,7 +524,7 @@ std::vector<Index> read_indices(const Array<std::int64_t, -1, 3>& argument, cons
     if constexpr (sizeof(Index) < sizeof(std::size_t)) {
         if (vertex_count >= std::numeric_limits<Index>::max() ||
             faces.shape(0) >= std::numeric_limits<Index>::max() / 3) {
-            value_error("this mesh is too large to index with uint32");
+            refuse("this mesh is too large to index with uint32");
         }
     }
     const std::int64_t* values = faces.data();
@@ -590,7 +548,7 @@ std::vector<Index> read_indices(const Array<std::int64_t, -1, 3>& argument, cons
         while (bad + 1 < indices.size() && static_cast<std::uint64_t>(values[bad]) < vertex_count) {
             bad++;
         }
-        value_error(name + " index a vertex out of range at row " + std::to_string(bad / 3));
+        refuse(name + " index a vertex out of range at row " + std::to_string(bad / 3));
     }
     return indices;
 }
@@ -724,21 +682,90 @@ std::pair<T*, nb::capsule> own(std::vector<T>&& values) {
     return {owned.release()->data(), std::move(capsule)};
 }
 
-// An output element left unwritten when allocated: for an output whose every
-// element the binding writes, often from many threads, so it isn't filled
-// once first. `to_numpy<T>` hands a vector of these to numpy as T, and
-// `elements` writes them as T
-template <typename T>
-struct Unset {
-    T value;
-    // NOLINTNEXTLINE(modernize-use-equals-default,cppcoreguidelines-pro-type-member-init): left unwritten on purpose
-    Unset() {}
+// the two arguments every scene query names its instances by
+using InstanceMatrices = Array<double, -1, 4, 4>;
+using InstanceIndex = Array<std::int64_t, -1>;
+
+// The arrays a query names its instances by, viewed once: their dtype, shape
+// and layout as `read` checks them, their values not yet looked at. An array
+// not given is None
+struct InstanceViews {
+    In<std::int64_t, -1> index;
+    In<double, -1, 4, 4> matrices;
+    bool given_index = false;
+    bool given_matrices = false;
 };
 
-template <typename T>
-T* elements(std::vector<Unset<T>>& values) {
-    static_assert(sizeof(Unset<T>) == sizeof(T) && std::is_standard_layout_v<Unset<T>>);
-    return reinterpret_cast<T*>(values.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): the same layout
+inline InstanceViews view_instances(const InstanceIndex& index_argument, const InstanceMatrices& matrices_argument) {
+    InstanceViews views;
+    views.given_index = !index_argument.is_none();
+    views.given_matrices = !matrices_argument.is_none();
+    if (views.given_index) {
+        views.index = view(index_argument, "instance_index");
+    }
+    if (views.given_matrices) {
+        views.matrices = view(matrices_argument, "instance_matrices");
+    }
+    return views;
+}
+
+// whether a query's arrays are exactly the ones `instances` was read from:
+// each None or not, and the same bytes, which were checked when it was read
+inline bool same_instances(const InstanceViews& views, const Instances& instances) {
+    if (views.given_index != instances.given_index || views.given_matrices != instances.given_matrices) {
+        return false;
+    }
+    const bool same_index = !views.given_index || (views.index.size() == instances.index.size() &&
+                                                   std::memcmp(views.index.data(), instances.index.data(),
+                                                               instances.index.size() * sizeof(std::int64_t)) == 0);
+    return same_index && (!views.given_matrices || (views.matrices.size() == instances.matrices.size() &&
+                                                    std::memcmp(views.matrices.data(), instances.matrices.data(),
+                                                                instances.matrices.size() * sizeof(double)) == 0));
+}
+
+// A query's instances read: each array copied once and the copy checked, the
+// one place any of this is checked. Values finite and bounded, one row per
+// instance, meshes in range, a last row of [0, 0, 0, 1], and for a scene
+// that takes only rigid transforms (`rigid`), a rotation. A scene whose
+// transforms need only be invertible checks that where it inverts them
+inline Instances read_instances(const InstanceViews& views, std::size_t mesh_count, bool rigid) {
+    Instances instances;
+    instances.given_index = views.given_index;
+    instances.given_matrices = views.given_matrices;
+    instances.count = mesh_count;
+    if (views.given_index) {
+        instances.index.assign(views.index.data(), views.index.data() + views.index.shape(0));
+        instances.count = instances.index.size();
+    }
+    if (views.given_matrices) {
+        const std::size_t rows = views.matrices.shape(0);
+        instances.matrices.resize(16 * rows);
+        if (count_beyond(views.matrices.data(), 16 * rows, COORDINATE_LIMIT, instances.matrices.data()) != 0) {
+            refuse(std::string("instance_matrices must be finite and within ") + COORDINATE_LIMIT_TEXT);
+        }
+        if (views.given_index && rows != instances.count) {
+            refuse("instance_index and instance_matrices must have one row per instance");
+        }
+        instances.count = rows;
+    }
+    if (!views.given_index && instances.count != mesh_count) {
+        refuse("without instance_index there is one instance per mesh");
+    }
+    for (std::size_t i = 0; i < instances.count; i++) {
+        if (views.given_index && !indexes(instances.index[i], mesh_count)) {
+            refuse("instance_index names a mesh out of range at instance " + std::to_string(i));
+        }
+        const double* m = instances.matrix(i);
+        if (m[12] != 0.0 || m[13] != 0.0 || m[14] != 0.0 || m[15] != 1.0) {
+            refuse("instance_matrices must be affine: the last row of instance " + std::to_string(i) +
+                   " is not [0, 0, 0, 1]");
+        }
+        if (rigid && !is_rigid(m)) {
+            refuse("instance_matrices must be rigid: instance " + std::to_string(i) +
+                   " rotates by a matrix that isn't a rotation");
+        }
+    }
+    return instances;
 }
 
 // An output's shape must be exactly what its buffer holds: checked here, once,

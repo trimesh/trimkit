@@ -2,7 +2,7 @@
 Fuzz the Python boundary of every function: random dtypes, shapes, strides,
 read-only flags and values go in, and each call must either raise
 ValueError or TypeError, or return fresh arrays with indices in range.
-Run by `uv run scripts atheris` against an ASan build.
+Run by `uv run scripts fuzz`, after the native harnesses, against an ASan build.
 """
 
 import contextlib
@@ -12,12 +12,12 @@ import warnings
 
 import atheris
 
-# the tests' helpers, for `public_api`
+# the tests' helpers, for the sweep's registry
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tests"))
 
 with atheris.instrument_imports():
+    import helpers
     import numpy as np
-    from helpers import public_api
 
     import trimkit
 DTYPES = [np.float64, np.float32, np.int64, np.int32, np.uint32, np.uint8, np.int16, np.bool_]
@@ -59,10 +59,19 @@ def check(result) -> None:
         assert result.flags.writeable and result.flags.c_contiguous
 
 
-def case_earcut(data: atheris.FuzzedDataProvider):
-    exterior = array(data, 2)
-    interiors = [array(data, 2) for _ in range(data.ConsumeIntInRange(0, 3))]
-    vertices, faces = trimkit.triangulate(exterior, interiors)
+def case_triangulate(data: atheris.FuzzedDataProvider):
+    def ring() -> np.ndarray:
+        # a small integer lattice now and then: duplicate vertices, rings
+        # that touch, and edges that cross, which CDT refuses
+        if data.ConsumeBool():
+            rows = data.ConsumeIntInRange(0, 12)
+            return np.array(data.ConsumeIntListInRange(2 * rows, -4, 4), dtype=np.float64).reshape((rows, 2))
+        return array(data, 2)
+
+    exterior = ring()
+    interiors = [ring() for _ in range(data.ConsumeIntInRange(0, 3))]
+    engine = [None, *trimkit.TriangulateEngine][data.ConsumeIntInRange(0, len(trimkit.TriangulateEngine))]
+    vertices, faces = trimkit.triangulate(exterior, interiors, engine=engine)
     assert faces.max(initial=0) < max(len(vertices), 1)
     result = (vertices, faces)
     return result
@@ -312,10 +321,11 @@ def case_contour(data: atheris.FuzzedDataProvider):
     return vertices, faces, vertex_sources
 
 
-# every public name, the case that fuzzes it: checked against the compiled
-# modules at startup, so nothing public goes unfuzzed
-CASES = {
-    "triangulate": case_earcut,
+# every public name, the case that fuzzes it: checked against the sweep's
+# registry (check/tests/helpers.py) at startup, which the tests check against
+# the compiled modules, so nothing public goes unfuzzed
+FUZZED = {
+    "triangulate": case_triangulate,
     "exchange.svg_parse": case_svg_parse,
     "exchange.svg_string": case_svg_string,
     "decompose": case_vhacd,
@@ -344,13 +354,13 @@ CASES = {
     "CollisionResult.pairs": case_collision,
     "CollisionResult.points": case_collision,
 }
-NAMES = sorted(CASES)
-if public_api() != NAMES:
-    sys.exit(f"check/fuzz/atheris_bindings.py must fuzz exactly {public_api()}, not {NAMES}")
+NAMES = sorted(FUZZED)
+if sorted(helpers.CASES) != NAMES:
+    sys.exit(f"check/fuzz/atheris_bindings.py must fuzz exactly {sorted(helpers.CASES)}, not {NAMES}")
 
 
 def one(data: atheris.FuzzedDataProvider) -> None:
-    check(CASES[NAMES[data.ConsumeIntInRange(0, len(NAMES) - 1)]](data))
+    check(FUZZED[NAMES[data.ConsumeIntInRange(0, len(NAMES) - 1)]](data))
 
 
 def test_one_input(raw: bytes) -> None:

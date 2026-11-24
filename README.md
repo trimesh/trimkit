@@ -129,6 +129,7 @@ Everything below this line is LLM output.
 | `Boxes.boxes` | Every box's two corners, with exactly the values given.<br>`boxes = tree.boxes()` |
 | `Boxes.intersection` | Every box overlapping one query box or each of many, touching included.<br>`hits = tree.intersection(np.array([0.5, 0.5, 2.5, 2.5]))` |
 | `Boxes.nearest` | The nearest boxes to one query box or each of many, nearest first.<br>`hits, distances = tree.nearest(np.array([4.0, 3.0, 4.0, 3.0]), maximum_hits=2)` |
+| `TriangulateEngine` | How `triangulate` fills a polygon.<br>`EARCUT, CDT` |
 | `triangulate` | Triangulate a polygon with holes.<br>`vertices, faces = trimkit.triangulate(exterior)` |
 | `decompose` | Decompose a closed triangle mesh into approximately convex hulls.<br>`hulls = trimkit.decompose(vertices, faces, maximum_hulls=1)` |
 | `parametrize` | Cut a mesh into charts and pack them into a UV atlas.<br>`vertex_sources, faces, uv = trimkit.parametrize(vertices, faces)` |
@@ -164,7 +165,8 @@ Arrays go in and come out as 64-bit floats or 64-bit integers. Each docstring sa
 | you pass | what happens |
 |---|---|
 | the exact type, in one unbroken block of memory | read in place, no copy |
-| a list, or 32-bit floats or integers | converted once, with a `UserWarning` naming the argument |
+| the exact type, laid out any other way (strided, reversed, Fortran order, misaligned) | copied once, silently, as `numpy.ascontiguousarray` would |
+| a list, 32-bit floats or integers, or the other byte order | converted once, with a `UserWarning` naming the argument |
 | a type that would lose values, or something that is not an array | `TypeError` |
 | a bad value (floats must be finite and within ±1e30) | `ValueError`, saying what was expected |
 
@@ -194,15 +196,16 @@ The second reason is fork, which most users never call themselves. Python's `mul
 | works in a forked copy | yes: a call cut off by the fork fails cleanly | no: "does not support fork()" | GCC's can hang | usually not |
 | track record | new, about 1,500 lines, model checked | many years in real programs | many years in real programs | varies |
 
-How it does, on 8 cores, against a plain loop and the best of three pools written by hand (`check/bench/parallel.cpp`, which `uv run scripts bench` runs; microseconds, the best run, 2026-11-18):
+How it does, on 8 cores, against a plain loop and the best of three pools written by hand (`check/bench/parallel.cpp`, which `uv run scripts bench` runs; microseconds, the best run, 2026-11-24):
 
 | work | plain loop | ours | best by hand |
 |---|---|---|---|
-| tiny: 100 items of 50 ns each | 3 | 4 | 11 |
-| even: 100,000 items of 1 µs each | 90,363 | 11,367 | 11,374 |
-| uneven: 10,000 items of 1 µs, the first eighth 20 times slower | 30,937 | 3,896 | 4,006 |
+| tiny: 100 items of 50 ns each | 4 | 7 | 58 |
+| even: 100,000 items of 1 µs each | 97,687 | 12,330 | 12,307 |
+| uneven: 10,000 items of 1 µs, the first eighth 20 times slower | 33,484 | 4,287 | 4,272 |
+| random: 10,000 items of 1 µs, each 2 to 128 times that at random | 17,829 | 2,315 | 2,537 |
 
-A tiny call wakes no helper thread, which is why it costs about what the plain loop costs.
+A tiny call wakes no helper thread, which is why it costs about what the plain loop costs. The bench runs 144 cells like these, with one caller and with four, alone and beside a busy neighbour. It fails a cell where the pool takes 10% longer than the best hand-written pool (plus 20 µs and one costliest item), or 25% more CPU (plus 50 µs), in each of three tries.
 
 The pool is used by big batches in `RayScene`, `Boxes` and `CollisionScene` queries, and by the heavy inner steps of `decompose` and `parametrize`. Everything else runs on the calling thread, and no vendored library starts threads of its own.
 
@@ -224,22 +227,22 @@ The GPU returns exactly the same bytes as the CPU. It walks the same search tree
 
 Rays are sent to the card as you give them. A single `(3,)` origin or direction is shared by every ray. 32-bit arrays are sent as 32-bit, at half the size, and widened on the card.
 
-Whether the GPU is faster depends on the rays. `python check/bench/scene.py` times a real assembly (`check/tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k faces). It runs the assembly as loaded (1x), and with its parts spread 2 and 5 times farther apart so that fewer rays hit anything. A batch is all the rays of one camera, from one origin. Times are milliseconds per batch, the median over eight cameras: the 32 threads of an i9-14900K against an RTX 5070, on an idle machine (2026-11-17).
+Whether the GPU is faster depends on the rays. `python check/bench/scene.py` times a real assembly (`check/tests/models/cycloidal.npz`: 13 meshes placed 72 times, 377k faces). It runs the assembly as loaded (1x), and with its parts spread 2 and 5 times farther apart so that fewer rays hit anything. A batch is all the rays of one camera, from one origin. Times are milliseconds per batch, the median over eight cameras: the 32 threads of an i9-14900K against an RTX 5070, on an idle machine (2026-11-24).
 
 | rays | pulled apart | hitting | nearest: CPU ms | device ms | ratio | any hit: CPU ms | device ms | ratio | every crossing: CPU ms | device ms | ratio |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 10,000 | 1x | 12% | 0.24 | 0.55 | 0.4x | 0.13 | 0.25 | 0.5x | 1.29 | 11.53 | 0.1x |
-| 10,000 | 2x | 11% | 0.17 | 0.43 | 0.4x | 0.09 | 0.28 | 0.3x | 0.73 | 5.59 | 0.1x |
-| 10,000 | 5x | 3% | 0.11 | 0.31 | 0.4x | 0.08 | 0.21 | 0.4x | 0.19 | 1.04 | 0.2x |
-| 99,856 | 1x | 12% | 1.15 | 0.82 | 1.4x | 0.87 | 0.51 | 1.7x | 7.72 | 13.17 | 0.6x |
-| 99,856 | 2x | 11% | 0.98 | 0.71 | 1.4x | 0.74 | 0.63 | 1.2x | 7.70 | 8.62 | 0.9x |
-| 99,856 | 5x | 3% | 0.53 | 0.65 | 0.8x | 0.35 | 0.45 | 0.8x | 1.47 | 2.15 | 0.7x |
-| 1,000,000 | 1x | 12% | 8.37 | 4.43 | 1.9x | 5.13 | 3.50 | 1.5x | 53.66 | 48.95 | 1.1x |
-| 1,000,000 | 2x | 11% | 6.26 | 3.98 | 1.6x | 3.93 | 3.54 | 1.1x | 27.49 | 28.10 | 1.0x |
-| 1,000,000 | 5x | 3% | 3.77 | 3.56 | 1.1x | 2.79 | 3.33 | 0.8x | 6.78 | 8.22 | 0.8x |
-| 4,000,000 | 1x | 12% | 31.25 | 17.80 | 1.8x | 18.88 | 13.16 | 1.4x | 211.01 | 154.86 | 1.4x |
-| 4,000,000 | 2x | 11% | 22.82 | 15.81 | 1.4x | 14.78 | 13.39 | 1.1x | 99.02 | 81.04 | 1.2x |
-| 4,000,000 | 5x | 3% | 13.46 | 12.88 | 1.0x | 9.88 | 12.65 | 0.8x | 22.97 | 26.97 | 0.9x |
+| 10,000 | 1x | 12% | 0.29 | 0.54 | 0.5x | 0.14 | 0.25 | 0.6x | 1.15 | 11.29 | 0.1x |
+| 10,000 | 2x | 11% | 0.21 | 0.43 | 0.5x | 0.09 | 0.28 | 0.3x | 0.75 | 5.52 | 0.1x |
+| 10,000 | 5x | 3% | 0.13 | 0.30 | 0.4x | 0.06 | 0.21 | 0.3x | 0.16 | 1.04 | 0.2x |
+| 99,856 | 1x | 12% | 1.24 | 0.86 | 1.4x | 0.65 | 0.50 | 1.3x | 7.62 | 13.12 | 0.6x |
+| 99,856 | 2x | 11% | 0.99 | 0.73 | 1.4x | 0.47 | 0.59 | 0.8x | 3.65 | 7.93 | 0.5x |
+| 99,856 | 5x | 3% | 0.53 | 0.61 | 0.9x | 0.27 | 0.42 | 0.7x | 0.92 | 2.06 | 0.4x |
+| 1,000,000 | 1x | 12% | 8.28 | 4.31 | 1.9x | 5.18 | 3.61 | 1.4x | 54.49 | 48.30 | 1.1x |
+| 1,000,000 | 2x | 11% | 6.22 | 3.93 | 1.6x | 4.12 | 3.46 | 1.2x | 26.65 | 25.85 | 1.0x |
+| 1,000,000 | 5x | 3% | 3.73 | 3.33 | 1.1x | 2.57 | 3.17 | 0.8x | 6.55 | 8.30 | 0.8x |
+| 4,000,000 | 1x | 12% | 32.42 | 16.63 | 2.0x | 19.31 | 13.35 | 1.4x | 215.60 | 226.85 | 1.0x |
+| 4,000,000 | 2x | 11% | 22.96 | 16.65 | 1.4x | 15.78 | 13.22 | 1.2x | 103.95 | 73.29 | 1.4x |
+| 4,000,000 | 5x | 3% | 13.99 | 12.42 | 1.1x | 10.17 | 12.75 | 0.8x | 23.95 | 24.70 | 1.0x |
 
 Three things have held on every machine measured:
 
@@ -249,7 +252,26 @@ Three things have held on every machine measured:
 
 ## Benchmarks
 
-Ray timings are in the GPU section above. The rest are here.
+Ray timings on the GPU and the CPU are in the GPU section above. The rest are here.
+
+### Against the alternatives
+
+| `trimkit.` | replaces | on | trimkit is | peak MiB, old / trimkit |
+|---|---|---|---|---|
+| `Boxes.nearest` | `rtree`'s `nearest_v` | 100k boxes, 20k points or unit boxes, 2D or 3D, k of 1 or 8 | 156-540x faster | 1-4 / 1-5 |
+| `contour` | `scikit-image` | a 14M-voxel bool volume, as voxels or as 70k runs; a 28M-voxel float64 field | 42-58x faster; 12x on the field | 155-156 / 49-53; 155 / 75 |
+| `exchange.svg_parse` | `svg.path` | 60k commands | 55-56x faster | 20 / 5 |
+| `Boxes` | `rtree` | build 100k boxes, query 20k | 10-11x faster | 19 / 21-22 |
+| `RayScene.intersect` | `embreex` | 1M rays, 82k faces, in float64 and watertight | 6.6-6.7x faster | 105-106 / 57-58 |
+| `CollisionScene.collides` | `python-fcl` | every touching pair of 200 spheres, through trimesh's `CollisionManager` | 4.3-4.4x faster, and convex distances more accurate | under 1 / under 1 |
+| `CollisionScene.collides`, `.distances` | MuJoCo 4.0.1, called from C on its best thread count | three robots' links as convex hulls (panda, talos, g1), every configuration in one call | `collides` 1.5-4.9x faster; `distances` 1.2-2.6x faster, but 0.7-0.8x on talos | |
+| `exchange.draco_encode`, `.draco_decode` | `DracoPy` | 82k faces | 3.5-3.7x faster encoding, 1.6-1.7x decoding | 10-11 / 6, 5 / 5 |
+| `simplify` | `fast-simplification` | 82k faces to 10% | 2.6x faster, and thread safe | 32 / 10 |
+| `decompose` | `vhacdx`: the same library | a torus | 1.2-1.3x faster | 382-385 / 468-471: V-HACD's work runs on every core at once, each with its own working set |
+| `parametrize` | `xatlas`: the same library | 5k faces | 1.1-1.2x faster | 6 / 5 |
+| `triangulate` | `mapbox-earcut`: the same library | a 200k-vertex polygon | 1.0-1.1x faster, and its faces join where rings touch | 20 / 23-24 |
+
+Measured 2026-11-24 on the 32 threads of an i9-14900K, with a release build that skips profile-guided optimization, on the same numpy inputs. A range is two runs, or the spread over the inputs listed. Every row but MuJoCo's is `check/bench/versus.py`: the best of five calls each, and peak memory as the most one call adds, its output included, each call in a fresh process. MuJoCo's row is `check/bench/collision/trimkit_robot.py` and `mujoco_kernel.cpp`, in microseconds per configuration, against MuJoCo split over 1 to 32 threads that spin between configurations, the best count kept. Both find the same touching pairs. MuJoCo treats every mesh as its convex hull, while trimkit also handles triangle meshes that aren't convex. `check/bench/collision/mujoco.coal.notes.md` has the details, including the changes to coal behind these numbers.
 
 ### Collisions
 
@@ -257,51 +279,22 @@ The same script times the same assembly as a `CollisionScene`. One call checks e
 
 | pulled apart | pairs | touching | `collides` ms | within 1 mm ms | distances within 10 mm ms | every distance ms |
 |---|---|---|---|---|---|---|
-| 1x | 2,556 | 119 | 0.48 | 0.48 | 28.8 | 59 |
-| 2x | 2,556 | 67 | 0.46 | 0.21 | 23.4 | 78 |
-| 5x | 2,556 | 25 | 0.07 | 0.23 | 2.7 | 95 |
+| 1x | 2,556 | 121 | 0.44 | 0.55 | 28.5 | 61 |
+| 2x | 2,556 | 67 | 0.41 | 0.23 | 17.9 | 80 |
+| 5x | 2,556 | 25 | 0.07 | 0.17 | 4.7 | 98 |
 
 `collides` is fast because it rules out most pairs cheaply: first by each instance's bounding box, then by each mesh's tree of boxes. That is how it finds which of 2,556 pairs touch, among 377k faces, in about half a millisecond. Given a margin, it also reports pairs that come within that distance without touching (the "within 1 mm" column).
 
 `distances` is slower because it measures every pair you ask about. Pass `upper_bound` and it stops early on pairs farther apart than that, which is usually all a motion planner needs.
-
-### Against MuJoCo
-
-Three robots from `robot_descriptions`, each link as its convex hull, checking the pairs a motion planner would. Times are microseconds per configuration, trimkit / MuJoCo 4.0.1. MuJoCo is called from C, and on all cores it gets its best thread count:
-
-| robot | pairs | `collides`, 1 core | `distances`, 1 core | `collides`, all cores | `distances`, all cores |
-|---|---|---|---|---|---|
-| panda | 42 | 2.9 / 2.4 | 27.1 / 35.4 | 0.8 / 1.8 | 3.5 / 14.2 |
-| talos | 1,242 | 30.5 / 47.5 | 633 / 662 | 7.3 / 20.7 | 113 / 86.6 |
-| g1 | 438 | 23.2 / 49.9 | 344 / 400 | 7.0 / 18.6 | 45.3 / 62.9 |
-
-Measured 2026-11-20 on the same i9-14900K. Both find the same touching pairs. MuJoCo treats every mesh as its convex hull, while trimkit also handles triangle meshes that aren't convex. `check/bench/collision/mujoco.coal.notes.md` has the details, including the changes to coal behind these numbers.
 
 ### Example: a robot arm planner
 
 `examples/ur10.py`: a UR10e robot arm with a box gripper reaches into a cubby for a block. The planner is one function. It places the arm at every waypoint of a path, makes one `CollisionScene.distances` call for all of them, and hands the result to `scipy.optimize.minimize`. The gradient comes from the normals and closest points that `distances` returns.
 
 ```
-planned in 40 ms: 15 L-BFGS-B evaluations of 14,342 pair distances each, aiming for 27.5 mm over 1 round
+planned in 31 ms: 27 L-BFGS-B evaluations of 14,342 pairs each, aiming for 27.5 mm over 1 round
 then twenty times as many waypoints checked clear
 ```
-
-### Against what trimesh used before
-
-| `trimkit.` | replaces | measured against it | peak memory (MiB), old / trimkit |
-|---|---|---|---|
-| `exchange.svg_parse`, `exchange.svg_string` | `svg.path` | 57x faster parsing 60k commands | 19-20 / 7 |
-| `contour` | `scikit-image` | 44x faster on a 14M-voxel bool volume, 12x on a 28M-voxel float64 field | 160 / 49, 159 / 74 |
-| `Boxes` | `rtree` | 11-12x faster: build 100k boxes, query 20k; `nearest` 100-470x faster than `nearest_v` on 20k points or unit boxes, in 2D or 3D, k of 1 or 8 | 19 / 20-21; `nearest` 1-2 / 1-5 |
-| `RayScene` | `embreex` | 6.3-6.4x faster on 1M rays, in float64 and watertight | 105 / 57 |
-| `CollisionScene` | `python-fcl` | 4x faster: every touching pair of 200 spheres, through trimesh's `CollisionManager`; convex distances more accurate | under 1 / under 1 |
-| `exchange.draco_encode`, `exchange.draco_decode` | `DracoPy` | 3.4x faster encoding, 1.5-1.6x decoding | 9 / 5, 5 / 6 |
-| `simplify` | `fast-simplification` | 2.6x faster, and thread safe | 31 / 10 |
-| `decompose` | `vhacdx` | 1.2x faster: the same library | 380 / 469: V-HACD's work runs on every core at once, each with its own working set |
-| `parametrize` | `xatlas` | 1.1x faster | 6 / 5 |
-| `triangulate` | `mapbox-earcut` | 1.1-1.2x faster: the same library | 20 / 21 |
-
-Measured 2026-11-17 (the `Boxes` and `svg_parse` rows 2026-11-23, with rtree 1.4.1) with `check/bench/versus.py`, on the same numpy inputs: the best of five calls each, on the 32 threads of an idle i9-14900K, with a release build that skips profile-guided optimization. A range is two runs. Peak memory is the most memory one call adds, its output included, each call in a fresh process.
 
 ### Installed size
 
@@ -352,6 +345,7 @@ For Linux distributions, `uv run scripts distro` generates the `debian/` directo
 ```
 uv run scripts check       # the gate: lint, build, tests, static checks, sanitizers, fuzzers, quick bench, thread-pool checkers
 uv run scripts lint        # the fast deterministic checks, nothing compiled
+uv run scripts test        # the build and the tests, on the last 2 cores (--cores N or all: on 4 or more, every planted bug too)
 uv run scripts fuzz        # every fuzzer, native then Atheris (--seconds each)
 uv run scripts bench       # the thread pool against hand-written pools, 144 cells (--quick: the short ones, seconds)
 uv run scripts genmc       # the thread pool's real code in every thread ordering (GenMC), and bugs planted in it
@@ -360,14 +354,22 @@ uv run scripts update      # every upstream and dependency to its newest
 uv run scripts format      # our C++, as scripts/clang-format.yaml says
 uv run scripts generate    # regenerate the shaders' SPIR-V, the stubs, this README's generated block and check/tests/golden.json
 uv run scripts wheel       # this platform's release wheels
-uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them)
+uv run scripts distro      # Debian and Fedora packaging (--run: build, test and lint them; --machine i686 or s390x)
 ```
 
 Run `check` before pushing; it prints how many minutes each stage took. Everything except `lock` and `wheel` runs inside a pinned Debian container (`scripts/docker/Dockerfile`), so your machine needs only Docker and uv. The sources are mounted read-only unless the command writes them.
 
+The tests are built so that a bug shows up on made-up inputs before anyone meets it on real data:
+
+- Every public function is called through one wrapper. It checks the answer against an independent reference, that the function raises only its documented errors and warnings, that it leaves its inputs unchanged and returns fresh arrays, and that no pool thread started between calls.
+- The inputs come from the type stubs: for each argument, every memory layout, every safe conversion, the other byte order, NaN, infinities, values at and past ±1e30, empty arrays, duplicate rows and integers at every edge (-1, 2^31, 2^32, 2^63-1). An argument type with no generator fails the suite.
+- Bugs are planted on purpose (`CODE_MUTANTS` in `scripts/__main__.py`): 28 small edits to the library, each of which the tests must catch, plus more for the fuzzers, GenMC and TLA+. `check` builds each one and fails if any gets through.
+- Nothing may print: a test that writes to stdout or stderr fails.
+- The references are exact on 32-bit x86 and on big-endian machines, which `distro --run --machine i686` and `--machine s390x` run.
+
 CI (the automatic checks on GitHub) runs the same commands:
 
-- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, then publishes the version `pyproject.toml` names. A version PyPI already has is left alone.
+- Every push to main runs `.github/workflows/release.yml`. It lints, builds and tests the sdist and every wheel, and the Debian package on s390x (an IBM mainframe chip that stores numbers in the opposite byte order, under an emulator: `distro --run --machine s390x`), then publishes the version `pyproject.toml` names. A version PyPI already has is left alone.
 - A push to `release/*` does all of that except the upload.
 - Once a week, if main has moved, `.github/workflows/fuzz.yml` fuzzes for ten minutes per fuzzer. A fuzzer feeds a function random inputs to find crashes. Each run starts from the seeds in the repository, keeps nothing, and fails on a finding.
 

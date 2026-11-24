@@ -34,10 +34,14 @@
 #   no_sanitize        { check = why } sanitizer checks off for its sources
 # vendor/ holds exactly these upstreams and vendor/patches/, nothing else.
 #
-# [part.NAME], a part of the one extension: src/NAME.cpp, whose bind_NAME adds
-# its functions and classes to the flat module:
+# [part.NAME], a part of the one extension. src/trimkit.cpp, the one file
+# that is Python, binds every part, and its own code is the unit src/NAME.cpp,
+# Python-free (src/trimkit.hpp declares it), built without Python's headers so
+# it can't reach for them. A part without a unit is a header of ours the
+# module includes (src/contour.hpp, src/svgpath.hpp):
 #   upstreams          what it compiles in
-#   fuzz               libFuzzer harnesses check/fuzz/HARNESS.cpp built against it
+#   fuzz               libFuzzer harnesses check/fuzz/HARNESS.cpp, linked with
+#                      the part's unit, the very object the extension links
 #   seeds              a program check/fuzz/SEEDS.cpp writing seeds for harness NAME
 #
 # [extension], the one extension, the package `trimkit` itself:
@@ -111,6 +115,20 @@ include = ["vendor/earcut/include/mapbox"]
 [upstream.earcut.patches]
 "earcut-convex-ring.patch" = "9b58d68009f53f58ea750819d82d4f3fe1745b9d98bc890f96e1851c88821e6f"
 "earcut-hole-bridge-blocks.patch" = "1b3551484374905f2659a23b51498c66715307742235ffa1560a947b11fd64a4"
+
+# constrained Delaunay triangulation, header only. MPL-2.0, which binds only its
+# own files: unmodified, shipped as source in the sdist. Its bundled predicates.h
+# (BSD-3-Clause) and portable_nth_element.hpp (Apache-2.0 WITH LLVM-exception)
+# keep their license texts beside it, as Eigen's do
+[upstream.cdt]
+repo = "artem-ogre/CDT"
+ref = "2.1.0"
+commit = "d66c2024ea3d7f06dca22bcbea93a8d5211ef5fb"
+tree_sha256 = "afaeb0c535945a693d3afc63af1113d626942f3031df952d86629049b51f8d38"
+spdx = "MPL-2.0"
+copyright = "Copyright the CDT authors"
+keep = ["LICENSE", "CDT/LICENSE-predicates.txt", "CDT/LICENSE-LLVM.txt"]
+include = ["vendor/cdt/CDT/include"]
 
 [upstream.vhacd]
 repo = "kmammou/v-hacd"
@@ -311,9 +329,9 @@ upstreams = ["nanobind", "robin_map"]
 upstreams = ["tinybvh", "vulkan_headers"]
 fuzz = ["bvh", "parallel", "vulkan"]
 
-[part.earcut]
-upstreams = ["earcut"]
-fuzz = ["earcut"]
+[part.triangulate]
+upstreams = ["earcut", "cdt"]
+fuzz = ["triangulate"]
 
 [part.vhacd]
 upstreams = ["vhacd"]
@@ -341,6 +359,12 @@ fuzz = ["meshoptimizer"]
 upstreams = ["coal", "eigen"]
 fuzz = ["collision"]
 
+# the operator new door: every allocation of the extension refused, as
+# MemoryError, past the memory the system has (src/allocator.cpp)
+[part.allocator]
+upstreams = []
+fuzz = []
+
 # src/contour.hpp is ours, as src/svgpath.hpp is
 [part.contour]
 upstreams = []
@@ -348,7 +372,7 @@ fuzz = ["contour"]
 
 # debian:trixie
 [distribution.debian]
-images = { x86_64 = "debian@sha256:e2914ec98e08b24b4cee3cefcb9f90dfb5519f8d215a2ccf0c9a49b10b6e43de", aarch64 = "debian@sha256:39f862f398f8ea1a2ffee9bbe02c649be6779244bd6a834c4f71155172f801f2" }
+images = { x86_64 = "debian@sha256:e2914ec98e08b24b4cee3cefcb9f90dfb5519f8d215a2ccf0c9a49b10b6e43de", aarch64 = "debian@sha256:39f862f398f8ea1a2ffee9bbe02c649be6779244bd6a834c4f71155172f801f2", i686 = "debian@sha256:8c4f4f1e5f055cbe52b31de749e301c92abcbb7c828becac6ed0c29e92a2f002", s390x = "debian@sha256:83e775c5c877a66903d4cd464e396bd83a7db98074c132f295903d8680569c35" }
 requires = ["clang", "lld", "llvm", "ninja-build", "python3-all-dev", "pybuild-plugin-pyproject", "python3-numpy", "python3-pytest", "python3-hypothesis", "python3-lark", "python3-svg.path"]
 
 # fedora:43

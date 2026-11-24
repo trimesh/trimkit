@@ -295,6 +295,7 @@ static inline const char* arc_commands(std::uint8_t kind, const double* start, c
             }
         }
     } else {
+        // NOLINTNEXTLINE(readability-simplify-boolean-expr): negated, so NaN is refused too
         if (!(weight > 0.0 && weight < 1.0)) {
             return "a conic's weight must be between 0 and 1";
         }
@@ -437,6 +438,7 @@ static inline void add_arc(SvgPen* pen, double end_x, double end_y, double radiu
         // subnormal (too imprecise to write back), they make a line
         radius_x *= reach;
         radius_y *= reach;
+        // NOLINTNEXTLINE(readability-simplify-boolean-expr): negated, so NaN is refused too
         if (!(radius_x >= std::numeric_limits<double>::min() && radius_y >= std::numeric_limits<double>::min() &&
               radius_x <= COORDINATE_LIMIT && radius_y <= COORDINATE_LIMIT)) {
             add_line(pen, end_x, end_y);
@@ -537,7 +539,7 @@ static inline void add_arc(SvgPen* pen, double end_x, double end_y, double radiu
     // every piece must be one `format` writes, or the whole arc is a line
     double from[2] = {pen->x, pen->y};
     for (int piece = 0; piece < count; piece++) {
-        SvgArcCommands commands;
+        SvgArcCommands commands{};
         const bool inside =
             within(through[piece][0]) && within(through[piece][1]) && within(ends[piece][0]) && within(ends[piece][1]);
         if (!inside || (kind != QUADRATIC &&

@@ -1,42 +1,45 @@
-// Property: any small mesh, with or without per-vertex attributes, simplifies
-// with the options src/meshoptimizer.cpp uses into triangles that only
-// reference input vertices, never more of them than went in, with a finite
-// error, and the same answer twice.
+// Property: any small mesh simplifies as `trimkit.simplify` does
+// (src/meshoptimizer.cpp): refused exactly when face_count or maximum_error
+// is out of range, else into triangles that index the output vertices, never
+// more of them than went in, each output vertex exactly the input vertex it
+// names, and the same answer twice. Positions span any scale, as the unit
+// centers and scales them itself.
+#include "../../src/trimkit.hpp"
+
 #include <fuzzer/FuzzedDataProvider.h>
-#include <meshoptimizer.h>
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
-struct Attributes {
-    std::vector<float> values;
-    std::vector<float> weights;
-};
+namespace {
 
-static std::size_t simplify(const std::vector<std::uint32_t>& indices, const std::vector<float>& positions,
-                            const Attributes& attributes, std::size_t target, float target_error, unsigned int options,
-                            std::vector<std::uint32_t>* kept, float* error) {
-    const std::size_t attribute_count = attributes.weights.size();
-    kept->assign(indices.size(), 0);
-    const std::size_t count = meshopt_simplifyWithAttributes(
-        kept->data(), indices.data(), indices.size(), positions.data(), positions.size() / 3, 3 * sizeof(float),
-        attribute_count > 0 ? attributes.values.data() : nullptr, attribute_count * sizeof(float),
-        attribute_count > 0 ? attributes.weights.data() : nullptr, attribute_count, nullptr, target, target_error,
-        options, error);
-    kept->resize(count);
-    return count;
+// any int64, drawn as a uint64's bits: libFuzzer's own range arithmetic
+// wraps for a signed range this wide, which UBSan reports
+std::int64_t any_int64(FuzzedDataProvider& provider) {
+    const std::uint64_t bits = provider.ConsumeIntegral<std::uint64_t>();
+    std::int64_t value = 0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
+
+}  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     FuzzedDataProvider input(data, size);
     const std::uint32_t vertex_count = input.ConsumeIntegralInRange<std::uint32_t>(3, 96);
     const std::uint32_t face_count = input.ConsumeIntegralInRange<std::uint32_t>(1, 192);
-    std::vector<float> positions(3 * std::size_t{vertex_count});
-    for (float& position : positions) {
-        // within [-1, 1]: what the binding's centering and scaling produce
-        position = input.ConsumeFloatingPointInRange<float>(-1.0F, 1.0F);
+    // any scale within the coordinate bound, and any offset: the unit
+    // centers and scales, so a mesh 1e-20 across and one at 1e25 are the same
+    const double scale = std::ldexp(1.0, input.ConsumeIntegralInRange<int>(0, 140) - 60);
+    const double offset = input.ConsumeFloatingPointInRange<double>(-1e20, 1e20);
+    std::vector<double> vertices(3 * std::size_t{vertex_count});
+    for (double& value : vertices) {
+        value = offset + (scale * input.ConsumeFloatingPointInRange<double>(-1.0, 1.0));
     }
     std::vector<std::uint32_t> indices;
     if (input.ConsumeBool() && vertex_count >= 9) {
@@ -56,36 +59,49 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             index = input.ConsumeIntegralInRange<std::uint32_t>(0, vertex_count - 1);
         }
     }
-    // as the binding passes them: unit weights, values as given
-    Attributes attributes;
-    const std::size_t attribute_count = input.ConsumeIntegralInRange<std::size_t>(0, 4);
-    attributes.weights.assign(attribute_count, 1.0F);
-    attributes.values.resize(attribute_count * vertex_count);
-    for (float& value : attributes.values) {
-        value = input.ConsumeFloatingPointInRange<float>(-4.0F, 4.0F);
-    }
-    const std::size_t target = 3 * input.ConsumeIntegralInRange<std::size_t>(0, indices.size() / 3);
-    const float target_error = input.ConsumeBool() ? 1e30F : input.ConsumeFloatingPointInRange<float>(0.0F, 2.0F);
-    unsigned int options = meshopt_SimplifyErrorAbsolute | meshopt_SimplifyRegularizeLight;
-    if (input.ConsumeBool()) {
-        options |= meshopt_SimplifyLockBorder;
-    }
+    // as Python can pass them: any int64, and any double
+    const std::int64_t wanted =
+        input.ConsumeBool() ? any_int64(input) : input.ConsumeIntegralInRange<std::int64_t>(0, 200);
+    const double maximum_error = input.ConsumeBool()   ? input.ConsumeFloatingPoint<double>()
+                                 : input.ConsumeBool() ? std::numeric_limits<double>::infinity()
+                                                       : scale * input.ConsumeFloatingPointInRange<double>(0.0, 2.0);
+    const bool lock_border = input.ConsumeBool();
+    const bool refused = wanted < 0 || !(maximum_error >= 0.0);
 
-    std::vector<std::uint32_t> kept;
-    float error = 0.0F;
-    const std::size_t count = simplify(indices, positions, attributes, target, target_error, options, &kept, &error);
-    if (count % 3 != 0 || count > indices.size() || !std::isfinite(error) || error < 0.0F) {
+    std::vector<double> output_vertices;
+    std::vector<std::int64_t> output_faces;
+    std::vector<std::int64_t> sources;
+    try {
+        trimkit::simplify_mesh(vertices.data(), vertex_count, indices, wanted, maximum_error, lock_border,
+                               &output_vertices, &output_faces, &sources);
+    } catch (const std::invalid_argument&) {
+        if (!refused) {
+            __builtin_trap();
+        }
+        return 0;
+    }
+    if (refused || output_faces.size() % 3 != 0 || output_faces.size() > indices.size() ||
+        output_vertices.size() != 3 * sources.size() || sources.size() > vertex_count) {
         __builtin_trap();
     }
-    for (const std::uint32_t index : kept) {
-        if (index >= vertex_count) {
+    for (const std::int64_t index : output_faces) {
+        if (index < 0 || static_cast<std::size_t>(index) >= sources.size()) {
             __builtin_trap();
         }
     }
-    std::vector<std::uint32_t> again;
-    float error_again = 0.0F;
-    simplify(indices, positions, attributes, target, target_error, options, &again, &error_again);
-    if (again != kept || error_again != error) {
+    for (std::size_t i = 0; i < sources.size(); i++) {
+        for (std::size_t k = 0; k < 3; k++) {
+            if (output_vertices[(3 * i) + k] != vertices[(3 * static_cast<std::size_t>(sources[i])) + k]) {
+                __builtin_trap();
+            }
+        }
+    }
+    std::vector<double> vertices_again;
+    std::vector<std::int64_t> faces_again;
+    std::vector<std::int64_t> sources_again;
+    trimkit::simplify_mesh(vertices.data(), vertex_count, indices, wanted, maximum_error, lock_border, &vertices_again,
+                           &faces_again, &sources_again);
+    if (faces_again != output_faces || sources_again != sources) {
         __builtin_trap();
     }
     return 0;

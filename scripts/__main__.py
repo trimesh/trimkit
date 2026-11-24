@@ -6,7 +6,8 @@ The one way to build, test and check this package, locally and in CI alike:
   uv run scripts lint        the fast deterministic checks, nothing compiled:
                              vendor, doors, lock, formatting, ruff, zizmor,
                              licenses, shaders and cppcheck
-  uv run scripts test        the strict build and the tests, in 2 GB
+  uv run scripts test        the strict build and the tests, in 2 GB, on the
+                             last 2 cores (--cores N, or all)
   uv run scripts static      the checks that need a build: clang-tidy, the
                              sdist, stubs and the wheel audit
   uv run scripts fuzz        every fuzzer, native then Atheris (--seconds each)
@@ -19,7 +20,8 @@ The one way to build, test and check this package, locally and in CI alike:
   uv run scripts bench       the pool against hand-written pools on 8 cores,
                              144 cells (--quick: the short calls, in seconds)
   uv run scripts distro      Debian and Fedora packaging (--run: build,
-                             test and lint them), when packaging changes
+                             test and lint them, --machine i686|s390x on
+                             another machine's images), when packaging changes
   uv run scripts generate    regenerate the shaders' SPIR-V, the stubs, the
                              README API summary and check/tests/golden.json
   uv run scripts patch       write vendor/patches/ from the blocks in vendor/
@@ -33,14 +35,15 @@ is a command: the stages and their parts exist for debugging one failure,
 and `fetch` and `outdated` re-vendor and audit trimkit.toml's upstreams;
 none of these are otherwise documented.
 
-CI runs these same commands. A push to main runs `lint`, `static`, `sdist` and
-`wheel` exactly as they run here, then publishes, the one CI-only step, as it
-needs GitHub's token for PyPI; once a week, when main has moved, CI runs
-`fuzz` for longer. `check` is the gate, run before pushing. Everything but `lock` and `wheel` re-runs
-itself inside the image built from scripts/docker/Dockerfile, with the repository
-mounted read-only at /src (writable for `generate`) and builds under
-`build/docker/`, so it behaves the same on every machine and needs only
-Docker and uv on the host.
+CI runs these same commands. A push to main runs `lint`, `static`, `sdist`,
+`wheel` and `distro --run --machine s390x` exactly as they run here, then
+publishes, the one CI-only step, as it needs GitHub's token for PyPI; once a
+week, when main has moved, CI runs `fuzz` for longer. `check` is the gate, run
+before pushing. Everything but what ON_HOST names re-runs itself inside the
+image built from scripts/docker/Dockerfile, with the repository mounted
+read-only at /src (writable for `generate`) and builds under `build/docker/`,
+so it behaves the same on every machine and needs only Docker and uv on the
+host.
 
 Standard library only, every subprocess an argument list, and nothing read
 from the environment. The image is the isolation: `docker run` starts every
@@ -66,6 +69,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
 import api
 import builder
@@ -230,8 +234,11 @@ def test_files() -> list[Path]:
 
 
 def cmd_build(args) -> None:
-    # the dev build alone: `in_image` runs it before `test`, which has less memory
+    # the dev build alone: `in_image` runs it before `test`, which has less
+    # memory, and with --planted the builds of the bugs `test` plants too
     dev(args.root)
+    if args.planted:
+        planted_wheels(args.root)
 
 
 def cmd_test(args) -> None:
@@ -242,6 +249,90 @@ def cmd_test(args) -> None:
     # the image has a Vulkan device (Mesa's CPU one), so the device tests run
     build.pytest("--device-required", *test_files())
     run(build.python, CHECK / "tests" / "memory_limit.py", cwd=CHECK / "tests")
+    # decided once, on the host, by the cores asked for (`in_image`)
+    cores = len(os.sched_getaffinity(0))
+    if not args.planted:
+        print(f"planted bugs: not tested on {cores} cores, the pool shows them on {PLANTED_TEST_CORES}")
+    elif cores < PLANTED_TEST_CORES:
+        sys.exit(f"planted bugs asked for on {cores} cores, where the pool can't show them")
+    elif not planted_bugs_tested(args.root):
+        sys.exit("the suite passed a build with a planted bug (CODE_MUTANTS)")
+
+
+# the cores the suite needs to fail on every planted bug: on two the pool has
+# one worker, which no wake leaves behind, so an idle respawn can't show
+PLANTED_TEST_CORES = 4
+# how long one planted bug's suite may run: the whole suite takes minutes
+PLANTED_TEST_SECONDS = 3600
+
+
+def planted_wheels(root: Path) -> dict[str, Path]:
+    """
+    A wheel for each bug planted for the suite (CODE_MUTANTS, "test"), by
+    name, built one at a time in one build directory, so each compiles only
+    what its bug changed: every file a bug edits is written fresh first, and
+    again once its bug is out, so no build keeps an object compiled with a
+    bug in it. Built outside `test`'s memory limit, as the dev build is.
+    """
+    planted = code_mutants("test")
+    build = Build(root, "planted")
+    kept = build.dir / "kept"
+    shutil.rmtree(kept, ignore_errors=True)
+    source = builder.export_tracked(build.source)
+    for path in {path for path, _ in planted.values()}:
+        (source / path).write_text((ROOT / path).read_text())
+    wheels = {}
+    for name, (path, mutated) in planted.items():
+        (source / path).write_text(mutated)
+        build.install(PYTHON, source=source, strict=True)
+        (kept / name).mkdir(parents=True)
+        wheels[name] = Path(shutil.copy(build.wheel, kept / name))
+        (source / path).write_text((ROOT / path).read_text())
+    return wheels
+
+
+def planted_bugs_tested(root: Path) -> bool:
+    """
+    The suite, as the stage runs it but stopping at its first failure, on
+    each planted bug's wheel (`planted_wheels`, which `build --planted`
+    made), one at a time, must fail: its timing tests too, which are what
+    see Ctrl-C ignored or the GIL held, and which never flake. Returns
+    whether every bug was caught.
+    """
+    build = Build(root, "planted")
+    caught = {}
+    for name in code_mutants("test"):
+        (wheel,) = (build.dir / "kept" / name).glob("*.whl")
+        run(
+            tool("uv"),
+            "pip",
+            "install",
+            "-q",
+            "--python",
+            build.python,
+            "--no-deps",
+            "--reinstall-package",
+            "trimkit",
+            wheel,
+        )
+        command = [build.python, "-m", "pytest", "-q", "-x", "--device-required", *test_files()]
+        try:
+            tested = subprocess.run(
+                command, cwd=ROOT, capture_output=True, text=True, check=False, timeout=PLANTED_TEST_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            # hung: what a bug that deadlocks the pool does, past every test's own bound
+            caught[name] = True
+            print(f"  pass  planted bug {name}: hung past {PLANTED_TEST_SECONDS} s", flush=True)
+            continue
+        # a test failed (1), or the bug crashed the process (a signal): what
+        # catches it. Not an error collecting or running the suite (2 to 4),
+        # or no test run (5), which says nothing of the bug
+        caught[name] = tested.returncode == 1 or tested.returncode < 0
+        last = tested.stdout.strip().splitlines()[-1:] or [""]
+        verdict = "pass" if caught[name] else f"FAIL ({tested.returncode})"
+        print(f"  {verdict}  planted bug {name}: {last[0]}", flush=True)
+    return all(caught.values())
 
 
 def cmd_asan(args) -> None:
@@ -303,7 +394,7 @@ def tsan_python(root: Path) -> Path:
     tree = fetch(url, CPYTHON_SHA256, source)
     configure = ["./configure", "-q", "--disable-gil", "--with-thread-sanitizer", f"--prefix={prefix}"]
     run(*configure, cwd=tree, env={"CC": "clang", "CXX": "clang++"})
-    run(tool("make"), "-s", f"-j{os.cpu_count()}", cwd=tree)
+    run(tool("make"), "-s", f"-j{len(os.sched_getaffinity(0))}", cwd=tree)
     run(tool("make"), "-s", "install", cwd=tree)
     shutil.copy(tree / "Tools" / "tsan" / "suppressions_free_threading.txt", prefix)
     shutil.rmtree(source)
@@ -433,9 +524,16 @@ def planted_bugs_fuzzed(root: Path, corpus: Path) -> bool:
             return name, True  # hung in a fixed check, before libFuzzer's own timeout applies
         return name, done.returncode != 0
 
-    planted = code_mutants("fuzz")
+    planted = {name: source for name, (_, source) in code_mutants("fuzz").items()}
+    # and the header as it is, run beside them under the same load: it must
+    # survive, or a crash or hang of a planted one says nothing of its bug
+    control = ("unplanted", (ROOT / "src" / "parallel.hpp").read_text())
     with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
-        results = list(pool.map(caught, planted.items()))
+        (_, failed), *results = pool.map(caught, [control, *planted.items()])
+    if failed:
+        sys.exit(
+            "the fuzz harness failed src/parallel.hpp as it is, beside the planted bugs: no catch counts"
+        )
     for name, found in results:
         print(f"  {'pass' if found else 'FAIL'}  planted bug {name}", flush=True)
     return all(found for _, found in results)
@@ -464,7 +562,8 @@ def replay_32bit(root: Path, corpus: Path, findings: Path) -> bool:
                 tool("clang++"), "-m32", "-msse2", "-mfpmath=sse",
                 "-std=c++17", "-O1", "-g", "-D_GLIBCXX_ASSERTIONS",
                 "-fsanitize=fuzzer,address,undefined", "-fno-sanitize-recover=all",
-                *includes, *defines, CHECK / "fuzz" / f"{name}.cpp", "-o", directory / f"fuzz_{name}",
+                *includes, *defines, CHECK / "fuzz" / f"{name}.cpp", *([part.source] if part.source else []),
+                "-o", directory / f"fuzz_{name}",
             )  # fmt: skip
             report = harness(directory, corpus, findings, name, ["-runs=0"])
             print(report.replace(f"{name}:", f"{name} (32-bit):"), flush=True)
@@ -519,6 +618,10 @@ def cmd_cppcheck(args) -> None:
         "--error-exitcode=1",
         # every branch, not cppcheck's default sample of them, one line per finding
         "--check-level=exhaustive",
+        # and every configuration of the #ifdefs, not the 12 it samples, so
+        # what it reports doesn't move when an include does
+        "--force",
+        f"-j{len(os.sched_getaffinity(0))}",
         "--template={file}:{line}: {severity}: {message} [{id}]",
         *MANIFEST.sources,
     )
@@ -616,8 +719,6 @@ def cmd_licenses(args) -> None:
     licenses.check()
 
 
-# what only src/numpy.hpp may do: touch nanobind's ndarray directly, or the
-# checks behind its `read*` functions, so no binding can skip one
 # what starts or waits on a thread, allowed in src/parallel.hpp alone
 THREADING = (
     "<mutex>",
@@ -637,6 +738,8 @@ POOLS_COMPILED_OUT = {
     "xatlas": "XA_MULTITHREADED=0",
 }
 
+# what only src/numpy.hpp may do: touch nanobind's ndarray directly, or the
+# checks behind its `read*` functions, so no binding can skip one
 DOOR_ONLY = re.compile(r"nb::ndarray|try_cast|check_values|trimkit::detail::|\b(malloc|calloc|realloc)\(")
 
 
@@ -735,12 +838,10 @@ def check_default_ints() -> None:
 
 
 def check_door() -> None:
-    # every C++ file of ours but the door itself
-    sources = [
-        p
-        for p in builder.tracked_under(ROOT / "src")
-        if p.suffix in (".cpp", ".hpp") and p.name not in ("numpy.hpp", "trimkit.cpp")
-    ]
+    # every C++ file of ours but the door itself, and the allocation door,
+    # whose malloc is every allocation's
+    every = [p for p in builder.tracked_under(ROOT / "src") if p.suffix in (".cpp", ".hpp")]
+    sources = [p for p in every if p.name not in ("numpy.hpp", "allocator.cpp")]
     found = [
         f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
         for path in sources
@@ -753,30 +854,42 @@ def check_door() -> None:
     # (FAR, near, min, max) rename whatever of ours they match
     found = [
         f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
-        for path in builder.tracked_under(ROOT / "src")
-        if path.suffix in (".cpp", ".hpp")
+        for path in every
         for number, line in enumerate(path.read_text().splitlines(), 1)
         if re.search(r"#\s*include\s*<windows\.h>", line, re.IGNORECASE)
     ]
     if found:
         sys.exit("Win32 calls must be declared in src/windows.hpp, never windows.h:\n  " + "\n  ".join(found))
-    # threads: only common.hpp reaches the pool, through in_parallel and
-    # gather_in_parallel, and gil.hpp, for the pool's exit gate (platform.hpp
-    # is the pool's own layer)
+    # numpy's bool bytes are read as bytes (numpy.hpp, mask_bytes): a byte
+    # other than 0 or 1 is undefined as a C++ bool, and a uint8 array viewed
+    # as bool holds one
     found = [
-        f"{path.relative_to(ROOT)}: {needle}"
+        f"{path.relative_to(ROOT)}:{number}: {line.strip()}"
         for path in sources
-        if path.name not in ("common.hpp", "gil.hpp", "parallel.hpp", "platform.hpp")
-        for needle in ("parallel.hpp", "parallel::")
-        if needle in path.read_text()
+        for number, line in enumerate(path.read_text().splitlines(), 1)
+        if re.search(r"\bbool\s*\*", line) and "NOLINT" not in line
     ]
     if found:
-        sys.exit("threads must go through in_parallel in src/common.hpp:\n  " + "\n  ".join(found))
+        sys.exit(
+            "read bool arrays as bytes (numpy.hpp, mask_bytes), never through bool*:\n  " + "\n  ".join(found)
+        )
+    # threads, in every file, the two doors too: only trimkit.hpp reaches the
+    # pool, through in_parallel and the rest of its door, and gil.hpp, for the pool's exit gate and Ctrl-C
+    # (platform.hpp is the pool's own layer). Anything else names at most the
+    # Stop it is handed, never the pool itself
+    found = [
+        f"{path.relative_to(ROOT)}: {needle}"
+        for path in every
+        if path.name not in ("trimkit.hpp", "gil.hpp", "parallel.hpp", "platform.hpp")
+        for needle in sorted(set(re.findall(r'parallel\.hpp"|parallel::(?!Stop\b)\w+', path.read_text())))
+    ]
+    if found:
+        sys.exit("threads must go through in_parallel in src/trimkit.hpp:\n  " + "\n  ".join(found))
     # and the platform only through the pool, but for the Vulkan code's fork
     # generation: platform.hpp is no second door to threads
     found = [
         f"{path.relative_to(ROOT)}: platform.hpp"
-        for path in sources
+        for path in every
         if path.name not in ("parallel.hpp", "platform.hpp", "vulkan.hpp")
         and re.search(r'#\s*include\s*"[./]*platform\.hpp"', path.read_text())
     ]
@@ -786,18 +899,36 @@ def check_door() -> None:
     # starts or blocks on anything else
     found = [
         f"{path.relative_to(ROOT)}: {needle}"
-        for path in sources
+        for path in every
         if path.name not in ("parallel.hpp", "platform.hpp")
         for needle in THREADING
         if needle in path.read_text()
     ]
     if found:
         sys.exit("the pool in src/parallel.hpp is the only threading there is:\n  " + "\n  ".join(found))
+    # a thread starts only at a call's wake that finds too few live
+    # (wake_helpers), or in the chain it began (a new worker's first step):
+    # never at an exit, which once started one for a wake other workers had
+    # served (Scheduler.tla, P3, checks the protocol; this, that the code
+    # has no other door)
+    pool = (ROOT / "src" / "parallel.hpp").read_text()
+    starts = []
+    for call in re.finditer(r"\bspawn_worker\(\)", pool):
+        before = pool[: call.start()]
+        if before.endswith("inline bool "):  # its definition
+            continue
+        function = re.findall(r"^inline [^\n(]*?\b(\w+)\(", before, re.MULTILINE)[-1]
+        case = re.findall(r"case (\w+::\w+):", before)
+        starts.append(function if function != "worker_main" else f"worker_main {case[-1] if case else ''}")
+    if sorted(starts) != ["wake_helpers", "worker_main WorkerStep::Start"]:
+        sys.exit(
+            f"src/parallel.hpp: spawn_worker() only from wake_helpers and WorkerStep::Start, not {starts}"
+        )
     # the GIL: released only through GilReleased (src/gil.hpp), which makes the
     # interpreter's exit safe for every call that releases it
     found = [
         f"{path.relative_to(ROOT)}: {needle}"
-        for path in sources
+        for path in every
         if path.name != "gil.hpp"
         for needle in ("gil_scoped_release", "PyEval_SaveThread", "Py_BEGIN_ALLOW_THREADS")
         if needle in path.read_text()
@@ -809,12 +940,17 @@ def check_door() -> None:
     for upstream, define in POOLS_COMPILED_OUT.items():
         if define not in MANIFEST.upstreams[upstream].defines:
             sys.exit(f"trimkit.toml: [upstream.{upstream}.defines] must set {define}: one pool, parallel.hpp")
-    print(f"ok: {len(sources)} sources use only src/numpy.hpp for arrays and src/common.hpp for threads")
+    print(f"ok: {len(sources)} sources use only src/numpy.hpp for arrays and src/trimkit.hpp for threads")
 
 
 def cmd_audit(args) -> None:
     # the dev build's wheel, audited as every release wheel is
     run(dev(args.root).python, ROOT / "scripts" / "check_wheel.py", dev(args.root).wheel)
+
+
+# the model's steps that only a mutation takes (claim_load_then_store's): no
+# scenario of the real protocol, nor any traced run, ever takes them
+MUTATION_ONLY_STEPS = ("CallerClaimStore", "WorkerClaimStore")
 
 
 def check_model_steps() -> None:
@@ -845,14 +981,7 @@ def check_model_steps() -> None:
     # traced, but for running items, which is local, and a mutation's
     traced = set(re.findall(r'"((?:Caller|Worker)\w+)"', header))
     modelled = set(re.findall(r"^((?:Caller|Worker)\w+)\(t, f\) ==", spec, re.M))
-    local = {
-        "CallerRun",
-        "CallerRunNested",
-        "WorkerRun",
-        "WorkerRunNested",
-        "CallerClaimStore",
-        "WorkerClaimStore",
-    }
+    local = {"CallerRun", "CallerRunNested", "WorkerRun", "WorkerRunNested", *MUTATION_ONLY_STEPS}
     problems += [
         f"src/parallel.hpp traces {name}, which the model has no action for"
         for name in sorted(traced - modelled)
@@ -871,6 +1000,9 @@ def cmd_lint(args) -> None:
     check_door()
     check_default_ints()
     check_model_steps()
+    # every planted bug still applies, whichever stage plants it: checked as
+    # text here, so a stale one is seen on any machine, not only by its stage
+    code_mutants("")
     # the lock matches pyproject.toml
     run(tool("uv"), "lock", "--check")
     for command in (cmd_clang_format, cmd_ruff, cmd_actions, cmd_licenses, cmd_shader, cmd_cppcheck):
@@ -895,7 +1027,7 @@ THREAD_CALLS = re.compile(
 THREAD_CALLS_ALLOWED = {
     "src/platform.hpp": "the operating system's threads, waits and signal masks, for the pool alone",
     "src/parallel.hpp": "the pool",
-    "src/common.hpp": "Interrupt polls for Ctrl-C on the calling thread (PyErr_CheckSignals)",
+    "src/gil.hpp": "Interrupt polls for Ctrl-C on the calling thread (PyErr_CheckSignals)",
 }
 # Eigen is vendored unmodified (MPL-2.0, `check` refuses a patch to it) and
 # isn't scanned: its thread pool is compiled only with EIGEN_USE_THREADS,
@@ -975,7 +1107,7 @@ def cmd_threads(args) -> None:
                         found.add((where, f"{name}({literal or '...'})"))
         return found
 
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 1) as pool:
+    with concurrent.futures.ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
         found = sorted(set().union(*pool.map(scan, entries)))
     if found:
         sys.exit(
@@ -1185,9 +1317,14 @@ GENMC_MUTANTS_SURVIVING: dict[str, str] = {
     "pool.spinning.fetch_sub(1, std::memory_order_seq_cst);  // out of the count before the wake is compared  [seq_cst -> acq_rel]": _LOST_WAKE,  # noqa: E501
     "moved = pool.wake.load(std::memory_order_seq_cst) != observed;  [seq_cst -> acquire]": _LOST_WAKE,
     "pool.live.fetch_sub(1, std::memory_order_seq_cst);  [seq_cst -> acq_rel]": _LOST_WAKE,
-    "if (pool.wake.load(std::memory_order_seq_cst) != observed) {  [seq_cst -> acquire]": _LOST_WAKE,
-    "holding.observed = pool.wake.load(std::memory_order_acquire);  [acquire -> relaxed]": _LOST_WAKE,
+    "if (pool.wake.load(std::memory_order_seq_cst) == observed || !count_worker_live()) {  [seq_cst -> acquire]": _LOST_WAKE,  # noqa: E501
+    "observed = pool.wake.load(std::memory_order_acquire);  [acquire -> relaxed]": _LOST_WAKE,
 }
+
+
+# how GenMC words what it found in the code: its verdicts, never a compiler's
+# error (lowercase) or a time limit
+GENMC_FOUND = re.compile(r"Error|FAILURE|violation|race")
 
 
 def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
@@ -1217,7 +1354,7 @@ def _genmc(root: Path, harness: str) -> tuple[bool, int, str]:
         return False, 0, f"no answer in {GENMC_SECONDS} s"
     found = re.search(r"complete executions explored: (\d+)", done.stdout)
     why = next(
-        (line for line in done.stdout.splitlines() if re.search(r"Error|FAILURE|violation|race", line)),
+        (line for line in done.stdout.splitlines() if GENMC_FOUND.search(line)),
         done.stderr.strip().splitlines()[-1] if done.returncode != 0 and done.stderr.strip() else "",
     )
     return done.returncode == 0, int(found.group(1)) if found else 0, why
@@ -1280,16 +1417,25 @@ def cmd_genmc(args) -> None:
     mutants = _weakened(source)
 
     def survives(mutant: tuple[str, str]) -> str | None:
+        # caught only by what GenMC itself found: a mutant that doesn't
+        # compile, or that no harness answers within GENMC_SECONDS, is
+        # nothing caught, and stops the stage rather than count as caught
         line, mutated = mutant
         with tempfile.TemporaryDirectory() as scratch:
-            shutil.copy(ROOT / "src" / "platform.hpp", scratch)
+            # every header the unmutated run reads, that one replaced
+            for header in builder.tracked_under(ROOT / "src"):
+                if header.suffix == ".hpp" and header.parent == ROOT / "src":
+                    shutil.copy(header, scratch)
             (Path(scratch) / "parallel.hpp").write_text(mutated)
             for harness in order:
-                if not _genmc(Path(scratch), harness)[0]:
+                passed, _, why = _genmc(Path(scratch), harness)
+                if not passed and GENMC_FOUND.search(why):
                     return None
+                if not passed:
+                    sys.exit(f"GenMC couldn't check {line!r} with {harness}: {why}")
         return line
 
-    bugs = [(name, mutated) for name, mutated in code_mutants("genmc").items()]
+    bugs = [(name, mutated) for name, (_, mutated) in code_mutants("genmc").items()]
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
         uncaught = [name for name in pool.map(survives, bugs) if name is not None]
         surviving = [line for line in pool.map(survives, mutants) if line is not None]
@@ -1349,6 +1495,8 @@ MODEL_MUTATIONS = {
     "wait_checks_count_first": ("L1", {"Calls": 1}),
     "wait_ignores_epoch": ("L1", {"Callers": 2, "Calls": 1, "NSlots": 1}),
     "exit_without_recheck": ("P2", {"IdleExit": True}),
+    # an exit starting another thread for a wake other workers served
+    "exit_starts_replacement": ("P3", {"IdleExit": True}),
     "wake_counts_live_first": ("P2", {"IdleExit": True}),
     "fork_fails_nothing": ("R", {"Calls": 1, "Fork": True}),
     "fork_keeps_slots": ("S1", {"Calls": 1, "Fork": True}),
@@ -1382,45 +1530,76 @@ TRACE_CALLERS, TRACE_CALLS, TRACE_ITEMS = 2, 4, 32
 # so more than one joins, leaves and is woken at once
 TRACE_CORES = 4
 
-# Bugs planted in src/parallel.hpp, one at a time, each with the check that
-# must fail on it: "genmc" (a harness of check/verify/genmc), "trace" (some
-# round's log is one the model doesn't allow) or "fuzz" (check/fuzz/parallel.cpp
-# crashes or hangs). A check that passes a planted bug fails its stage, and so
-# does an edit that no longer applies: so each check is shown able to fail on
-# the real code, not only on the model. Not here, as nothing at code level
-# sees them (they cost speed, never an answer, and `bench` is what would
-# notice): an exiting worker that doesn't look at the wake again, a spawn
-# chain that stops early, and a caller's wait that ignores the epoch
+
+class PlantedBug(NamedTuple):
+    """
+    A bug planted in one of our sources, `path`: each (old, new) of `edits`
+    an exact text of it, found once, replaced. `caught_by` names every check that must fail on it:
+    "genmc" (a harness of check/verify/genmc), "trace" (some round's log is
+    one the model doesn't allow) or "fuzz" (check/fuzz/parallel.cpp crashes
+    or hangs), all three on src/parallel.hpp alone; or "test" (the suite, on
+    a build with it, `scripts test`).
+    """
+
+    caught_by: tuple[str, ...]
+    edits: tuple[tuple[str, str], ...]
+    path: str = "src/parallel.hpp"
+
+
+# Bugs planted one at a time, each with the checks that must fail on it. A
+# check that passes a planted bug fails its stage, and so does an edit that
+# no longer applies: so each check is shown able to fail on the real code,
+# not only on the model. Not here, as nothing sees them but `bench` (they cost
+# speed, never an answer): a spawn chain that stops early, and a caller's
+# wait that ignores the epoch
 CODE_MUTANTS = {
-    "close_without_waiting": (
-        "genmc",
-        "            if (inside) {\n"
-        "                wait_for_workers(*slot_, job_, epoch_, poll);\n"
-        "            }\n",
-        "",
+    "close_without_waiting": PlantedBug(
+        ("genmc",),
+        (
+            (
+                "            if (inside) {\n"
+                "                wait_for_workers(*slot_, job_, epoch_, poll);\n"
+                "            }\n",
+                "",
+            ),
+        ),
     ),
-    "join_ignores_open": (
-        "genmc",
-        "while (SlotWord{word}.open() && SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
-        "while (SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
+    "join_ignores_open": PlantedBug(
+        ("genmc",),
+        (
+            (
+                "while (SlotWord{word}.open() && SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
+                "while (SlotWord{word}.epoch() == SlotWord{seen}.epoch()) {",
+            ),
+        ),
     ),
-    "touch_job_after_leave": (
-        "genmc",
-        "                holding.leave();\n                job = nullptr;",
-        "                holding.leave();\n"
-        "                (void)job->stopped.load(std::memory_order_relaxed);\n"
-        "                job = nullptr;",
+    "touch_job_after_leave": PlantedBug(
+        ("genmc",),
+        (
+            (
+                "                holding.leave();\n                job = nullptr;",
+                "                holding.leave();\n"
+                "                (void)job->stopped.load(std::memory_order_relaxed);\n"
+                "                job = nullptr;",
+            ),
+        ),
     ),
-    "claim_load_then_store": (
-        "genmc",
-        "        job.next.fetch_add(take, std::memory_order_relaxed);"
-        "  // atomicity alone: each item claimed once (T2)",
-        "        job.next.load(std::memory_order_relaxed);\n"
-        "    job.next.store(first + take, std::memory_order_relaxed);",
+    "claim_load_then_store": PlantedBug(
+        ("genmc",),
+        (
+            (
+                "        job.next.fetch_add(take, std::memory_order_relaxed);"
+                "  // atomicity alone: each item claimed once (T2)",
+                "        job.next.load(std::memory_order_relaxed);\n"
+                "    job.next.store(first + take, std::memory_order_relaxed);",
+            ),
+        ),
     ),
-    "open_before_store": (
-        "genmc",
-        """    {
+    "open_before_store": PlantedBug(
+        ("genmc",),
+        (
+            (
+                """    {
         const TraceStep step("CallerPublishStore");
         reserved->job.store(&job, std::memory_order_relaxed);
     }
@@ -1428,23 +1607,31 @@ CODE_MUTANTS = {
     // release: pairs with join_job's acquire, publishing the job and its pointer
     const SlotWord opened{reserved->word.fetch_or(SlotWord::OPEN, std::memory_order_release)};
 """,
-        """    const TraceStep step("CallerPublishOpen");
+                """    const TraceStep step("CallerPublishOpen");
     const SlotWord opened{reserved->word.fetch_or(SlotWord::OPEN, std::memory_order_release)};
     reserved->job.store(&job, std::memory_order_relaxed);
 """,
+            ),
+        ),
     ),
-    "exit_live_before_index": (
-        "genmc",
-        """                give_thread_index();
-                // out of the count before it reads the wake (pairs with wake_helpers)
-                pool.live.fetch_sub(1, std::memory_order_seq_cst);""",
-        """                pool.live.fetch_sub(1, std::memory_order_seq_cst);
-                give_thread_index();""",
+    "exit_live_before_index": PlantedBug(
+        ("genmc",),
+        (
+            (
+                """            give_thread_index();
+            // out of the count before it reads the wake (pairs with wake_helpers)
+            pool.live.fetch_sub(1, std::memory_order_seq_cst);""",
+                """            pool.live.fetch_sub(1, std::memory_order_seq_cst);
+            give_thread_index();""",
+            ),
+        ),
     ),
     # the spinning count read before the wake's bump: a spinner can miss it
-    "wake_reads_spinning_first": (
-        "trace",
-        """    {
+    "wake_reads_spinning_first": PlantedBug(
+        ("trace",),
+        (
+            (
+                """    {
         const TraceStep step("CallerWake");
         pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
     }
@@ -1454,7 +1641,7 @@ CODE_MUTANTS = {
         spinning = pool.spinning.load(std::memory_order_seq_cst);
     }
 """,
-        """    std::uint32_t spinning = 0;
+                """    std::uint32_t spinning = 0;
     {
         const TraceStep step("CallerWakeSpinning");
         spinning = pool.spinning.load(std::memory_order_seq_cst);
@@ -1464,79 +1651,437 @@ CODE_MUTANTS = {
         pool.wake.fetch_add(1, std::memory_order_seq_cst);  // pairs with park_worker's, Holding's decrements
     }
 """,
+            ),
+        ),
     ),
     # no second look after reading `left`: the last leave can slip between
-    "wait_skips_recheck": (
-        "trace",
-        """        {
+    "wait_skips_recheck": PlantedBug(
+        ("trace",),
+        (
+            (
+                """        {
             const TraceStep step("CallerCloseRecheck");
             if (workers_gone(slot, epoch)) {
                 return;
             }
         }
 """,
-        "",
+                "",
+            ),
+        ),
     ),
     # `left` bumped before the worker is out of the count
-    "leave_bumps_first": (
-        "trace",
-        """    SlotWord before;
+    "leave_bumps_first": PlantedBug(
+        ("trace",),
+        (
+            (
+                """    SlotWord before;
     {
         const TraceStep step("WorkerLeave");""",
-        """    {
+                """    {
         const TraceStep bump("WorkerLeaveBump");
         slot.left.fetch_add(1, std::memory_order_relaxed);
     }
     SlotWord before;
     {
         const TraceStep step("WorkerLeave");""",
+            ),
+        ),
     ),
     # the last worker out tells no one: its caller sleeps for ever
-    "leave_never_bumps": (
-        "fuzz",
-        "        slot.left.fetch_add(1, std::memory_order_release);\n"
-        "        platform::wake_all(slot.left);\n",
-        "",
+    "leave_never_bumps": PlantedBug(
+        ("fuzz",),
+        (
+            (
+                "        slot.left.fetch_add(1, std::memory_order_release);\n"
+                "        platform::wake_all(slot.left);\n",
+                "",
+            ),
+        ),
     ),
-    "leave_never_wakes": ("fuzz", "        platform::wake_all(slot.left);\n", ""),
-    "never_wake_sleepers": (
-        "fuzz",
-        "const std::uint32_t woken = platform::wake_some(pool.wake, more - spinning);",
-        "const std::uint32_t woken = 0;",
+    "leave_never_wakes": PlantedBug(
+        ("fuzz",),
+        (("        platform::wake_all(slot.left);\n", ""),),
     ),
-    "failure_not_stopping": (
-        "fuzz",
-        "    job.stopped.store(true, std::memory_order_relaxed);\n"
-        "}\n\n// Items [begin, end) run on this thread",
-        "}\n\n// Items [begin, end) run on this thread",
+    "never_wake_sleepers": PlantedBug(
+        ("fuzz",),
+        (
+            (
+                "const std::uint32_t woken = platform::wake_some(pool.wake, more - spinning);",
+                "const std::uint32_t woken = 0;",
+            ),
+        ),
     ),
-    "fork_fails_nothing": (
-        "fuzz",
-        "        held->job->forked.store(true, std::memory_order_relaxed);\n",
-        "",
+    "failure_not_stopping": PlantedBug(
+        ("fuzz",),
+        (
+            (
+                "    job.stopped.store(true, std::memory_order_relaxed);\n"
+                "}\n\n// Items [begin, end) run on this thread",
+                "}\n\n// Items [begin, end) run on this thread",
+            ),
+        ),
     ),
-    "fork_closes_wiped_slot": (
-        "fuzz",
-        "        if (generation_ == platform::fork_generation()) {",
-        "        if (slot_ != nullptr) {",
+    "fork_fails_nothing": PlantedBug(
+        ("fuzz",),
+        (("        held->job->forked.store(true, std::memory_order_relaxed);\n", ""),),
     ),
-    "exit_refusal_forgotten": (
-        "fuzz",
-        "        job.refused_at_exit.store(true, std::memory_order_relaxed);\n",
-        "",
+    "fork_closes_wiped_slot": PlantedBug(
+        ("fuzz",),
+        (("        if (generation_ == platform::fork_generation()) {", "        if (slot_ != nullptr) {"),),
+    ),
+    # the idle respawn the pool once had: a parked worker gave up at its
+    # timeout without comparing the wake, and an exit seeing the wake moved
+    # started a replacement, so after a big call then a small one every
+    # sleeping worker started another as it went idle
+    "idle_exit_respawns": PlantedBug(
+        ("fuzz", "test"),
+        (
+            (
+                """        if (moved) {
+            return true;
+        }
+        const std::int64_t now = platform::monotonic_ns();
+        if (now >= idle_until) {
+            return false;
+        }
+""",
+                """        const std::int64_t now = platform::monotonic_ns();
+        if (now >= idle_until) {
+            return false;
+        }
+        if (moved) {
+            return true;
+        }
+""",
+            ),
+            (
+                "                if (pool.wake.load(std::memory_order_seq_cst) == observed ||"
+                " !count_worker_live()) {\n"
+                "                    return nullptr;  // gone: no caller counted it, or the cap"
+                " is full without it\n"
+                "                }\n"
+                "                // a caller may have counted it live: it stays, and looks\n"
+                "                traced.took(1);\n"
+                "                if (!take_thread_index()) {  // as at its start: the cap leaves"
+                " room for every live one\n"
+                '                    checked(false, "a worker that stays finds a thread index'
+                ' free");\n'
+                "                    pool.live.fetch_sub(1, std::memory_order_seq_cst);\n"
+                "                    return nullptr;\n"
+                "                }\n"
+                "                holding.counted = true;\n"
+                "                step = WorkerStep::Scan;\n"
+                "                break;\n",
+                "                if (pool.wake.load(std::memory_order_seq_cst) != observed) {\n"
+                "                    spawn_worker();\n"
+                "                }\n"
+                "                return nullptr;\n",
+            ),
+        ),
+    ),
+    "exit_refusal_forgotten": PlantedBug(
+        ("fuzz",),
+        (("        job.refused_at_exit.store(true, std::memory_order_relaxed);\n", ""),),
+    ),
+    # RayScene.intersect's loop handed a Stop that never stops: Ctrl-C can't land in it
+    "intersect_ignores_stop": PlantedBug(
+        ("test",),
+        (
+            (
+                "        warn_fallback(trimkit::with_pool([&](const trimkit::parallel::Stop& stop) {\n"
+                "            return scene_.intersect(*top, origins.vectors, directions.vectors, n, most,"
+                " stop, &columns);\n",
+                "        warn_fallback(trimkit::with_pool([&](const trimkit::parallel::Stop& /*stop*/) {\n"
+                "            return scene_.intersect(*top, origins.vectors, directions.vectors, n, most,"
+                " trimkit::parallel::Stop{}, &columns);\n",
+            ),
+        ),
+        "src/trimkit.cpp",
+    ),
+    # simplify's work done with the GIL held: no other thread runs until it answers
+    "simplify_holds_gil": PlantedBug(
+        ("test",),
+        (
+            (
+                "        // converting reads every value, so it runs without the GIL too\n"
+                "        const trimkit::GilReleased release;\n",
+                "",
+            ),
+        ),
+        "src/trimkit.cpp",
+    ),
+    # the pool's fork handler never installed: a child keeps its parent's slots, counts and exit gate
+    "fork_handler_not_installed": PlantedBug(
+        ("test",),
+        (("    parallel::install_fork_handler();\n", ""),),
+        "src/gil.hpp",
+    ),
+    # the exit handler never registered: the interpreter finalizes with calls still inside the gate
+    "exit_handler_not_registered": PlantedBug(
+        ("test",),
+        (
+            (
+                '    nb::module_::import_("atexit").attr("register")'
+                "(nb::cpp_function(&trimkit::exit_at_interpreter_exit));\n",
+                "",
+            ),
+        ),
+        "src/trimkit.cpp",
+    ),
+    # check_values refuses nothing: NaN, an infinity and a value past the limit are all read
+    "check_values_checks_nothing": PlantedBug(
+        ("test",),
+        (
+            (
+                "    if (beyond != 0) {\n        refuse(name + ",
+                "    if (beyond > count) {\n        refuse(name + ",
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # faces compared as signed: an index of -1 is in range, and kept as the largest index there is
+    "faces_compared_signed": PlantedBug(
+        ("test",),
+        (
+            (
+                "violations += static_cast<std::uint64_t>(index) >= vertex_count ? 1U : 0U;",
+                "violations += index >= static_cast<std::int64_t>(vertex_count) ? 1U : 0U;",
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # faces narrowed to the library's index before they are compared: 2**32 is read as vertex 0
+    "faces_narrowed_before_compared": PlantedBug(
+        ("test",),
+        (
+            (
+                "violations += static_cast<std::uint64_t>(index) >= vertex_count ? 1U : 0U;",
+                "violations += static_cast<Index>(index) >= vertex_count ? 1U : 0U;",
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # any dtype numpy can cast at all is converted: float64 faces are truncated, not refused
+    "converts_unsafe_casts": PlantedBug(
+        ("test",),
+        (
+            (
+                'numpy.can_cast(array.attr("dtype"), wanted, "safe")',
+                'numpy.can_cast(array.attr("dtype"), wanted, "unsafe")',
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # a dtype numpy casts safely converted without the warning
+    "converts_without_warning": PlantedBug(
+        ("test",),
+        (
+            (
+                "    warn_converted(name, source, dtype);\n"
+                '    return numpy.array(array, nb::arg("dtype") = wanted,',
+                '    return numpy.array(array, nb::arg("dtype") = wanted,',
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # an array's shape not checked before it is converted: a wrong one is copied, and warned about, first
+    "converts_before_shape_checked": PlantedBug(
+        ("test",),
+        (("if (seen.is_valid() && shaped<Shape...>(seen)) {", "if (seen.is_valid()) {"),),
+        "src/numpy.hpp",
+    ),
+    # an array in the other byte order viewed as this machine's, its bytes never swapped: other values
+    "byte_order_viewed_not_swapped": PlantedBug(
+        ("test",),
+        (
+            (
+                'return numpy.array(array, nb::arg("dtype") = native, nb::arg("copy") = true,',
+                'return numpy.array(array.attr("view")(native), nb::arg("copy") = true,',
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # instance_index bounded one past the meshes: the mesh after the last is placed
+    "instance_index_off_by_one": PlantedBug(
+        ("test",),
+        (
+            (
+                "!indexes(instances.index[i], mesh_count)",
+                "!indexes(instances.index[i], mesh_count + 1)",
+            ),
+        ),
+        "src/numpy.hpp",
+    ),
+    # a pair naming one instance twice is measured against itself, not refused
+    "pair_of_one_instance_allowed": PlantedBug(
+        ("test",),
+        (
+            (
+                "        if (a == b) {\n"
+                '            trimkit::refuse("pairs names one instance twice at row " + std::to_string(p));\n'
+                "        }\n",
+                "",
+            ),
+        ),
+        "src/collision.cpp",
+    ),
+    # equal vertices each kept as their own: faces name the later ones, and CDT is handed duplicates
+    "equal_vertices_not_merged": PlantedBug(
+        ("test",),
+        (
+            (
+                "                    first[row] = held - 1;\n",
+                "                    first[row] = static_cast<std::uint32_t>(row);\n",
+            ),
+        ),
+        "src/triangulate.cpp",
+    ),
+    # CDT erases only its super triangle: the triangles outside the shell and inside holes are kept
+    "cdt_keeps_outer_triangles": PlantedBug(
+        ("test",),
+        (("cdt.eraseOuterTrianglesAndHoles();", "cdt.eraseSuperTriangle();"),),
+        "src/triangulate.cpp",
+    ),
+    # boxes that only touch don't overlap, and a 2D box, flat on z, overlaps nothing
+    "touching_boxes_do_not_overlap": PlantedBug(
+        ("test",),
+        (
+            (
+                "if (b_lo[axis] > a_hi[axis] || b_hi[axis] < a_lo[axis]) {",
+                "if (b_lo[axis] >= a_hi[axis] || b_hi[axis] <= a_lo[axis]) {",
+            ),
+        ),
+        "src/bvh.cpp",
+    ),
+    # nearest boxes ordered by distance alone: of two as near, the walk's first wins, not the lower index
+    "nearest_tie_ignores_index": PlantedBug(
+        ("test",),
+        (
+            (
+                "return distance < other.distance || (distance == other.distance && box < other.box);",
+                "return distance < other.distance;",
+            ),
+        ),
+        "src/bvh.cpp",
+    ),
+    # a crossing taken for the last one found again by its face alone: the same face of the next
+    # instance is skipped. Not the test dropped: a triangle found again would then be counted for ever
+    "crossing_found_again_by_face_alone": PlantedBug(
+        ("test",),
+        (
+            ("    std::int64_t last_instance = -1;\n", ""),
+            ("if (instance == last_instance && face == last_face) {", "if (face == last_face) {"),
+            ("        last_instance = instance;\n", ""),
+        ),
+        "src/bvh.cpp",
+    ),
+    # a transform's determinant never looked at: a singular one is placed, with its adjugate as inverse
+    "place_skips_determinant": PlantedBug(
+        ("test",),
+        (
+            (
+                "bool invertible = trimkit::determinant_of(transform) != 0.0;",
+                "bool invertible = true;",
+            ),
+        ),
+        "src/bvh.cpp",
+    ),
+    # a distance written in coal's order, not the pair's: for a convex solid against a mesh the faces
+    # and points trade places and the normal points back
+    "witness_swap_ignored": PlantedBug(
+        ("test",),
+        (
+            (
+                "write_witness(swapped, result.b1, result.b2, result.nearest_points,",
+                "write_witness(false, result.b1, result.b2, result.nearest_points,",
+            ),
+        ),
+        "src/collision.cpp",
+    ),
+    # pairs culled by their boxes' gap alone: one within the margin whose boxes are apart never touches
+    "may_touch_ignores_margin": PlantedBug(
+        ("test",),
+        (
+            (
+                "box_gap(a.box, b.box) > request.security_margin",
+                "box_gap(a.box, b.box) > 0.0",
+            ),
+        ),
+        "src/collision.cpp",
+    ),
+    # maximum_error handed to meshoptimizer in the caller's units, not the scaled ones it works in
+    "simplify_error_not_scaled": PlantedBug(
+        ("test",),
+        (
+            (
+                "const double scaled_error = maximum_error * scale;",
+                "const double scaled_error = maximum_error;",
+            ),
+        ),
+        "src/meshoptimizer.cpp",
+    ),
+    # V-HACD's progress updates never look at the Stop: Ctrl-C waits for the whole decomposition
+    "decompose_never_polls": PlantedBug(
+        ("test",),
+        (
+            (
+                "        if (trimkit::stopped(stop_)) {",
+                "        if (stop_.poll == nullptr && trimkit::stopped(stop_)) {",
+            ),
+        ),
+        "src/vhacd.cpp",
+    ),
+    # a device's log, grown for a query with many crossings, kept after it
+    "device_log_kept": PlantedBug(
+        ("test",),
+        (("        settle();\n    } catch (...) {", "    } catch (...) {"),),
+        "src/vulkan/vulkan.hpp",
+    ),
+    # xatlas left to print its warnings to the caller's terminal
+    "xatlas_prints": PlantedBug(
+        ("test",),
+        (("        xatlas::SetPrint(nullptr, false);\n", ""),),
+        "src/xatlas.cpp",
+    ),
+    # the broadphase's boxes unpadded: rounding in placing them culls pairs that touch
+    "collision_cull_unpadded": PlantedBug(
+        ("test",),
+        (("    return trimkit::BOX_SLACK * farthest;", "    return 0.0 * farthest;"),),
+        "src/collision.cpp",
+    ),
+    # a point's value read wherever the buffer maps it, past the values its attribute holds
+    "draco_mapped_value_unchecked": PlantedBug(
+        ("test",),
+        (
+            (
+                "            if (at.value() >= held) {\n"
+                "                malformed = true;\n"
+                "                break;\n"
+                "            }\n",
+                "",
+            ),
+        ),
+        "src/draco.cpp",
     ),
 }
 
 
-def code_mutants(checker: str) -> dict[str, str]:
-    # src/parallel.hpp with each of `checker`'s planted bugs, by name
-    source = (ROOT / "src" / "parallel.hpp").read_text()
+def code_mutants(checker: str) -> dict[str, tuple[str, str]]:
+    # each planted bug `checker` must catch, by name: (its path, that file
+    # with the bug in it). Every bug is applied, so none goes stale unseen
     mutated = {}
-    for name, (by, old, new) in CODE_MUTANTS.items():
-        if source.count(old) != 1:
-            sys.exit(f"CODE_MUTANTS: {name} no longer applies to src/parallel.hpp")
-        if by == checker:
-            mutated[name] = source.replace(old, new)
+    for name, bug in CODE_MUTANTS.items():
+        source = (ROOT / bug.path).read_text()
+        for old, new in bug.edits:
+            if source.count(old) != 1:
+                sys.exit(f"CODE_MUTANTS: {name} no longer applies to {bug.path}")
+            source = source.replace(old, new)
+        unknown = set(bug.caught_by) - {"genmc", "trace", "fuzz", "test"}
+        if unknown or (bug.path != "src/parallel.hpp" and bug.caught_by != ("test",)):
+            sys.exit(f"CODE_MUTANTS: {name} can't be caught by {bug.caught_by}")
+        if checker in bug.caught_by:
+            mutated[name] = (bug.path, source)
     return mutated
 
 
@@ -1556,11 +2101,14 @@ def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, st
     config = here / "run.cfg"
     config.write_text(
         "SPECIFICATION Spec\nCONSTANTS\n" + "\n".join(lines) + f'\n    Mutation = "{mutation}"\n'
-        f"INVARIANTS {' '.join(MODEL_PROPERTIES)}\nPROPERTIES L1\n"
+        f"INVARIANTS {' '.join(MODEL_PROPERTIES)}\nPROPERTIES L1 P3\n"
     )
+    # liveness checked once, at the end: TLC otherwise checks it on a clock
+    # as it explores, so on a loaded machine a mutation breaking both an
+    # invariant and L1 was reported as either, as the clock fell
     try:
         done = subprocess.run(
-            [tool("java"), *tlc_java(here), "-cp", "/opt/tla2tools.jar", "tlc2.TLC",
+            [tool("java"), *tlc_java(here), "-cp", "/opt/tla2tools.jar", "tlc2.TLC", "-lncheck", "final",
              "-deadlock", "-workers", "1", "-coverage", "100000", "-metadir", str(here / "states"),
              "-config", config.name, "Scheduler.tla"],
             cwd=here, capture_output=True, text=True, check=False, timeout=MODEL_SECONDS,
@@ -1580,9 +2128,12 @@ def _tlc(spec: Path, name: str, constants: dict, mutation: str) -> tuple[int, st
             at = rf"line {number}, col {column} to line \d+, col \d+ of module Scheduler: (\d+)"
             counts = re.findall(at, done.stdout)
             taken[arm.group(1)] = max((int(c) for c in counts), default=0)
-    broken = re.search(r"Invariant (\w+) is violated|Temporal properties were (violated)", done.stdout)
+    broken = re.search(
+        r"Invariant (\w+) is violated|Action property (\w+) is violated|Temporal properties were (violated)",
+        done.stdout,
+    )
     if broken:
-        return states, broken.group(1) or "L1", taken
+        return states, broken.group(1) or broken.group(2) or "L1", taken
     # a step outside a transition's precondition: outside SlotWordTable's domain
     if "Attempted to apply function" in done.stdout:
         return states, "SlotWord", taken
@@ -1603,6 +2154,10 @@ def _traces(spec: Path, src: Path, name: str) -> list[tuple[Path, dict]]:
     run(tool("clang++"), "-std=c++20", "-O1", "-pthread", f"-I{src}", CHECK / "verify" / "tla" / "trace.cpp",
         "-o", driver)  # fmt: skip
     cores = sorted(os.sched_getaffinity(0))[:TRACE_CORES]
+    if len(cores) < TRACE_CORES:
+        print(
+            f"  traces on {len(cores)} cores, not {TRACE_CORES}: fewer workers join, leave and wake at once"
+        )
     logs = []
     for round_ in range(TRACE_ROUNDS):
         log = here / f"round{round_}" / "TraceLog.tla"
@@ -1668,7 +2223,7 @@ def cmd_model(args) -> None:
     failed = []
     traced = _traces(spec, ROOT / "src", "code")
     mutants = {}
-    for name, source in code_mutants("trace").items():
+    for name, (_, source) in code_mutants("trace").items():
         mutated = spec / f"src_{name}"
         mutated.mkdir()
         for header in (ROOT / "src").glob("*.hpp"):
@@ -1720,8 +2275,7 @@ def cmd_model(args) -> None:
             if not rejected:
                 failed.append(f"planted bug {name}: every round's log was one the model allows")
         # a step no scenario takes is one no scenario checks
-        mutation_only = {"CallerClaimStore", "WorkerClaimStore"}  # claim_load_then_store's
-        never = sorted(a for a, count in taken.items() if count == 0 and a not in mutation_only)
+        never = sorted(a for a, count in taken.items() if count == 0 and a not in MUTATION_ONLY_STEPS)
         if not taken or never:
             failed.append("no scenario takes " + (", ".join(never) or "any step: coverage unread"))
         for name, (expected, _) in MODEL_MUTATIONS.items():
@@ -1811,10 +2365,14 @@ def cmd_distro(args) -> None:
     (archive,) = out.glob("*.tar.gz")
     distro.write(archive, args.root / "distro")
     if args.run:
+        machine = args.machine or distro.host_machine()
+        # under qemu every instruction costs ten: half the machine, as `genmc` gets
+        cores = VERIFY_CORES if distro.emulated(machine) else CORES
         distro.run(
             args.root / "distro",
-            [tool("docker"), "run", "--rm", *docker_cores()],
+            [tool("docker"), "run", "--rm", *docker_cores(cores)],
             f"{os.getuid()}:{os.getgid()}",
+            machine,
         )
 
 
@@ -1939,6 +2497,10 @@ def cmd_check(args) -> None:
         command = [sys.executable, str(ROOT / "scripts"), "--root", str(args.root), stage]
         if stage == "fuzz":
             command += ["--seconds", str(args.fuzz_seconds)]
+        if stage == "test":
+            # every planted bug shows (PLANTED_TEST_CORES), on any machine with that many
+            cores = min(os.cpu_count() or 1, max(VERIFY_CORES, PLANTED_TEST_CORES))
+            command += ["--cores", str(cores)]
         if stage == "bench":
             command += ["--quick"]  # the short calls, in seconds: a pool that works but stalls fails here
         print(f"\n==== {stage} ====", flush=True)
@@ -1966,13 +2528,23 @@ VERIFIES = {"genmc", "model"}
 CORES = 2
 # but the `genmc` and `model` stages, which run dozens of single-threaded
 # checkers and nothing that measures time (the traced driver pins itself to
-# TRACE_CORES): half the machine, or they are most of an hour on two cores
+# TRACE_CORES): half the machine, or they are most of an hour on two cores.
+# And `fuzz`, which measures no time either, and whose pool harness shows an
+# idle respawn (CODE_MUTANTS) only with more than one worker to go idle
 VERIFY_CORES = max(CORES, (os.cpu_count() or CORES) // 2)
+HALF_MACHINE = VERIFIES | {"fuzz"}
 
 
-def docker_cores(cores: int = CORES) -> list[str]:
+def core_count(text: str) -> int:
+    # `--cores`: how many of the last cores, or `all` of them
+    return (os.cpu_count() or 1) if text == "all" else int(text)
+
+
+def docker_cores(cores: int) -> list[str]:
     total = os.cpu_count() or 1
-    first = max(0, total - cores)
+    if cores > total:
+        sys.exit(f"{cores} cores asked for, of the {total} this machine has")
+    first = total - cores
     return ["--cpuset-cpus", f"{first}-{total - 1}"]
 
 
@@ -1998,15 +2570,6 @@ def in_image(args) -> None:
     writes under build/ stay theirs, with the sources read-only.
     """
     cmd_image(args)
-    forwarded = [args.command]
-    if hasattr(args, "seconds"):
-        forwarded += ["--seconds", str(args.seconds)]
-    if args.command == "fetch":
-        forwarded += [*args.names, *(["--latest"] if args.latest else [])]
-    if args.command == "patch":
-        forwarded += args.names
-    if args.command == "bench":
-        forwarded += ["--cores", str(args.cores), *(["--quick"] if args.quick else [])]
     builds = ROOT / "build" / "docker"
     builds.mkdir(parents=True, exist_ok=True)
     access = "rw" if args.command in WRITES_SOURCES else "ro"
@@ -2020,7 +2583,11 @@ def in_image(args) -> None:
         "--rm",
         "--init",
         *docker_cores(
-            args.cores if args.command == "bench" else VERIFY_CORES if args.command in VERIFIES else CORES
+            args.cores
+            if args.command in ("bench", "test")
+            else VERIFY_CORES
+            if args.command in HALF_MACHINE
+            else CORES
         ),
         *seccomp,
         # Docker's default open-file limit is about 2**31, and sanitizers
@@ -2046,10 +2613,15 @@ def in_image(args) -> None:
         docker += ["-v", f"{main_git}:{main_git}:ro"]
     inside = ["python3", "/src/scripts", "--inside", "--root", "/src/build/docker"]
     if args.command == "test":
-        run(*docker, IMAGE, *inside, "build")
+        # and every planted bug's build, where the suite will see them: on
+        # cores enough to show them, the one place that is decided
+        planted = ["--planted"] if args.cores >= PLANTED_TEST_CORES and "--planted" not in args.given else []
+        args.given += planted
+        run(*docker, IMAGE, *inside, "build", *planted)
         # no swap to page out to, as the limit is what it's testing
         docker += ["--memory", "2g", "--memory-swap", "2g"]
-    run(*docker, VERIFY_IMAGE if args.command in VERIFIES else IMAGE, *inside, *forwarded)
+    # the command as it was given, every option of it
+    run(*docker, VERIFY_IMAGE if args.command in VERIFIES else IMAGE, *inside, *args.given)
 
 
 def main() -> None:
@@ -2059,8 +2631,12 @@ def main() -> None:
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     # only the documented commands show in the usage and help
     documented = {
-        "check": "the gate: lint, tests, static checks, sanitizers and fuzzers",
+        "check": "the gate: lint, test, static, ASan, TSan, fuzz, bench --quick, genmc and model",
         "lint": "the fast deterministic checks, nothing compiled",
+        "test": "the strict build and the tests in 2 GB, on the last 2 cores (--cores N or all)",
+        "static": "the checks that need a build: clang-tidy, the sdist, stubs and the wheel audit",
+        "bench": "the pool against hand-written pools, 144 cells (--quick: the short calls)",
+        "distro": "Debian and Fedora packaging (--run: build, test and lint them; --machine i686|s390x)",
         "genmc": "model check src/parallel.hpp itself with GenMC, and its weakened memory orders",
         "model": "check the pool's protocol in check/verify/tla with TLC, and that each mutation is caught",
         "fuzz": "every fuzzer, native then Atheris, --seconds each",
@@ -2081,10 +2657,21 @@ def main() -> None:
                 command.add_argument("--seconds", type=int, default=60)
             if name in ("cmd_fetch", "cmd_patch"):
                 command.add_argument("names", nargs="*")
-            if name == "cmd_bench":
+            if name == "cmd_build":
                 command.add_argument(
-                    "--cores", type=int, default=BENCH_CORES, help="the last this many cores"
+                    "--planted", action="store_true", help="and a wheel for each bug planted for `test`"
                 )
+            if name == "cmd_test":
+                # set by `in_image` alone: whether the cores asked for show the planted bugs
+                command.add_argument("--planted", action="store_true", help=argparse.SUPPRESS)
+            if name in ("cmd_bench", "cmd_test"):
+                command.add_argument(
+                    "--cores",
+                    type=core_count,
+                    default=BENCH_CORES if name == "cmd_bench" else CORES,
+                    help="the last this many cores, or all",
+                )
+            if name == "cmd_bench":
                 command.add_argument(
                     "--quick",
                     action="store_true",
@@ -2096,12 +2683,20 @@ def main() -> None:
                 command.add_argument(
                     "--run", action="store_true", help="build, test and lint them in containers"
                 )
+                command.add_argument(
+                    "--machine",
+                    choices=sorted(distro.PLATFORMS),
+                    help="in that machine's images (default this one's): i686 natively, others under qemu",
+                )
             if name == "cmd_check":
                 command.add_argument("--fuzz-seconds", type=int, default=10, help="seconds per fuzzer")
     # `uv run scripts -- static` reads the same as `uv run scripts static`
     argv = sys.argv[1:]
-    args = parser.parse_args(argv[1:] if argv[:1] == ["--"] else argv)
+    argv = argv[1:] if argv[:1] == ["--"] else argv
+    args = parser.parse_args(argv)
     args.root = args.root.resolve()
+    # the command and its own options, as given, for `in_image` to pass on
+    args.given = argv[argv.index(args.command) :]
     try:
         if args.command not in ON_HOST and not args.inside:
             in_image(args)

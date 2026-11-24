@@ -8,13 +8,13 @@ backend-path = ["scripts"]
 
 [project]
 name = "trimkit"
-version = "0.3.2"
+version = "0.3.3"
 description = "Thin stable-ABI numpy bindings to mature geometry libraries: rays and boxes, collision, triangulation, convex decomposition, UV atlases, simplification, draco and SVG paths."
 readme = "README.md"
 requires-python = ">=3.12"
 # includes every upstream compiled in
 license = "MIT AND Apache-2.0 AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR BSL-1.0) AND BSD-3-Clause AND ISC AND (MIT OR Apache-2.0 OR BSL-1.0) AND MPL-2.0"
-license-files = ["LICENSE", "vendor/*/LICENSE*", "vendor/*/COPYING*"]
+license-files = ["LICENSE", "vendor/*/LICENSE*", "vendor/*/COPYING*", "vendor/cdt/CDT/LICENSE-*"]
 authors = [{ name = "Michael Dawson-Haggerty", email = "mikedh@kerfed.com" }]
 dependencies = ["numpy>=2"]
 classifiers = [
@@ -45,7 +45,7 @@ build = ["ninja==1.13.2"]
 audit = ["abi3audit", "twine"]
 # static analysis and license tooling, installed into the trixie image
 lint = ["ruff", "zizmor"]
-# the Python-boundary fuzzer for `uv run scripts atheris`
+# the Python-boundary fuzzer, which `uv run scripts fuzz` runs after the native ones
 fuzz = ["atheris"]
 # the wheel builder for `uv run scripts wheel`, locally and in CI
 wheel = ["cibuildwheel>=4.3,<5"]

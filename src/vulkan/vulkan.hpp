@@ -236,7 +236,8 @@ inline bool node_images(const Tree& tree, Node32* node32, std::string* reason) {
 // device's tracing (measured against 2^16 to 2^22)
 constexpr std::size_t CHUNK = std::size_t{1} << 18U;
 // crossings per ray a chunk's log holds when a device opens: a chunk that
-// logs more runs again with a log that holds them, kept from then on
+// logs more runs again with a log that holds them, kept for the rest of its
+// query and then sized back (run_query)
 constexpr std::size_t LOG_PER_RAY = 4;
 // a chunk's header on the device: the crossings logged, then the three group
 // counts of the dispatches that lay them out
@@ -1106,6 +1107,17 @@ bool run_query(Device& device, const Query& query, std::size_t count, const Fill
         consume(answers);
         return true;
     };
+    // once nothing is in flight: a log grown for this query back to the size
+    // a device opens with, so one query with many crossings doesn't keep its
+    // log, hundreds of MB, for as long as the process has the device
+    const auto settle = [&] {
+        for (Chunk& chunk : device.chunks) {
+            std::string unused;
+            if (chunk.capacity > CHUNK * LOG_PER_RAY) {
+                size_log(device, &chunk, CHUNK * LOG_PER_RAY, &unused);
+            }
+        }
+    };
     const std::size_t chunks = (count + CHUNK - 1) / CHUNK;
     std::size_t started = 0;
     std::size_t finished = 0;
@@ -1125,14 +1137,17 @@ bool run_query(Device& device, const Query& query, std::size_t count, const Fill
         while (finished < started) {
             working = finish(finished++, working) && working;
         }
+        settle();
     } catch (...) {
         // `consume` threw (its columns didn't fit in memory): the chunks still
         // in flight are waited for all the same, so the next query finds the
         // device idle, and the caller gets its exception
         std::string unused;
+        // cppcheck-suppress unsignedLessThanZero ; two counts, not a test against zero
         while (finished < started) {
             wait(device, device.chunks[finished++ % IN_FLIGHT].fence, &unused);
         }
+        settle();
         throw;
     }
     return working;

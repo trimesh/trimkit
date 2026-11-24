@@ -46,7 +46,7 @@ def system_upstreams() -> list[str]:
 
 def bundled() -> list[builder.Upstream]:
     # every vendored upstream a distribution build still compiles in
-    return [u for u in builder.load().compiled_in if not u.own and not u.system]
+    return [u for u in builder.load().compiled_in if not u.system]
 
 
 def requirements(name: str) -> list[str]:
@@ -172,7 +172,7 @@ def debian_copyright(maintainer: str) -> str:
         f"License: {licenses.OWN}\n" + indented((builder.ROOT / "LICENSE").read_text()),
     ]
     for name, pin in builder.load().upstreams.items():
-        if pin.own or pin.system:
+        if pin.system:
             continue
         texts = [debian_license_text(p.read_text()) for p in licenses.license_files_of(name)]
         paragraphs.append(
@@ -337,26 +337,44 @@ def write(sdist: Path, out: Path) -> None:
     print(f"wrote {out / 'debian'} and {out / 'fedora'}, what a maintainer commits")
 
 
-def run(out: Path, docker_run: list[str], owner: str) -> None:
+# each machine trimkit.toml may pin an image for, as docker names its platform
+PLATFORMS = {"x86_64": "linux/amd64", "aarch64": "linux/arm64", "i686": "linux/386", "s390x": "linux/s390x"}
+
+
+def host_machine() -> str:
+    names = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
+    return names[platform.machine().lower()]
+
+
+def emulated(machine: str) -> bool:
+    # whether this machine runs `machine` only under qemu: x86_64 runs i686 itself
+    return machine not in (host_machine(), *(["i686"] if host_machine() == "x86_64" else []))
+
+
+def run(out: Path, docker_run: list[str], owner: str, machine: str) -> None:
     """
-    Build and lint both packages `write` made, each in its distribution's
-    image on this machine's own architecture: any failure, any failing test,
-    or any lint error or warning stops it.
+    Build and lint the packages `write` made, each in its distribution's
+    image for `machine`, wherever trimkit.toml pins one: i686 runs natively
+    on x86_64, any other foreign machine under the qemu that binfmt_misc
+    registered. Any failure, any failing test, or any lint error or warning
+    stops it.
     """
     meta = project()
     name, version = meta["name"], meta["version"]
-    machine = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[
-        platform.machine().lower()
-    ]
-    for which, script in (
-        ("debian", debian_script(name, version)),
-        ("fedora", fedora_script(name, version)),
-    ):
-        image = distribution(which)["images"][machine]
+    scripts = {"debian": debian_script(name, version), "fedora": fedora_script(name, version)}
+    pinned = {which: distribution(which)["images"].get(machine) for which in scripts}
+    if not any(pinned.values()):
+        raise SystemExit(f"no distribution in trimkit.toml pins an image for {machine}")
+    for which, script in scripts.items():
+        image = pinned[which]
+        if image is None:
+            print(f"- {which} ({machine}): no image pinned, skipped", flush=True)
+            continue
         print(f"+ {which} ({machine}): build, test and lint", flush=True)
         # as root, as the package managers need, then the results handed back,
         # pass or fail, so a failed run leaves nothing only root can delete
         command = f"({script}); status=$?; chown -R {owner} /out; exit $status"
-        command_line = [*docker_run, "-v", f"{out}:/out", image, "sh", "-c", command]
+        platform_flag = ["--platform", PLATFORMS[machine]]
+        command_line = [*docker_run, *platform_flag, "-v", f"{out}:/out", image, "sh", "-c", command]
         subprocess.run(command_line, check=True)
-    print(f"ok: Debian and Fedora packages built, tested and linted in {out}")
+    print(f"ok: packages for {machine} built, tested and linted in {out}")

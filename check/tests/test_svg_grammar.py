@@ -9,10 +9,12 @@ and an independent reading of the spec, `svg_reference`.
 - It agrees with `svg.path`, the package it replaces in trimesh.
 """
 
+import re
+
 import pytest
 import svg_reference as ref
 from helpers import check_svg_segments, svg_round_trip, svg_rows
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, given, reject, settings
 from hypothesis import strategies as st
 from hypothesis.extra.lark import from_lark
 
@@ -153,8 +155,8 @@ def test_matches_svg_path(d):
     try:
         parsed = parse_path(d)
     except ZeroDivisionError:
-        # svg.path divides by radii like 1e-178, which we draw
-        return
+        # svg.path divides by radii like 1e-178, which we draw: not an example
+        reject()
     # svg.path keeps what draws nothing: arcs to their own start (F.6.2), and
     # closes of a subpath with nothing drawn, right after a move or a close
     old = []
@@ -205,4 +207,7 @@ def test_string_round_trips(d):
     # written is path data the reference grammar accepts: the lenient one
     # only for a signed arc rotation (SVG 1.1)
     written = svg_round_trip(d)
-    assert ref.parse(ref.LENIENT_PARSER, written) is not None or written == ""
+    strict = ref.parse(ref.STRICT_PARSER, written) is not None
+    assert strict or (
+        re.search(r"A\S+ \S+ -", written) and ref.parse(ref.LENIENT_PARSER, written) is not None
+    )

@@ -3,11 +3,14 @@ The package-wide promises: numpy is the only dependency, Python is a
 docstring, every array input is exactly typed and bounded, read in place when
 C-contiguous and aligned and copied once otherwise, converted only when numpy
 casts the dtype safely and then with a warning, every output is a fresh array
-that owns its memory and aliases no input, the tables cover the whole public
-API, and the GIL is released while computing.
+that owns its memory and aliases no input, and the GIL is released while
+computing. Every public call is swept through every family of variants of
+each argument its stub annotates (helpers.CASES, helpers.families), each call
+checked for all of it and its answer against an independent oracle.
 """
 
 import _thread
+import collections
 import contextlib
 import copy
 import functools
@@ -17,8 +20,6 @@ import json
 import os
 import pathlib
 import pickle
-import select
-import signal
 import sys
 import threading
 import time
@@ -28,218 +29,103 @@ import warnings
 import numpy as np
 import pytest
 from helpers import (
+    AS_GIVEN,
+    CASES,
     LITTLE_ENDIAN,
-    ball_runs,
+    ORACLE,
+    SIZES,
+    SRC_BUGS,
+    PoolCensus,
+    assert_releases_gil,
+    bound,
     box,
-    circle,
-    collision_fields,
-    first_hits,
+    call,
+    checked_call,
+    cpus_allowed,
+    families,
+    forked_answer,
+    form_variants,
     heap_in_use,
+    input_arrays,
     leaves,
+    long_call,
     longest_gil_stall,
     public_api,
+    raises_seen,
     run_python,
     runs_here,
-    small_calls,
+    same_answers,
     sphere,
+    stub_parameters,
 )
 
 import trimkit
 
 API = public_api()
+# the names with a slow call, and with a big one: the others' cases say why not
+SLOW = [name for name, case in CASES.items() if callable(case.slow)]
+BIG = [name for name, case in CASES.items() if callable(case.big)]
 
 
-# Inputs slow enough to see a background thread run. Each is built for the one
-# test that uses it and goes when that test does: cached, they held 900 MiB for
-# the rest of the session, which is what a 32-bit process ran out of.
-def _big_mesh():
-    return sphere(60, 120)
+def test_cases_cover_the_api():
+    # every public function, class and method has a case, and nothing else:
+    # a new one can't go untested, and a renamed one can't linger. Each has an
+    # oracle, each size a call or why there is none, every annotation of
+    # every parameter a family generator, and every range a parameter's
+    assert sorted(CASES) == API == sorted(stub_parameters())
+    every = {p for parameters in stub_parameters().values() for p, _, _, _ in parameters}
+    for name, case in CASES.items():
+        assert callable(case.oracle) and callable(case.small), name
+        for size in SIZES:
+            assert callable(getattr(case, size)) or getattr(case, size), (name, size)
+        assert set(case.ranges) <= every, name
+        for _, annotation, _, _ in stub_parameters()[name]:
+            assert families(annotation)
 
 
-def _big_rays():
-    placed = np.tile(np.eye(4), (8, 1, 1))
-    placed[:, 0, 3] = np.arange(8, dtype=np.int64) * 3.0
-    return _big_mesh(), np.random.default_rng(0).normal(size=(2, 2_000_000, 3)), placed
+def test_an_annotation_without_a_generator_fails():
+    with pytest.raises(TypeError, match="no family generates an argument annotated complex"):
+        families("complex | None")
 
 
-def _big_corners():
-    return np.random.default_rng(0).uniform(-100, 100, (1_000_000, 3))
-
-
-def _big_boxes():
-    corners = _big_corners()
-    return np.stack([corners, corners + 1.0], axis=1)
-
-
-def _many_instances():
-    # a million instances: their boxes build into a Boxes as big as _big_boxes
-    many = np.tile(np.eye(4), (1_000_000, 1, 1))
-    many[:, :3, 3] = _big_corners()
-    return many, np.zeros(len(many), np.int64)
-
-
-def _near_spheres():
-    # two big spheres a hair apart, the one pair tested many times: every test
-    # descends both hierarchies to the leaves nearest the gap
-    near = np.tile(np.eye(4), (2, 1, 1))
-    near[1, 0, 3] = 2.0001
-    return sphere(200, 400), near, np.tile(np.array([[0, 1]], dtype=np.int64), (2_000, 1))
-
-
-def _big_path():
-    return "M0 0 " + "c1 2 3 4 5 6 a 3 2 30 1 0 4 4 " * 1_000_000
-
-
-def _big_draco():
-    n = 2_000_000
-    position = [np.random.default_rng(0).random((n, 3)).astype(np.float32)]
-    faces = np.arange(3 * (n // 3), dtype=np.int64).reshape((-1, 3))
-    return faces, position, np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-
-
-def _big_buffer():
-    return trimkit.exchange.draco_encode(*_big_draco()) if LITTLE_ENDIAN else b""
-
-
-# each name's input and what it calls on that input
-_SLOW_CALLS = {
-    "RayScene": (lambda: sphere(500, 1000), lambda mesh: len(trimkit.RayScene([mesh]))),
-    "RayScene.boxes": (_many_instances, lambda i: trimkit.RayScene([box()]).boxes(*i).boxes()),
-    "RayScene.intersect": (
-        _big_rays,
-        lambda i: trimkit.RayScene([i[0]]).intersect(*i[1], i[2], np.zeros(8, dtype=np.int64)),
-    ),
-    "RayScene.intersect_any": (_big_rays, lambda i: trimkit.RayScene([i[0]]).intersect_any(*i[1])),
-    "Boxes": (_big_boxes, lambda b: len(trimkit.Boxes(b))),
-    "Boxes.bounds": (_big_boxes, lambda b: trimkit.Boxes(b).bounds),
-    "Boxes.boxes": (_big_boxes, lambda b: trimkit.Boxes(b).boxes()),
-    "Boxes.intersection": (_big_boxes, lambda b: trimkit.Boxes(b).intersection(b)),
-    "Boxes.nearest": (_big_boxes, lambda b: trimkit.Boxes(b).nearest(b, maximum_hits=4)),
-    "CollisionScene.boxes": (_many_instances, lambda i: trimkit.CollisionScene([box()]).boxes(*i).boxes()),
-    "CollisionResult": (
-        _near_spheres,
-        lambda i: len(
-            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200])
-        ),
-    ),
-    "CollisionResult.pairs": (
-        _near_spheres,
-        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]).pairs,
-    ),
-    "CollisionResult.faces": (
-        _near_spheres,
-        lambda i: (
-            trimkit.CollisionScene([i[0]])
-            .collides(i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8)
-            .faces
-        ),
-    ),
-    "CollisionResult.distances": (
-        _near_spheres,
-        lambda i: (
-            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]).distances
-        ),
-    ),
-    "CollisionResult.points": (
-        _near_spheres,
-        lambda i: (
-            trimkit.CollisionScene([i[0]])
-            .collides(i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8)
-            .points
-        ),
-    ),
-    "CollisionResult.normals": (
-        _near_spheres,
-        lambda i: (
-            trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]).normals
-        ),
-    ),
-    "CollisionScene": (
-        _near_spheres,
-        lambda i: trimkit.CollisionScene([i[0]]).collides(i[1], np.zeros(2, np.int64), pairs=i[2]),
-    ),
-    "CollisionScene.collides": (
-        _near_spheres,
-        lambda i: trimkit.CollisionScene([i[0]]).collides(
-            i[1], np.zeros(2, np.int64), pairs=i[2], return_distance=True, maximum_contacts=8
-        ),
-    ),
-    "CollisionScene.distances": (
-        _near_spheres,
-        lambda i: trimkit.CollisionScene([i[0]]).distances(i[1], np.zeros(2, np.int64), pairs=i[2][:200]),
-    ),
-    "triangulate": (lambda: circle(2_000_000), trimkit.triangulate),
-    "exchange.svg_parse": (_big_path, trimkit.exchange.svg_parse),
-    "exchange.svg_string": (
-        lambda: trimkit.exchange.svg_parse(_big_path()),
-        lambda parsed: trimkit.exchange.svg_string(*parsed),
-    ),
-    "decompose": (_big_mesh, lambda mesh: trimkit.decompose(*mesh, resolution=50_000)),
-    "parametrize": (_big_mesh, lambda mesh: trimkit.parametrize(*mesh)),
-    "simplify": (lambda: sphere(400, 800), lambda mesh: trimkit.simplify(*mesh, 1000)),
-    # a ball of radius 700 peaked at 1.15 GB (704 MB of it the surface), which
-    # late in the suite was more than the 2 GB limit had left: a MemoryError
-    "contour": (lambda: ball_runs(550), trimkit.contour),
-    "exchange.draco_encode": (_big_draco, lambda i: trimkit.exchange.draco_encode(*i)),
-    "exchange.draco_decode": (
-        _big_buffer,
-        lambda buffer: trimkit.exchange.draco_decode(buffer, np.array([0], dtype=np.int64)),
-    ),
-}
-
-
-def slow_call(name: str):
-    # the call for `name`, its input built now and freed along with the call
-    build, call = _SLOW_CALLS[name]
-    given = build()
-    return lambda: call(given)
-
-
-@functools.cache
-def empty_calls():
-    # each function on an empty input, or None where none can exist
-    no_vertices, no_faces = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
-    no_rays = (no_vertices, no_vertices)
-    return {
-        "RayScene": lambda: len(trimkit.RayScene([])),
-        "RayScene.boxes": lambda: trimkit.RayScene([]).boxes().boxes(),
-        "RayScene.intersect": lambda: trimkit.RayScene([(no_vertices, no_faces)]).intersect(
-            *no_rays, np.zeros((0, 4, 4)), np.zeros(0, dtype=np.int64)
-        ),
-        "RayScene.intersect_any": lambda: trimkit.RayScene([]).intersect_any(*no_rays),
-        "Boxes": lambda: len(trimkit.Boxes(np.zeros((0, 2, 3)))),
-        "Boxes.bounds": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).bounds,
-        "Boxes.boxes": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).boxes(),
-        "Boxes.intersection": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).intersection(np.zeros((0, 2, 3))),
-        "Boxes.nearest": lambda: trimkit.Boxes(np.zeros((0, 2, 3))).nearest(np.zeros((0, 2, 3))),
-        "CollisionScene.boxes": lambda: trimkit.CollisionScene([]).boxes().boxes(),
-        "CollisionResult": lambda: len(trimkit.CollisionResult(np.zeros((0, 2), dtype=np.int64))),
-        "CollisionResult.pairs": lambda: trimkit.CollisionScene([]).collides().pairs,
-        "CollisionResult.faces": lambda: trimkit.CollisionScene([]).collides(return_distance=True).faces,
-        "CollisionResult.distances": lambda: trimkit.CollisionScene([]).distances().distances,
-        "CollisionResult.points": lambda: trimkit.CollisionScene([]).distances().points,
-        "CollisionResult.normals": lambda: trimkit.CollisionScene([]).collides(return_distance=True).normals,
-        "CollisionScene": lambda: trimkit.CollisionScene([]).collides(),
-        "CollisionScene.collides": lambda: trimkit.CollisionScene([(no_vertices, no_faces)] * 2).collides(),
-        "CollisionScene.distances": lambda: trimkit.CollisionScene([]).distances(),
-        "triangulate": lambda: trimkit.triangulate(np.zeros((0, 2))),
-        "exchange.svg_parse": lambda: trimkit.exchange.svg_parse(""),
-        "exchange.svg_string": lambda: trimkit.exchange.svg_string(*trimkit.exchange.svg_parse("")),
-        "decompose": lambda: trimkit.decompose(no_vertices, no_faces),
-        "parametrize": lambda: trimkit.parametrize(no_vertices, no_faces),
-        "simplify": lambda: trimkit.simplify(no_vertices, no_faces, 0),
-        "contour": lambda: trimkit.contour(np.zeros((0, 4), dtype=np.int64)),
-        # draco has no empty primitive: it refuses one without vertices
-        "exchange.draco_encode": None,
-        "exchange.draco_decode": None,
-    }
-
-
-def test_tables_cover_the_api():
-    # every public function, class and method is in every table, and nothing
-    # else: a new one can't go untested, and a renamed one can't linger
-    for table in (small_calls(), _SLOW_CALLS, empty_calls(), _array_arguments()):
-        assert sorted(table) == API
+@pytest.mark.parametrize("name", API)
+def test_every_family_of_every_argument(name):
+    # the empty call, then every small form and every parameter of it
+    # through every family its annotation has, each variant checked for
+    # everything a call promises: answered as the form is, as the oracle
+    # says, or refused as it must be. A family that never ran tested
+    # nothing: every small form gives what it needs. Where SRC_BUGS names a
+    # bug a variant must still fail, so a fix can't leave its line behind
+    runs_here(name)
+    case = CASES[name]
+    census = PoolCensus()
+    ran = collections.Counter()
+    open_bugs = {key for key in SRC_BUGS if key.startswith(name + ": ")}
+    if not isinstance(case.empty, str):
+        checked_call(census, name, case.arguments("empty"))
+    for number, form in enumerate(case.arguments("small")):
+        answer = checked_call(census, name, form)
+        for parameter, family, variant in form_variants(name, form):
+            ran[parameter, family] += variant is not None
+            if variant is None:
+                continue
+            expected = answer if variant.reference is AS_GIVEN else None
+            if variant.reference is not AS_GIVEN and variant.reference is not ORACLE:
+                expected = checked_call(census, name, {**form, parameter: variant.reference})
+            given = {**form, parameter: variant.value}
+            where = f"form {number}, {parameter} {family}"
+            try:
+                checked_call(census, name, given, variant=variant, expected=expected)
+            except Exception as error:
+                # a refusal returns, so this is a check failing: a bug known here, or new
+                if f"{name}: {where}" not in SRC_BUGS:
+                    error.add_note(f"{where}: {variant}")
+                    raise
+                open_bugs.discard(f"{name}: {where}")
+                census.returned()
+    idle = sorted(key for key, count in ran.items() if count == 0)
+    assert not idle, f"families that never ran: {idle}"
+    assert not open_bugs, f"these pass now, so SRC_BUGS can lose them: {sorted(open_bugs)}"
 
 
 def pickled_objects() -> dict:
@@ -328,37 +214,15 @@ def test_every_class_pickles():
                 assert constructor.func is type(instance) and constructor.args == () and positional == ()
                 assert sorted(constructor.keywords) == sorted(keywords)
                 for key, given in keywords.items():
-                    reduced = constructor.keywords[key]
-                    if isinstance(given, bool) or given is None:
-                        assert reduced is given
-                        continue
-                    for argument, truth in zip(leaves(reduced), leaves(given), strict=True):
-                        assert isinstance(argument, np.ndarray) and argument.dtype == truth.dtype
-                        assert argument.shape == truth.shape and argument.tobytes() == truth.tobytes()
+                    # an array for an array, True, False and None themselves
+                    assert same_answers(constructor.keywords[key], given), key
                 data = pickle.dumps(instance)
                 # a pickle this test just made, so trusted
                 for loaded in (pickle.loads(data), copy.deepcopy(instance)):  # noqa: S301
                     assert type(loaded) is type(instance)
                     assert pickle.dumps(loaded) == data
                     # bit for bit, the NaNs a pair with a faceless mesh answers too
-                    for answer, truth in zip(leaves(query(loaded)), leaves(query(instance)), strict=True):
-                        assert answer.dtype == truth.dtype and answer.shape == truth.shape
-                        assert answer.tobytes() == truth.tobytes()
-
-
-@pytest.mark.parametrize("name", API)
-@pytest.mark.parametrize("which", ["small", "empty"])
-def test_outputs_are_fresh(name, which):
-    # every output is a fresh, writable, C-contiguous array (or bytes, a str
-    # or a number), empty ones included: nothing else holds its memory, so
-    # writing to it is safe and nothing has to copy it first
-    runs_here(name)
-    call = (small_calls() if which == "small" else empty_calls())[name]
-    if call is None:
-        pytest.skip("no empty input exists")
-    for a in [a for a in leaves(call()) if isinstance(a, np.ndarray)]:
-        assert a.flags.writeable and a.flags.c_contiguous
-        a.flat[:1] = 0
+                    assert same_answers(query(loaded), query(instance))
 
 
 @pytest.mark.timing
@@ -368,19 +232,19 @@ def test_stall_detector_catches_a_held_gil():
     # held off for most of the call (the rest is the call's own setup).
     # Shuffled, as timsort sorts a run (a reversed range) in linear time
     data = np.random.default_rng(0).permutation(1_000_000).tolist()
-    assert longest_gil_stall(lambda: sorted(data), minimum=0.05) > 0.5
+    assert longest_gil_stall(lambda: sorted(data)) > 0.5
+    # and the one test of release fails it, after every measurement
+    with pytest.raises(AssertionError, match="the least of"):
+        assert_releases_gil(lambda: sorted(data))
 
 
 @pytest.mark.timing
-@pytest.mark.parametrize("name", API)
+@pytest.mark.parametrize("name", SLOW)
 def test_releases_gil(name):
     runs_here(name)
-    # held off for at most a third of the call: Python's checks before and
-    # after the work hold the GIL. The least of three runs, as a held GIL
-    # stalls every run and a busy machine's scheduler only some of them
-    call = slow_call(name)
-    stall = min(longest_gil_stall(call, minimum=0.05) for _ in range(3))
-    assert stall < 1 / 3, f"the GIL was held for {stall:.0%} of the call at once"
+    # only the method is measured: its object's constructor, built first,
+    # would hold off the thread for none of the method's own time
+    assert_releases_gil(bound(name, CASES[name].arguments("slow")))
 
 
 def test_only_numpy():
@@ -403,59 +267,23 @@ def test_the_package_is_the_extension():
     ]
 
 
-@pytest.mark.parametrize("name", API)
-def test_values_must_be_bounded(name):
-    # every float input is refused unless finite, and float64 ones unless
-    # within 1e30 too: past it, products downstream overflow (rays silently
-    # missed past 5.6e102), and NaN reaches undefined float-to-int casts
-    runs_here(name)
-    function, arguments = _array_arguments()[name]
-    for argument, value in arguments.items():
-        for path, array, _ in _paths(value):
-            if array.dtype.kind != "f" or array.size == 0:
-                continue
-            bad_values = [np.nan, np.inf, -np.inf] + ([1e31, -1e31] if array.dtype == np.float64 else [])
-            for bad in bad_values:
-                broken = array.copy()
-                broken.flat[0] = bad
-                if name == "CollisionResult":
-                    # it holds a query's answers, as a pickle gives them back:
-                    # a pair past the bound is infinitely far, with NaN points
-                    # and normal, so it keeps any value exactly
-                    held = getattr(function(**{**arguments, argument: broken}), argument)
-                    assert np.array_equal(held, broken, equal_nan=True)
-                    continue
-                with pytest.raises(ValueError, match="must be finite"):
-                    function(**{**arguments, argument: _replace(value, path, broken)})
-
-
 def bytes_held(name: str) -> int:
     """
     What 50 more rounds of public call `name` leave allocated, answering
     and refusing, after 50 to warm it: counted by glibc, so every
     allocation is in it, ours, numpy's and the vendored libraries' alike
     """
-    function, arguments = _array_arguments()[name]
-    calls = [small_calls()[name]]
-    # and refused: its first float input NaN, as test_values_must_be_bounded
-    # makes it
-    floats = [
-        (argument, path, array)
-        for argument, value in arguments.items()
-        for path, array, _ in _paths(value)
-        if array.dtype.kind == "f" and array.size
-    ]
-    if floats:
-        argument, path, array = floats[0]
-        broken = array.copy()
-        broken.flat[0] = np.nan
-        given = {**arguments, argument: _replace(arguments[argument], path, broken)}
-        calls.append(lambda: function(**given))
+    form = CASES[name].arguments("small")[0]
+    # and refused: the first variant of its arguments that must be
+    parameter, variant = next(
+        (p, v) for p, _, v in form_variants(name, form) if v is not None and v.answers is False
+    )
+    calls = [form, {**form, parameter: variant.value}]
 
     def every_call():
-        for call in calls:
-            with contextlib.suppress(ValueError):
-                call()
+        for given in calls:
+            with contextlib.suppress(ValueError, TypeError):
+                call(name, given)
 
     for _ in range(50):
         every_call()
@@ -470,16 +298,19 @@ def bytes_held(name: str) -> int:
 @functools.cache
 def _held_by_every_call() -> dict[str, int]:
     # every call measured in one fresh process with glibc's per-thread cache
-    # off: a pool worker lives on between calls, and the chunks its cache
-    # keeps count as in use, though they're a few per size and per thread,
-    # filling once, which no call holds
+    # off and one arena: a pool worker lives on between calls, and the chunks
+    # its cache keeps count as in use, though they're a few per size and per
+    # thread, filling once, which no call holds. So do the arenas glibc adds
+    # as workers contend, each a few kilobytes counted in use from its first
+    # allocation: on 32 cores 10-60 KB appeared over 50 rounds of
+    # Boxes.intersection at random, and none with one arena
     script = (
         "import json, sys\n"
         f"sys.path.insert(0, {str(pathlib.Path(__file__).parent)!r})\n"
         "import test_invariants as t\n"
         "print(json.dumps({name: t.bytes_held(name) for name in sys.argv[1:]}))\n"
     )
-    environment = {**os.environ, "GLIBC_TUNABLES": "glibc.malloc.tcache_count=0"}
+    environment = {**os.environ, "GLIBC_TUNABLES": "glibc.malloc.tcache_count=0:glibc.malloc.arena_max=1"}
 
     def runs(name: str) -> bool:
         try:
@@ -513,195 +344,6 @@ def test_calls_hold_no_memory(name):
     assert grown < 16 * 1024, f"{grown} bytes held after 50 more rounds"
 
 
-def test_the_bound_itself_is_accepted():
-    # exactly 1e30 is in range, and works: a mesh at that scale is hit by rays
-    # and simplifies like the unit one
-    vertices, faces = sphere(8, 16)
-    huge = vertices * 1e30
-    assert np.abs(huge).max() == 1e30
-    _, hit_faces, _ = first_hits(
-        trimkit.RayScene([(huge, faces)]), np.zeros((50, 3)), np.random.default_rng(0).normal(size=(50, 3))
-    )
-    assert (hit_faces >= 0).all()
-    assert len(trimkit.simplify(huge, faces, 20)[1]) == len(trimkit.simplify(vertices, faces, 20)[1])
-
-
-def _array_arguments(big: bool = False) -> dict:
-    """
-    Every public call with valid keyword arguments, by name: built inside
-    each test, so no scene outlives it (nanobind reports those as leaks).
-    `big` makes every array argument hundreds of kilobytes.
-    """
-    vertices, faces = sphere(100, 200) if big else box()
-    rays = np.random.default_rng(0).normal(size=(2, 20_000 if big else 8, 3))
-    scene = trimkit.RayScene([(vertices, faces)])
-    # big ones narrow, so their overlaps are a few per box rather than all pairs
-    bounds = np.stack([vertices, vertices + (1e-3 if big else 1.0)], axis=1)
-    position = vertices.astype(np.float32)
-    kind = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-    buffer = trimkit.exchange.draco_encode(faces, [position], kind) if LITTLE_ENDIAN else b""
-    segments = trimkit.exchange.svg_parse("M0 0 L1 1 L2 0" * (10_000 if big else 1))
-    instance_count = 5_000 if big else 2
-    placed = np.tile(np.eye(4), (instance_count, 1, 1))
-    placed[:, 0, 3] = np.arange(instance_count, dtype=np.int64) * 3.0
-    origins_directions = {"origins": rays[0], "directions": rays[1]}
-    ray_instances = {"instance_matrices": placed, "instance_index": np.zeros(instance_count, np.int64)}
-    collision_scene = trimkit.CollisionScene([(vertices, faces)])
-    neighbors = np.column_stack(
-        [np.arange(instance_count - 1, dtype=np.int64), np.arange(1, instance_count, dtype=np.int64)]
-    ).astype(np.int64)
-    instances = {
-        "instance_matrices": placed,
-        "instance_index": np.zeros(instance_count, np.int64),
-        "pairs": neighbors,
-    }
-    runs = ball_runs(60 if big else 3)
-    calls = [
-        (
-            "RayScene",
-            trimkit.RayScene,
-            {"meshes": [(vertices, faces)]},
-        ),
-        ("RayScene.boxes", scene.boxes, ray_instances),
-        ("RayScene.intersect", scene.intersect, {**origins_directions, **ray_instances}),
-        ("RayScene.intersect_any", scene.intersect_any, {**origins_directions, **ray_instances}),
-        ("Boxes", trimkit.Boxes, {"boxes": bounds}),
-        ("Boxes.bounds", lambda: trimkit.Boxes(bounds).bounds, {}),
-        ("Boxes.boxes", trimkit.Boxes(bounds).boxes, {}),
-        ("Boxes.intersection", trimkit.Boxes(bounds).intersection, {"queries": bounds}),
-        ("Boxes.nearest", trimkit.Boxes(bounds).nearest, {"queries": bounds, "maximum_hits": 4}),
-        (
-            "CollisionScene",
-            trimkit.CollisionScene,
-            {"meshes": [(vertices, faces)], "convex": np.array([True])},
-        ),
-        (
-            "CollisionScene.boxes",
-            collision_scene.boxes,
-            {"instance_matrices": placed, "instance_index": np.zeros(instance_count, np.int64)},
-        ),
-        ("CollisionScene.collides", collision_scene.collides, {**instances, "return_distance": True}),
-        ("CollisionScene.distances", collision_scene.distances, instances),
-        (
-            "CollisionResult",
-            trimkit.CollisionResult,
-            collision_scene.distances(**instances).__reduce__()[0].keywords,
-        ),
-        ("CollisionResult.pairs", lambda: collision_scene.collides(**instances).pairs, {}),
-        ("CollisionResult.faces", lambda: collision_scene.distances(**instances).faces, {}),
-        ("CollisionResult.distances", lambda: collision_scene.distances(**instances).distances, {}),
-        ("CollisionResult.points", lambda: collision_scene.distances(**instances).points, {}),
-        ("CollisionResult.normals", lambda: collision_scene.distances(**instances).normals, {}),
-        ("triangulate", trimkit.triangulate, {"exterior": circle(40_000 if big else 8)}),
-        ("decompose", trimkit.decompose, {"vertices": vertices, "faces": faces, "resolution": 20_000}),
-        ("parametrize", trimkit.parametrize, {"vertices": vertices, "faces": faces}),
-        (
-            "simplify",
-            trimkit.simplify,
-            {"vertices": vertices, "faces": faces, "face_count": 4},
-        ),
-        ("contour", trimkit.contour, {"voxels": runs, "weights": np.full(len(runs), 0.75)}),
-        (
-            "exchange.draco_encode",
-            trimkit.exchange.draco_encode,
-            {"faces": faces, "attributes": [position], "kinds": np.array([0], dtype=np.int64)},
-        ),
-        (
-            "exchange.draco_decode",
-            trimkit.exchange.draco_decode,
-            {"buffer": np.frombuffer(buffer, np.uint8), "draco_attributes": np.array([0], dtype=np.int64)},
-        ),
-        ("exchange.svg_parse", trimkit.exchange.svg_parse, {"path": "M0 0 L1 1 L2 0"}),
-        (
-            "exchange.svg_string",
-            trimkit.exchange.svg_string,
-            {"vertices": segments[0], "segments": segments[1]},
-        ),
-    ]
-    return {name: (function, arguments) for name, function, arguments in calls}
-
-
-def _paths(value, path=(), in_tuple=False):
-    """
-    (path, array, in_tuple) for every array in an argument, through lists and
-    tuples: whether it is a tuple's item, as a mesh's arrays are.
-    """
-    if isinstance(value, (list, tuple)):
-        for i, item in enumerate(value):
-            yield from _paths(item, (*path, i), isinstance(value, tuple))
-    elif isinstance(value, np.ndarray):
-        yield path, value, in_tuple
-
-
-def _replace(value, path, new):
-    # `value` with the item at `path` replaced, lists and tuples rebuilt
-    if not path:
-        return new
-    items = list(value)
-    items[path[0]] = _replace(items[path[0]], path[1:], new)
-    return type(value)(items)
-
-
-def _converted(value: np.ndarray):
-    # the same values as a narrower dtype of the same kind (a safe cast back,
-    # converted with a warning), as a list (the same), and as a dtype that
-    # casts back only with loss (refused). A uint8 buffer as a list reads as
-    # int64, which doesn't cast back safely either
-    narrower = {np.dtype(np.float64): np.float32, np.dtype(np.int64): np.int32, np.dtype(np.uint8): np.int8}
-    lossy = {np.dtype(np.float64): np.complex128, np.dtype(np.int64): np.float64, np.dtype(np.uint8): np.int8}
-    yield "narrower", value.astype(narrower.get(value.dtype, np.float64))
-    yield "list", value.tolist()
-    yield "lossy", value.astype(lossy.get(value.dtype, np.int64))
-
-
-def _relaid(value: np.ndarray):
-    # exactly these values in every other layout: strided, Fortran-ordered,
-    # misaligned, and reversed views of reversed copies (negative strides, as
-    # `np.flipud` and `np.fliplr` make) that read back as the original
-    yield "strided", np.repeat(value, 2, axis=0)[::2]
-    yield "reversed", np.ascontiguousarray(value[::-1])[::-1]
-    if value.ndim > 1:
-        yield "fortran", np.asfortranarray(value)
-        yield "flipped", np.ascontiguousarray(value[..., ::-1])[..., ::-1]
-    raw = np.zeros(value.nbytes + 1, dtype=np.uint8)
-    shifted = np.frombuffer(raw.data, dtype=value.dtype, count=value.size, offset=1).reshape(value.shape)
-    shifted[...] = value
-    yield "misaligned", shifted
-
-
-@pytest.mark.parametrize("name", API)
-def test_safe_conversions_warn_and_match(name):
-    # every array argument, and each array of a mesh pair, given as another
-    # dtype or a list: converted with a UserWarning naming the argument and
-    # answering exactly as the exact dtype does when numpy casts it back
-    # safely, a TypeError naming the argument otherwise (the bare arrays of a
-    # list, draco's attributes, take any dtype as they are)
-    runs_here(name)
-    function, arguments = _array_arguments()[name]
-    for argument, value in arguments.items():
-        for path, array, in_tuple in _paths(value):
-            if array.dtype.names or not (in_tuple or not path):
-                continue
-            for how, wrong in _converted(array):
-                given = {**arguments, argument: _replace(value, path, wrong)}
-                if not np.can_cast(np.asarray(wrong).dtype, array.dtype, "safe"):
-                    with pytest.raises(TypeError, match=argument):
-                        function(**given)
-                    continue
-                # the same values as the exact dtype (narrowing rounded them)
-                same = np.asarray(wrong).astype(array.dtype).reshape(array.shape)
-                expected = _results(function(**{**arguments, argument: _replace(value, path, same)}))
-                if argument in ("origins", "directions") and np.asarray(wrong).dtype == np.float32:
-                    # rays are float64 or float32: taken as they are (a warning here is an error)
-                    got = _results(function(**given))
-                else:
-                    with pytest.warns(UserWarning, match=f"{argument}.*converted to {array.dtype.name}"):
-                        got = _results(function(**given))
-                for a, b in zip(got, expected, strict=True):
-                    same = np.array_equal(a, b, equal_nan=True) if isinstance(a, np.ndarray) else a == b
-                    assert same, (argument, how)
-
-
 def test_a_wrong_shape_is_refused_before_anything_converts():
     # the shape is checked first: no conversion warning (which this suite
     # raises) for an array that is refused anyway, whatever its dtype
@@ -712,70 +354,9 @@ def test_a_wrong_shape_is_refused_before_anything_converts():
         trimkit.RayScene([box()]).intersect_any(np.zeros(3), np.ones(3), None, [[0]])
 
 
-def test_a_mesh_is_any_pair():
-    # a mesh is any sequence of two: a list is as good as a tuple, a triple isn't
-    vertices, faces = box()
-    expected = trimkit.RayScene([(vertices, faces)]).boxes().boxes()
-    assert np.array_equal(trimkit.RayScene([[vertices, faces]]).boxes().boxes(), expected)
-    assert np.array_equal(trimkit.CollisionScene([[vertices, faces]]).boxes().boxes(), expected)
-    with pytest.raises(TypeError, match=r"meshes\[0\] must be a \(vertices, faces\) pair"):
-        trimkit.RayScene([(vertices, faces, faces)])
-
-
-def _results(result) -> list:
-    # what a call answers, comparable: its arrays, bytes, strings and numbers
-    if isinstance(result, (tuple, list)):
-        return [r for item in result for r in _results(item)]
-    if isinstance(result, trimkit.CollisionResult):
-        return collision_fields(result)
-    if isinstance(result, trimkit.Boxes):
-        return [result.boxes()]
-    # what a scene holds, so its constructor's layouts are compared too
-    if isinstance(result, (trimkit.RayScene, trimkit.CollisionScene)):
-        return [result.boxes().boxes()]
-    assert isinstance(result, (np.ndarray, bytes, str, int, float)), type(result)
-    return [result]
-
-
-@pytest.mark.parametrize("name", API)
-def test_any_layout_answers_the_same(name):
-    # every array in any layout (strided, reversed, Fortran-ordered,
-    # misaligned, the records of a structured dtype too) gives exactly the
-    # answer its C-contiguous copy does: copied once, as the caller would
-    runs_here(name)
-    function, arguments = _array_arguments()[name]
-    expected = _results(function(**arguments))
-    for argument, value in arguments.items():
-        for path, array, _ in _paths(value):
-            for how, relaid in _relaid(array):
-                got = _results(function(**{**arguments, argument: _replace(value, path, relaid)}))
-                assert len(got) == len(expected), (argument, how)
-                for a, b in zip(got, expected, strict=True):
-                    same = np.array_equal(a, b, equal_nan=True) if isinstance(a, np.ndarray) else a == b
-                    assert same, (argument, how)
-
-
-def _arrays(value) -> list:
-    # every array in an argument or a result, through tuples and lists
-    if isinstance(value, (tuple, list)):
-        return [a for item in value for a in _arrays(item)]
-    if isinstance(value, trimkit.CollisionResult):
-        return collision_fields(value)
-    return [value] if isinstance(value, np.ndarray) else []
-
-
-@pytest.mark.parametrize("name", API)
-def test_outputs_never_alias_inputs(name):
-    runs_here(name)
-    function, arguments = _array_arguments()[name]
-    inputs = _arrays(list(arguments.values()))
-    for output in _arrays(function(**arguments)):
-        assert not any(np.shares_memory(output, given) for given in inputs)
-
-
-def _peak_python_bytes(call) -> int:
+def _peak_python_bytes(query) -> int:
     """
-    The most memory Python and numpy held at once during `call`, above what
+    The most memory Python and numpy held at once during `query`, above what
     they held before it: numpy reports every array buffer it allocates to
     tracemalloc, and our own C++ allocations and outputs don't go through it.
     """
@@ -783,7 +364,7 @@ def _peak_python_bytes(call) -> int:
     try:
         before, _ = tracemalloc.get_traced_memory()
         tracemalloc.reset_peak()
-        call()
+        query()
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -796,85 +377,107 @@ def test_copy_detector_catches_copies():
     assert _peak_python_bytes(lambda: np.ascontiguousarray(data[::-1])) >= data.nbytes
 
 
-@pytest.mark.parametrize("name", API)
+@pytest.mark.parametrize("name", BIG)
 def test_inputs_are_never_copied(name):
-    # nothing converts or copies an input on the way in: during the call numpy
-    # allocates far less than the largest input
+    # nothing converts or copies an input on the way in: during the call
+    # Python and numpy allocate far less than the largest input, beyond what
+    # the answer is made of there (draco's bytes, a property's numpy copy);
+    # a str is read in place too
     runs_here(name)
-    function, arguments = _array_arguments(big=True)[name]
-    largest = max((a.nbytes for a in _arrays(list(arguments.values()))), default=0)
-    if largest == 0:
-        pytest.skip("no array arguments to copy")
+    given = CASES[name].arguments("big")
+    texts = [len(value) for value in given.values() if isinstance(value, str)]
+    largest = max([a.nbytes for a in input_arrays(given)] + texts)
     assert largest > 200_000
-    assert _peak_python_bytes(lambda: function(**arguments)) < largest // 2
-
-
-def _long_query(name: str, scale: int):
-    # a query whose structure is built outside it, so only the polling loop is
-    # timed: a tinybvh build has no point at which to check for Ctrl-C
-    rng = np.random.default_rng(0)
-    if name == "RayScene.intersect":
-        scene = trimkit.RayScene([sphere(100, 200)])
-        origins, directions = rng.normal(size=(2, 250_000 * scale, 3)) * 0.1
-        return lambda: scene.intersect(origins, directions)
-    corners = rng.uniform(0, 100, (200_000, 3))
-    tree = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
-    queries = rng.uniform(0, 100, (25_000 * scale, 3))
-    bounds = np.stack([queries, queries + 3.0], axis=1)
-    return lambda: tree.intersection(bounds)
+    answered = 0
+    for leaf in leaves(call(name, given)):
+        if isinstance(leaf, (bytes, str)) or (isinstance(leaf, np.ndarray) and leaf.flags.owndata):
+            answered += leaf.nbytes if isinstance(leaf, np.ndarray) else len(leaf)
+    assert _peak_python_bytes(lambda: call(name, given)) < largest // 2 + answered
 
 
 @pytest.mark.timing
-@pytest.mark.parametrize("name", ["decompose", "RayScene.intersect", "Boxes.intersection"])
-def test_ctrl_c_stops_long_calls(name):
-    # every long loop polls for Ctrl-C with the GIL released: an interrupt
-    # 50 ms in stops the call well before it would finish. Queries double
-    # until a call takes 1 s, so this holds on fast and slow machines alike:
-    # stopping takes the 50 ms timer plus up to one 50 ms poll period, and at
-    # 0.5 s a loaded machine missed the half-call bound by 5 ms (2026-11-01).
-    # (xatlas reports progress only when a stage's percentage changes, from
-    # whichever thread runs that task, and only the calling thread's reports
-    # can see Ctrl-C: measured, it stops at 0.48 s of a 0.53 s call, a known gap.)
-    scale = 1
-    while True:
-        call = slow_call(name) if name == "decompose" else _long_query(name, scale)
-        tic = time.perf_counter()
-        call()
-        uninterrupted = time.perf_counter() - tic
-        if uninterrupted > 1.0 or name == "decompose" or scale >= 128:
-            break
-        scale *= 2
-    assert uninterrupted > 0.5, "the input couldn't be made slow enough to interrupt mid-call"
+def test_ctrl_c_stops_long_queries():
+    # every query polls for Ctrl-C with the GIL released, in the one place,
+    # trimkit.hpp's in_parallel, polled through gil.hpp's with_pool, which no binding can go around (`scripts
+    # static`), so one query tests them all: an interrupt 50 ms in stops it
+    # well before it would finish. It takes a second here (helpers.long_call),
+    # so this holds on fast and slow machines alike: stopping takes the 50 ms
+    # timer plus up to one 50 ms poll period, and at 0.5 s a loaded machine
+    # missed the half-call bound by 5 ms (2026-11-01)
+    query, uninterrupted = long_call()
     timer = threading.Timer(0.05, _thread.interrupt_main)
     tic = time.perf_counter()
     timer.start()
     with pytest.raises(KeyboardInterrupt):
-        call()
-        time.sleep(10)  # only if the call ignored it: the interrupt lands here instead
+        query()
     timer.join()
     assert time.perf_counter() - tic < uninterrupted / 2
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("name", ["decompose", "parametrize"])
+def test_ctrl_c_in_a_library_answers_whole_or_raises(name):
+    # a vendored library polls only from its own progress reports, which
+    # V-HACD makes between stages (its vertex welding, before any, is
+    # seconds on a mesh of a million triangles) and xatlas only when a
+    # stage's percentage changes: so how soon it stops isn't promised. What
+    # is: Ctrl-C at any moment raises KeyboardInterrupt or the call answers
+    # whole, never part of an answer, and the next call answers the same
+    given = CASES[name].arguments("slow")
+    tic = time.perf_counter()
+    expected = call(name, given)
+    took = time.perf_counter() - tic
+    # delays within the call, until at least one interrupt landed inside it
+    # (the library polled, and the call raised from inside), or nothing here
+    # tested an interrupted call: one that never polls finishes, and the
+    # interrupt is raised only after it returned
+    landed = 0
+    for trial, fraction in enumerate(np.random.default_rng(3).uniform(0.05, 0.6, 16)):
+        if trial >= 4 and landed:
+            break
+        timer = threading.Timer(fraction * took, _thread.interrupt_main)
+        timer.start()
+        answer = None
+        with raises_seen(getattr(trimkit, name)) as raised:
+            try:
+                answer = call(name, given)
+            except KeyboardInterrupt:
+                landed += bool(raised)
+            else:
+                # the call finished first: the interrupt lands here, between sleeps
+                with contextlib.suppress(KeyboardInterrupt):
+                    for _ in range(1000):
+                        time.sleep(0.01)
+        timer.join()
+        assert answer is None or same_answers(answer, expected)
+        assert same_answers(call(name, given), expected)
+    assert landed, f"no interrupt landed inside {name}: nothing polled during it"
 
 
 @pytest.mark.timing
 def test_random_ctrl_c_leaves_the_pool_healthy():
     # Ctrl-C at random moments in a long parallel query, workers mid-range
     # or not: each raises promptly, and the next call is whole and the same
-    call = _long_query("Boxes.intersection", 8)
-    expected = call()
-    for delay in np.random.default_rng(7).uniform(0.005, 0.2, 6):
+    query, uninterrupted = long_call()
+    expected = query()
+    # delays within the first half of a call of a second or more, so each
+    # lands inside it
+    for fraction in np.random.default_rng(7).uniform(0.005, 0.5, 6):
+        delay = fraction * uninterrupted
         timer = threading.Timer(delay, _thread.interrupt_main)
         tic = time.perf_counter()
         timer.start()
         with pytest.raises(KeyboardInterrupt):
-            call()
+            query()
             # the call finished first: the interrupt lands here, between
             # sleeps, as interrupt_main sends no signal to cut one short
             for _ in range(1000):
                 time.sleep(0.01)
         timer.join()
-        # a 50 ms poll and one range at most; a second covers a loaded machine
-        assert time.perf_counter() - tic < delay + 1.0
-    assert np.array_equal(call(), expected)
+        # a 50 ms poll and one range at most: well before a call that
+        # ignored it would have ended
+        assert time.perf_counter() - tic < delay + (uninterrupted - delay) / 2
+    assert np.array_equal(query(), expected)
 
 
 # big enough that every parallel query wakes workers, hashed to compare runs
@@ -882,7 +485,7 @@ _PARALLEL_QUERIES = """
 import hashlib, os, sys
 import numpy as np
 sys.path.insert(0, sys.argv[2])
-from helpers import collision_fields, sphere
+from helpers import ball_runs, box, collision_fields, sphere
 import trimkit
 if sys.argv[1] == "one":
     os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
@@ -905,6 +508,9 @@ outputs = [
     *collision_fields(solids.collides(matrices, index, return_distance=True, maximum_contacts=4)),
     # xatlas's tasks on however many threads, each with its own scratch
     *trimkit.parametrize(*sphere(30, 60)),
+    # contour's passes, and V-HACD's fan-outs, on the pool
+    *trimkit.contour(ball_runs(60)),
+    *(array for hull in trimkit.decompose(*box(), resolution=20_000) for array in hull),
 ]
 print(hashlib.sha256(b"".join(np.ascontiguousarray(a).tobytes() for a in outputs)).hexdigest())
 """
@@ -914,6 +520,8 @@ print(hashlib.sha256(b"".join(np.ascontiguousarray(a).tobytes() for a in outputs
 def test_one_core_matches_every_core():
     # however many workers a query gets, down to none, the answers are the
     # same bytes: each item's output depends on that item alone
+    if cpus_allowed() < 2:
+        pytest.skip("one CPU: every core is the one core, so there is nothing to compare")
     tests = str(pathlib.Path(__file__).parent)
     digests = {
         cores: run_python(
@@ -933,71 +541,37 @@ def test_one_core_matches_every_core():
 def test_fork_after_a_parallel_call():
     # a child forked while the parent's workers are alive starts its own and
     # answers the same; Python warns about forking with threads alive
-    call = _long_query("Boxes.intersection", 2)
-    expected = call()
-    read, write = os.pipe()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        pid = os.fork()
-    if pid == 0:
-        try:
-            os.write(write, b"1" if np.array_equal(call(), expected) else b"0")
-        finally:
-            os._exit(0)
-    os.close(write)
-    try:
-        # a child that hangs fails this rather than the whole run
-        assert select.select([read], [], [], 120.0)[0], "the forked child hung"
-        assert os.read(read, 1) == b"1"
-    finally:
-        os.close(read)
-        os.kill(pid, signal.SIGKILL)
-        os.waitpid(pid, 0)
-
-
-@pytest.mark.timing
-@pytest.mark.skipif(not pathlib.Path("/proc/self/task").is_dir(), reason="counts threads through /proc")
-def test_workers_exit_when_idle():
-    # parallel.hpp's workers sleep for 10 s with nothing to do, then exit, so
-    # an idle process holds no threads of ours
-    if len(os.sched_getaffinity(0)) < 2:
-        pytest.skip("one CPU: queries never wake workers")
-    call = _long_query("Boxes.intersection", 2)
-
-    def threads() -> int:
-        return len(os.listdir("/proc/self/task"))
-
-    time.sleep(11)
-    before = threads()
-    call()
-    assert threads() > before
-    time.sleep(11)
-    assert threads() == before
+    query, _ = long_call(0.1)
+    # a child that hangs fails this rather than the whole run
+    assert forked_answer(query, query(), 120.0) == b"1"
 
 
 def test_enums_are_int_enums_named_for_their_function():
-    # every enumeration is an IntEnum beside the functions taking it, none at the
-    # top level, each built from its int and an int itself, and named for them:
-    # DracoKind for draco_*, SvgKind for svg_*
+    # every enumeration is an IntEnum beside the function taking it, each
+    # built from its int and an int itself, and named for it: DracoKind for
+    # exchange.draco_*, SvgKind for exchange.svg_*, TriangulateEngine for triangulate
     import enum
     import re
 
     from trimkit.exchange import DracoKind
 
     exchange = trimkit.exchange
-    families = [v for v in vars(exchange).values() if isinstance(v, type) and issubclass(v, enum.Enum)]
-    assert sorted(f.__name__ for f in families) == ["DracoKind", "SvgKind"]
     assert DracoKind is exchange.DracoKind and sys.modules["trimkit.exchange"] is exchange
-    assert not [v for v in vars(trimkit).values() if isinstance(v, type) and issubclass(v, enum.Enum)]
-    functions = [n for n, v in vars(exchange).items() if callable(v) and not isinstance(v, type)]
-    for family in families:
-        assert issubclass(family, enum.IntEnum)
-        for member in family:
-            assert family(int(member)) is member
-            assert member == int(member)
-        prefix = re.match(r"[A-Z][a-z]+", family.__name__)[0].lower()
-        assert [f for f in functions if f.startswith(prefix + "_")], family
+    found = []
+    for module in (trimkit, exchange):
+        families = [v for v in vars(module).values() if isinstance(v, type) and issubclass(v, enum.Enum)]
+        functions = [n for n, v in vars(module).items() if callable(v) and not isinstance(v, type)]
+        for family in families:
+            found.append(family.__name__)
+            assert issubclass(family, enum.IntEnum)
+            for member in family:
+                assert family(int(member)) is member
+                assert member == int(member)
+            prefix = re.match(r"[A-Z][a-z]+", family.__name__)[0].lower()
+            assert [f for f in functions if f == prefix or f.startswith(prefix + "_")], family
+    assert sorted(found) == ["DracoKind", "SvgKind", "TriangulateEngine"]
     assert int(exchange.SvgKind.CUBIC) == 2
+    assert int(trimkit.TriangulateEngine.CDT) == 1
     assert exchange.SvgSegment.fields["kind"][0] == np.uint8
 
 
@@ -1070,7 +644,10 @@ def test_docs_name_everything():
     assert sorted(_attributes(trimkit.__doc__)) == sorted([*plain, "__version__"])
     assert _attributes(trimkit.exchange.__doc__) == ["DracoKind", "SvgKind", "SvgSegment"]
     families = [
-        v for v in vars(trimkit.exchange).values() if isinstance(v, type) and issubclass(v, enum.Enum)
+        v
+        for module in (trimkit, trimkit.exchange)
+        for v in vars(module).values()
+        if isinstance(v, type) and issubclass(v, enum.Enum)
     ]
     for family in families:
         assert _attributes(family.__doc__) == [m.name for m in family]
@@ -1083,91 +660,3 @@ def test_docs_name_everything():
 
 def test_version_is_the_packages():
     assert trimkit.__version__ == importlib.metadata.version("trimkit")
-
-
-def _scalar_calls():
-    # every scalar argument of the package, as a call taking it, with a value
-    vertices, faces = sphere(8, 12)
-    position = vertices.astype(np.float32)
-    kind = np.array([trimkit.exchange.DracoKind.POSITION], dtype=np.int64)
-    placed = np.tile(np.eye(4), (2, 1, 1))
-    placed[1, 0, 3] = 3.0
-    which = np.zeros(2, np.int64)
-
-    def decompose(**scalar):
-        return trimkit.decompose(vertices, faces, resolution=5000, **scalar)
-
-    def scene():
-        # built inside the call: this table outlives the tests, and no scene may
-        return trimkit.CollisionScene([box()], convex=True)
-
-    return {
-        "face_count": (lambda v: trimkit.simplify(vertices, faces, v), 8),
-        "maximum_error": (lambda v: trimkit.simplify(vertices, faces, 8, maximum_error=v), 1),
-        "lock_border": (lambda v: trimkit.simplify(vertices, faces, 8, lock_border=v), True),
-        "decompose maximum_hulls": (lambda v: decompose(maximum_hulls=v), 2),
-        "decompose maximum_vertices": (lambda v: decompose(maximum_vertices=v), 8),
-        "resolution": (lambda v: trimkit.decompose(vertices, faces, resolution=v), 5000),
-        "decompose maximum_error": (lambda v: decompose(maximum_error=v), 4),
-        "quantization_bits": (
-            lambda v: (trimkit.exchange.draco_encode(faces, [position], kind, quantization_bits=v),),
-            9,
-        ),
-        "convex": (lambda v: trimkit.CollisionScene([box()], convex=v).distances(placed, which), True),
-        "margin": (lambda v: (scene().collides(placed, which, margin=v),), 1),
-        "return_distance": (lambda v: scene().collides(placed, which, margin=4.0, return_distance=v), True),
-        "maximum_contacts": (
-            lambda v: scene().collides(placed, which, margin=4.0, return_distance=True, maximum_contacts=v),
-            2,
-        ),
-        "maximum_hits": (
-            lambda v: trimkit.RayScene([(vertices, faces)]).intersect(
-                np.zeros((2, 3)), np.eye(3)[:2], maximum_hits=v
-            ),
-            2,
-        ),
-        "upper_bound": (lambda v: scene().distances(placed, which, upper_bound=v), 4),
-        # False never touches a device, so this runs everywhere
-        "use_gpu": (lambda v: len(trimkit.RayScene([(vertices, faces)], use_gpu=v)), False),
-    }
-
-
-def _numpy_kinds(value) -> list:
-    # the same value as each numpy scalar that can hold it, and as a float
-    if isinstance(value, bool):
-        return [np.bool_(value)]
-    kinds = [np.int64, np.int32, np.int16, np.uint8, np.uint64]
-    integers = [kind(value) for kind in kinds if value <= np.iinfo(kind).max]
-    return [*integers, float(value), np.float64(value), np.float32(value)]
-
-
-@pytest.mark.parametrize("name", _scalar_calls())
-def test_numpy_scalars_are_python_scalars(name):
-    # no argument ever needs numpy.float64(10.0), or refuses it: what numpy's
-    # own arithmetic returns answers exactly as Python's number does
-    runs_here("exchange.draco_encode" if name == "quantization_bits" else name)
-    call, value = _scalar_calls()[name]
-    expected = call(value)
-    integral = name in (
-        "face_count",
-        "decompose maximum_hulls",
-        "decompose maximum_vertices",
-        "resolution",
-        "quantization_bits",
-        "maximum_hits",
-        "maximum_contacts",
-    )
-    for scalar in _numpy_kinds(value):
-        if integral and isinstance(scalar, (float, np.floating)):
-            with pytest.raises(TypeError):
-                call(scalar)
-            continue
-        for got, same in zip(_results(call(scalar)), _results(expected), strict=True):
-            assert np.array_equal(got, same, equal_nan=True) if isinstance(got, np.ndarray) else got == same
-
-
-@pytest.mark.parametrize("name", ["lock_border", "convex", "use_gpu", "return_distance"])
-@pytest.mark.parametrize("wrong", [0, 1, None, "yes", np.int64(1)])
-def test_nothing_else_is_a_bool(name, wrong):
-    with pytest.raises(TypeError):
-        _scalar_calls()[name][0](wrong)

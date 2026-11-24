@@ -272,6 +272,18 @@ inline bool start_detached_thread(void* (*entry)(void*), std::size_t stack_bytes
 #endif
 }
 
+// Name the calling thread "trimkit", as `top -H`, debuggers and
+// /proc/PID/task/*/comm show it: a pool worker is told apart from the
+// interpreter's threads and every other library's, which a test counting
+// threads would otherwise count with ours (helpers.pool_threads)
+inline void name_this_thread() {
+#if defined(__linux__) && !defined(TRIMKIT_GENMC)
+    pthread_setname_np(pthread_self(), "trimkit");
+#elif defined(__APPLE__)
+    pthread_setname_np("trimkit");
+#endif
+}
+
 #if defined(__linux__) && !defined(TRIMKIT_GENMC)
 // How many CPUs a sysfs CPU list names ("0-3,8,10-11": 7), or 0 for none
 inline std::uint32_t count_cpu_list(const char* list) {

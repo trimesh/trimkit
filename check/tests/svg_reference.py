@@ -22,6 +22,7 @@ import math
 import sys
 
 from lark import Lark, Token
+from lark.exceptions import LarkError
 
 TEMPLATE = r"""
 start: (moveto drawto*)?
@@ -91,7 +92,7 @@ def parse(grammar: Lark, d: str):
     """
     try:
         tree = grammar.parse(d)
-    except Exception:
+    except LarkError:
         return None
     commands = []
     for node in tree.children:

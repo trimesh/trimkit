@@ -8,52 +8,22 @@ import numpy as np
 import pytest
 from helpers import (
     box,
+    brute_force,
     check_boxes,
     first_hits,
     flatten,
     heap_in_use,
+    nearest_rows,
+    overlapping,
     ray_scene,
     run_python,
-    same,
+    same_answers,
+    same_box_distances,
     sphere,
     transform,
 )
 
 import trimkit
-
-
-def brute_force(vertices, faces, origins, directions):
-    """
-    Möller-Trumbore for every ray against every triangle, from either side:
-    the (r, m) distance to each triangle hit ahead of its origin, else inf.
-    """
-    a, b, c = (vertices[faces[:, i]] for i in range(3))
-    e1, e2 = b - a, c - a
-    p = np.cross(directions[:, None], e2[None])
-    det = np.einsum("rmk,mk->rm", p, e1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        s = origins[:, None] - a[None]
-        u = np.einsum("rmk,rmk->rm", s, p) / det
-        q = np.cross(s, e1[None])
-        v = np.einsum("rk,rmk->rm", directions, q) / det
-        t = np.einsum("rmk,mk->rm", q, e2) / det
-    hit = (det != 0) & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 0)
-    return np.where(hit, t, np.inf)
-
-
-def edge_distance(vertices, triangle, origin, direction) -> float:
-    """
-    How far inside its triangle a ray crosses the triangle's plane, in
-    barycentric units: 0 on an edge or vertex.
-    """
-    a, b, c = vertices[triangle]
-    e1, e2 = b - a, c - a
-    p = np.cross(direction, e2)
-    det = p @ e1
-    s = origin - a
-    u = (s @ p) / det
-    v = (direction @ np.cross(s, e1)) / det
-    return min(abs(u), abs(v), abs(1 - u - v))
 
 
 def exact_t(vertices, triangle, origin, direction) -> Fraction:
@@ -102,7 +72,7 @@ def test_first_hits_match_brute_force(name, vertices, faces):
 
     instances, faces_hit, distances = first_hits(scene_of(vertices, faces), origins, directions)
     t = parameters(distances, directions)
-    every = brute_force(vertices, faces, origins, directions)
+    every, _, _ = brute_force(vertices, faces, origins, directions)
     best = every.min(axis=1)
     miss = np.isinf(best)
     assert miss.any() and not miss.all()
@@ -139,7 +109,7 @@ def test_distances_are_true_distances():
     assert np.allclose(d_unit, d_scaled, rtol=1e-12, atol=0)
     # aimed at the center of a unit sphere from 4 away: exactly the nearest
     # triangle a brute force over every triangle finds
-    assert np.allclose(d_unit, brute_force(vertices, faces, origins, unit).min(axis=1), rtol=1e-12, atol=0)
+    assert np.allclose(d_unit, brute_force(vertices, faces, origins, unit)[0].min(axis=1), rtol=1e-12, atol=0)
 
 
 def test_closed_mesh_is_watertight():
@@ -181,25 +151,13 @@ def test_bad_input():
     vertices, faces = sphere(6, 8)
     with pytest.raises(ValueError, match=r"meshes\[0\]\[1\] index a vertex out of range"):
         trimkit.RayScene([(vertices, faces + len(vertices))])
-    with pytest.raises(ValueError, match=r"meshes\[0\]\[0\].*finite"):
-        trimkit.RayScene([(np.where(vertices == vertices.max(), np.nan, vertices), faces)])
     for mesh in ((vertices,), (vertices, faces, faces), vertices):
         with pytest.raises(TypeError, match=r"meshes\[0\] must be a \(vertices, faces\) pair"):
             trimkit.RayScene([mesh])
-    # int32 faces cast safely to int64: converted with a warning, the same scene
-    expected = trimkit.RayScene([(vertices, faces)]).boxes().boxes()
-    with pytest.warns(UserWarning, match=r"meshes\[0\]\[1\]: int32 converted to int64"):
-        converted = trimkit.RayScene([(vertices, faces.astype(np.int32))])
-    assert np.array_equal(converted.boxes().boxes(), expected)
-    # float64 faces would lose values: refused
-    with pytest.raises(TypeError, match=r"meshes\[0\]\[1\]"):
-        trimkit.RayScene([(vertices, faces.astype(np.float64))])
     scene = scene_of(vertices, faces)
     for query in (scene.intersect, scene.intersect_any):
         with pytest.raises(ValueError, match="same number"):
             query(np.zeros((2, 3)), np.ones((3, 3)))
-        with pytest.raises(ValueError, match="finite"):
-            query(np.full((1, 3), np.inf), np.ones((1, 3)))
 
 
 def test_mesh_owns_its_geometry():
@@ -264,9 +222,7 @@ def test_defaults_and_fast_path():
     far[0, 3] = 1000.0  # a second instance well out of the way
     one, two = np.eye(4)[None], np.stack([np.eye(4), far])
     scene = ray_scene([mesh])
-    check_boxes(
-        scene.boxes(two, np.array([0, 0], dtype=np.int64)), [mesh], two, np.array([0, 0], dtype=np.int64)
-    )
+    check_boxes(scene, [mesh], two, np.array([0, 0], dtype=np.int64))
     assert len(scene) == 1
     for query in (scene.intersect, scene.intersect_any):
         expected = query(origins, directions)
@@ -275,10 +231,10 @@ def test_defaults_and_fast_path():
             (one, None),
             (two, np.array([0, 0], dtype=np.int64)),
         ):
-            same(query(origins, directions, *placed), expected)
+            assert same_answers(query(origins, directions, *placed), expected)
     # matrices alone default the meshes, one each
     pair = ray_scene([mesh, mesh], two)
-    same(
+    assert same_answers(
         first_hits(pair, origins, directions, two),
         first_hits(scene, origins, directions, two, np.zeros(2, np.int64)),
     )
@@ -323,22 +279,22 @@ def test_remembered_instances_answer_the_same():
     expected = fresh(first)
     other = fresh(second)
     assert expected[0].size and not all(np.array_equal(x, y) for x, y in zip(expected, other, strict=True))
-    same(scene.intersect(origins, directions, first, index), expected)
-    same(scene.intersect(origins, directions, first, index), expected)
-    same(scene.intersect(origins, directions, second, index), other)
-    same(scene.intersect(origins, directions, first.copy(), index), expected)
+    assert same_answers(scene.intersect(origins, directions, first, index), expected)
+    assert same_answers(scene.intersect(origins, directions, first, index), expected)
+    assert same_answers(scene.intersect(origins, directions, second, index), other)
+    assert same_answers(scene.intersect(origins, directions, first.copy(), index), expected)
     # the same array, its values changed: the bytes say it moved
     moving = first.copy()
-    same(scene.intersect(origins, directions, moving, index), expected)
+    assert same_answers(scene.intersect(origins, directions, moving, index), expected)
     moving[...] = second
-    same(scene.intersect(origins, directions, moving, index), other)
+    assert same_answers(scene.intersect(origins, directions, moving, index), other)
     # another index over the same matrices, and None for each mesh once
     swapped = 1 - index
-    same(
+    assert same_answers(
         scene.intersect(origins, directions, first, swapped),
         trimkit.RayScene(meshes).intersect(origins, directions, first, swapped),
     )
-    same(
+    assert same_answers(
         first_hits(scene, origins, directions),
         first_hits(trimkit.RayScene(meshes), origins, directions),
     )
@@ -365,7 +321,7 @@ def test_remembered_instances_from_many_threads():
             )
         )
     for k, result in results:
-        same(result, expected[k])
+        assert same_answers(result, expected[k])
 
 
 def test_instances_match_flattened_scene():
@@ -459,7 +415,7 @@ def test_scene_bad_input():
         with pytest.raises(ValueError, match=match):
             scene.boxes(transforms, index)
         # and a refused placement is never remembered
-        same(
+        assert same_answers(
             first_hits(scene, np.zeros((1, 3)), np.ones((1, 3))),
             first_hits(trimkit.RayScene([mesh]), np.zeros((1, 3)), np.ones((1, 3))),
         )
@@ -491,7 +447,7 @@ def test_all_hits_match_brute_force_and_first():
     # every hit against brute force over each instance's transformed copy
     for k, (g, m) in enumerate(zip(index, transforms, strict=True)):
         vertices = transform(meshes[g][0], m)
-        every = brute_force(vertices, meshes[g][1], origins, directions)
+        every, inside, _ = brute_force(vertices, meshes[g][1], origins, directions)
         expected = {tuple(row) for row in np.argwhere(np.isfinite(every)).tolist()}
         mine = rays[instances == k], faces_hit[instances == k]
         found = set(zip(*(a.tolist() for a in mine), strict=True))
@@ -499,7 +455,7 @@ def test_all_hits_match_brute_force_and_first():
         # crossing, so one hit here, where the float64 reference finds every
         # triangle there, or none
         for ray, face in expected ^ found:
-            assert edge_distance(vertices, meshes[g][1][face], origins[ray], directions[ray]) < 1e-9
+            assert abs(inside[ray, face]) < 1e-9
         # and where both hit, at the same distance
         t = parameters(distances[instances == k], directions[mine[0]])
         agreed = np.array([(ray, face) in expected for ray, face in zip(*mine, strict=True)], dtype=bool)
@@ -559,39 +515,6 @@ def test_no_leaks_and_shared_meshes():
     assert "leaked" not in result.stderr, result.stderr
 
 
-def overlapping(boxes, queries):
-    """
-    Brute force: [query, box] for every overlap, touching included, sorted.
-    """
-    lo, hi = boxes[:, 0], boxes[:, 1]
-    rows = [
-        [q, b]
-        for q, query in enumerate(queries)
-        for b in np.flatnonzero(((lo <= query[1]) & (hi >= query[0])).all(axis=1))
-    ]
-    return np.array(rows, dtype=np.int64).reshape((-1, 2))
-
-
-def nearest_rows(boxes, queries, k):
-    """
-    Brute force: [query, box] rows of each query's k nearest boxes by
-    distance and then box, and their distances, each axis's gap squared
-    summed in axis order as the contract says.
-    """
-    lo, hi = boxes[:, 0], boxes[:, 1]
-    rows, distances = [], []
-    for q, query in enumerate(queries):
-        gaps = np.maximum(np.maximum(lo - query[1], query[0] - hi), 0.0)
-        squared = gaps[:, 0] * gaps[:, 0]
-        for axis in range(1, boxes.shape[2]):
-            squared = squared + gaps[:, axis] * gaps[:, axis]
-        distance = np.sqrt(squared)
-        order = np.lexsort((np.arange(len(boxes), dtype=np.int64), distance))[:k]
-        rows.append(np.column_stack([np.full(len(order), q, dtype=np.int64), order]))
-        distances.append(distance[order])
-    return np.concatenate(rows).astype(np.int64).reshape((-1, 2)), np.concatenate(distances)
-
-
 def random_boxes(rng, n, d, scale=1.0):
     corner = rng.uniform(-10, 10, (n, d))
     return np.stack([corner, corner + rng.uniform(0, 3 * scale, (n, d))], axis=1)
@@ -622,7 +545,7 @@ def test_boxes_match_brute_force(d):
         truth_hits, truth_distances = nearest_rows(grid, query_boxes, k)
         assert hits.dtype == np.int64 and distances.dtype == np.float64
         assert np.array_equal(hits, truth_hits)
-        assert distances.tobytes() == truth_distances.tobytes()
+        assert same_box_distances(distances, truth_distances, grid, query_boxes, truth_hits)
     # ties and overlaps, so the order means something
     assert (distances == 0.0).any() and len(np.unique(distances)) < len(distances)
 
@@ -652,7 +575,7 @@ def test_boxes_moving_loop(d):
         for k in (1, 5, len(boxes)):
             hits, distances = tree.nearest(asked, maximum_hits=k)
             assert np.array_equal(hits, truth_hits[:, :k].reshape((-1, 2)))
-            assert distances.tobytes() == truth_distances[:, :k].tobytes()
+            assert same_box_distances(distances, truth_distances[:, :k], boxes, queries, hits)
         touching = truth_hits[truth_distances == 0.0]
         touching = touching[np.lexsort((touching[:, 1], touching[:, 0]))]
         assert np.array_equal(tree.intersection(asked), touching)
@@ -705,11 +628,6 @@ def test_boxes_query_shapes_refused():
     # None is refused by the binding itself, as for every array argument
     with pytest.raises(TypeError):
         tree.intersection(None)
-    # a shape that fits but a value that doesn't is a ValueError
-    with pytest.raises(ValueError, match="finite"):
-        tree.intersection(np.full(6, np.nan))
-    with pytest.raises(ValueError, match="finite"):
-        tree.nearest(np.full(6, np.inf))
     with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
         tree.nearest(np.zeros(4))
     # fewer than one is refused as RayScene refuses it, and only an int is one
@@ -792,12 +710,8 @@ def test_boxes_empty():
 
 def test_boxes_bad_input():
     good = np.zeros((1, 2, 3))
-    for bounds, match in [
-        (np.array([[[1.0, 0, 0], [0, 1, 1]]]), "minimum above its maximum"),
-        (good * np.nan, "finite"),
-    ]:
-        with pytest.raises(ValueError, match=match):
-            trimkit.Boxes(bounds)
+    with pytest.raises(ValueError, match="minimum above its maximum"):
+        trimkit.Boxes(np.array([[[1.0, 0, 0], [0, 1, 1]]]))
     with pytest.raises(TypeError, match=r"queries must be float64 of shape \(6,\) or \(2, 3\)"):
         trimkit.Boxes(good).intersection(np.zeros((1, 2, 2)))
     # a shape of no 2D or 3D boxes is the wrong type, and one box alone too
@@ -815,17 +729,6 @@ def test_distance_for_any_direction_length(scale):
     _, faces, distances = first_hits(scene, np.array([[0.0, 0.0, 5.0]]), np.array([[0.0, 0.0, -scale]]))
     assert faces.tolist() == [0]
     assert np.isclose(distances[0], 5.0)
-
-
-def test_misaligned_arrays_are_copied():
-    # C-contiguous at an odd byte offset, where every read in place would be
-    # undefined: copied once, aligned, and the same scene as from the original
-    vertices, faces = box()
-    raw = np.zeros(vertices.nbytes + 1, dtype=np.uint8)
-    shifted = np.frombuffer(raw.data, dtype=np.float64, count=vertices.size, offset=1).reshape((-1, 3))
-    shifted[...] = vertices
-    assert shifted.flags.c_contiguous and not shifted.flags.aligned
-    assert np.array_equal(ray_scene([(shifted, faces)]).boxes().boxes(), ray_scene([box()]).boxes().boxes())
 
 
 def test_transform_inverse_must_be_bounded():
@@ -881,10 +784,10 @@ def test_scene_boxes_hold_every_instance():
     scene = ray_scene(meshes, transforms, index)
     # boxes of other placements, before and after a query remembers one
     for count in (0, 1, 7):
-        check_boxes(scene.boxes(transforms[:count], index[:count]), meshes, transforms[:count], index[:count])
+        check_boxes(scene, meshes, transforms[:count], index[:count])
     scene.intersect_any(np.zeros((1, 3)), np.ones((1, 3)), transforms, index)
-    check_boxes(scene.boxes(transforms, index), meshes, transforms, index)
-    check_boxes(scene.boxes(), meshes)
+    check_boxes(scene, meshes, transforms, index)
+    check_boxes(scene, meshes)
 
 
 @pytest.mark.parametrize("x", [1e3, 1e7, 2e7, 1e9, 1e29])
@@ -900,7 +803,7 @@ def test_all_hits_on_axis_aligned_rays_far_out(x):
     every = scene.intersect(origins, directions)
     assert first[2].tolist() == [10.0]
     ray = np.zeros(1, dtype=np.int64)
-    same((every[0], every[1], every[2], every[3]), (ray, first[0], first[1], first[2]))
+    assert same_answers((every[0], every[1], every[2], every[3]), (ray, first[0], first[1], first[2]))
 
 
 def test_one_row_is_every_rays():
@@ -912,7 +815,7 @@ def test_one_row_is_every_rays():
     direction = np.array([0.03, -0.02, -1.0])
     expected = scene.intersect(origins, np.tile(direction, (500, 1)))
     assert len(expected[0]) > 0
-    same(expected, scene.intersect(origins, direction))
+    assert same_answers(expected, scene.intersect(origins, direction))
     assert len(scene.intersect(np.zeros((0, 3)), direction)[0]) == 0
     with pytest.raises(ValueError, match="same number of rays"):
         scene.intersect(origins[:1], np.tile(direction, (500, 1)))
@@ -945,7 +848,7 @@ def test_hit_counts_tell_inside_from_outside():
 
 def test_maximum_hits_caps_each_ray():
     # the first k hits of each ray, exactly the full answer's first k rows for
-    # it; one hit per ray is the nearest; fewer than one is refused
+    # it; one hit per ray is the nearest
     vertices, faces = sphere(10, 20)
     meshes = [(vertices, faces), (vertices + np.array([3.0, 0.0, 0.0]), faces)]
     scene = ray_scene(meshes)
@@ -963,8 +866,6 @@ def test_maximum_hits_caps_each_ray():
     assert np.array_equal(rays, np.arange(50, dtype=np.int64))
     for mine, theirs in zip((instances, faces_hit, distances), first, strict=True):
         assert np.array_equal(mine, theirs)
-    with pytest.raises(ValueError, match="maximum_hits"):
-        scene.intersect(origins, directions, maximum_hits=0)
 
 
 def test_trees_keep_no_build_scratch():
@@ -997,3 +898,13 @@ def test_trees_keep_no_build_scratch():
     # from 100k, spatial splits: 192 of nodes, 12 of index, ours: 225
     vertices, faces = sphere(200, 400)
     assert held_per(len(faces), lambda: trimkit.RayScene([(vertices, faces)])) < 260
+
+
+def test_nearest_past_memory_is_memory_error():
+    # a million queries each wanting all of a million boxes: 10**12 rows, more
+    # than any memory holds. A 32-bit size_t wrapped their count to a small
+    # one, and the walk wrote past it
+    corners = np.zeros((1_000_000, 2))
+    tree = trimkit.Boxes(np.stack([corners, corners + 1.0], axis=1))
+    with pytest.raises(MemoryError):
+        tree.nearest(np.stack([corners, corners], axis=1), maximum_hits=len(corners))

@@ -20,7 +20,7 @@
 (*   P1  a worker counted as spinning by a waking caller never sleeps      *)
 (*       through that caller's wake                                        *)
 (*   P2  a job published, wanting help, with items left, has a live worker *)
-(*       or one leaving that will start its replacement; but in a forked   *)
+(*       or one leaving that will look at the wake again; but in a forked  *)
 (*       child, whose caller runs alone                                    *)
 (*   R   a call that returned ran every item, or failed, or was stopped    *)
 (*       by its caller's poll                                              *)
@@ -29,6 +29,11 @@
 (*       just before its fetch-add, so one that read the gate open may     *)
 (*       still take its range)                                             *)
 (*   E   an epoch names one job, so a worker skips only a job it drained   *)
+(* And of every step:                                                      *)
+(*   P3  a worker thread starts only at a call's wake that finds fewer     *)
+(*       live than it wants, or in the chain such a wake started: never    *)
+(*       for nothing, as an exit's replacement once did for a wake served  *)
+(*       long before (a thread is the cost, so this one is checked)        *)
 (* A step outside a SlotWord transition's precondition (which the C++'s    *)
 (* checked() asserts) is outside its table's domain, and stops TLC too.    *)
 (* And over every behaviour, each thread taking its steps fairly:          *)
@@ -435,8 +440,8 @@ WorkerParkCompare(t, f) ==
     /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, live, wanted, indexes, promised, gate, interrupt, forked>>
 
 \* idle long enough: its index given back, then out of the live count, then
-\* (Holding's destructor) a last look at the wake, which a caller may have
-\* bumped after counting it live, so it starts its replacement
+\* a last look at the wake, which a caller may have bumped after counting it
+\* live: then it counts itself again and looks, rather than go
 WorkerExit(t, f) ==
     /\ indexes' = [indexes EXCEPT ![t] = 0]
     /\ live' = live - 1
@@ -444,11 +449,21 @@ WorkerExit(t, f) ==
     /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, promised, gate, interrupt, forked>>
 
 WorkerExitRecheck(t, f) ==
-    /\ IF wake # f.observed /\ ~Broken("exit_without_recheck")
-       THEN \E r \in SpawnWorker(Pop(stack, t), live): stack' = r[1] /\ live' = r[2]
-       ELSE stack' = Pop(stack, t) /\ UNCHANGED live
-    /\ promised' = [promised EXCEPT ![t] = 0]
-    /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, indexes, gate, interrupt, forked>>
+    LET held == {indexes[w] : w \in Workers} \ {0}
+        free == {i \in 1 .. Cap : i \notin held}
+    IN /\ IF Broken("exit_starts_replacement")
+          \* what the C++ did: start another thread in its place
+          THEN /\ IF wake # f.observed
+                  THEN \E r \in SpawnWorker(Pop(stack, t), live): stack' = r[1] /\ live' = r[2]
+                  ELSE stack' = Pop(stack, t) /\ UNCHANGED live
+               /\ UNCHANGED indexes
+          ELSE IF wake # f.observed /\ ~Broken("exit_without_recheck") /\ live < Cap
+               THEN /\ live' = live + 1
+                    /\ indexes' = [indexes EXCEPT ![t] = CHOOSE i \in free : \A x \in free : i <= x]
+                    /\ Go(t, [f EXCEPT !.pc = "Scan"])
+               ELSE stack' = Pop(stack, t) /\ UNCHANGED <<live, indexes>>
+       /\ promised' = [promised EXCEPT ![t] = 0]
+       /\ UNCHANGED <<slot, job, jobs, calls, wake, spinning, wanted, gate, interrupt, forked>>
 
 \* an idle worker may exit once asleep
 MayExit(f) == IdleExit /\ f.pc = "ParkSleep"
@@ -595,5 +610,14 @@ R == \A j \in 1 .. MaxJobs :
 
 Calling == \E t \in Threads : \E i \in 1 .. Len(stack[t]) : stack[t][i].kind = "caller"
 L1 == <>(~Calling /\ \A t \in 1 .. Callers : calls[t] = 0)
+
+\* a worker newly at its first step was started by a caller at its wake's
+\* spawn, finding fewer live than it wants, or by a worker at its first step
+\* continuing that wake's chain
+Starting == {w \in Workers : stack[w] # <<>> /\ Top(w).kind = "worker" /\ Top(w).pc = "Start"}
+P3 == [][ \/ Starting' \subseteq Starting
+          \/ \E t \in Threads : stack[t] # <<>> /\ Top(t).kind = "caller" /\ Top(t).pc = "WakeSpawn"
+                              /\ live < Top(t).want
+          \/ Starting # {} /\ live < wanted ]_vars
 
 =============================================================================

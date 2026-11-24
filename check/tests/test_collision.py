@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-from helpers import box, collision_boxes, collision_fields, sphere
+from helpers import box, check_boxes, collision_fields, cycloidal, exploded, sphere
 
 import trimkit
 
@@ -38,7 +38,7 @@ def scene(convex, *meshes) -> trimkit.CollisionScene:
     """
     meshes = list(meshes) or [box()]
     built = trimkit.CollisionScene(meshes, convex=convex if isinstance(convex, bool) else np.array(convex))
-    collision_boxes(built, meshes)
+    check_boxes(built, meshes)
     return built
 
 
@@ -56,7 +56,7 @@ def test_found_pairs_match_named_pairs():
     four = scene(False)
     matrices = placed(0.0, 0.5, 5.0, 5.5)
     index = np.zeros(4, np.int64)
-    collision_boxes(four, [box()], matrices, index)
+    check_boxes(four, [box()], matrices, index)
     explicit = np.column_stack(np.triu_indices(4, 1)).astype(np.int64)
     assert (
         four.collides(matrices, index).pairs.tolist()
@@ -100,6 +100,66 @@ def test_mesh_normal_is_nan_once_touching():
     assert np.isnan(normals).all()
 
 
+def test_collides_agrees_with_distances_on_a_real_assembly():
+    # the cycloidal drive, as loaded and pulled apart: the pairs `collides`
+    # finds are exactly those `distances` puts at most the margin apart. 0.3.1
+    # culled two pairs touching within rounding, (19, 24) and (20, 24), that
+    # its own `distances` put at 0. No pair is within 0.07 mm of 1 mm
+    meshes, matrices, index = cycloidal()
+    scene = trimkit.CollisionScene(meshes)
+    for pose in (1.0, 2.0, 5.0):
+        placed = exploded(meshes, matrices, index, pose)
+        measured = scene.distances(placed, index)
+        for margin in (0.0, 1.0):
+            within = measured.pairs[measured.distances <= margin]
+            found = scene.collides(placed, index, margin=margin).pairs
+            assert sorted(found.tolist()) == sorted(within.tolist()), f"pulled apart {pose}x, margin {margin}"
+
+
+def test_every_pair_past_memory_is_memory_error():
+    # 300,000 instances have 4.5e10 pairs, more than any memory holds: a 32-bit
+    # size_t wrapped their count, and gave too few rows back
+    count = 300_000
+    scene = trimkit.CollisionScene([box()])
+    with pytest.raises(MemoryError):
+        scene.distances(np.tile(np.eye(4), (count, 1, 1)), np.zeros(count, np.int64))
+
+
+def test_touching_within_rounding_collides():
+    # the fuzzer's find: a sliver and a segment (a triangle without area)
+    # meeting another sliver exactly, as fractions show, across the plane
+    # x = -2.113725490196078 their placement puts them on. Rounded there,
+    # their boxes miss each other by an ulp, and a broadphase culling on
+    # them unpadded said they didn't collide
+    first = np.array(
+        [
+            [-0.9921862928003959, -0.11372549019607847, -0.11372543152275627],
+            [-0.11373901367187189, -0.1137254934557076, -0.11372549019607847],
+            [-0.11372549019607847, -0.11372549019607847, -0.11372549019607847],
+        ]
+    )
+    second = np.array(
+        [
+            [-0.1137254934557076, -0.11372549019607847, -0.11372549019607847],
+            [-0.11372549019607847, -0.11372549019607847, -0.1138475605086069],
+            [-0.6059129901960785, -0.11372549019607847, -0.11718630744137126],
+        ]
+    )
+    place = np.array(
+        [[0.0, 0.0, 1.0, -2.0], [1.0, 0.0, 0.0, -2.0], [0.0, 1.0, 0.0, -2.0], [0.0, 0.0, 0.0, 1.0]]
+    )
+    scene = trimkit.CollisionScene(
+        [
+            (first, np.array([[2, 0, 1], [2, 2, 0]], dtype=np.int64)),
+            (second, np.array([[1, 0, 2]], dtype=np.int64)),
+        ]
+    )
+    matrices = np.stack([place, place])
+    assert scene.distances(matrices).distances.tolist() == [0.0]
+    assert scene.collides(matrices).pairs.tolist() == [[0, 1]]
+    assert scene.collides(matrices, pairs=np.array([[0, 1]], dtype=np.int64)).pairs.tolist() == [[0, 1]]
+
+
 @pytest.mark.parametrize("convex", [False, True])
 def test_margin_counts_near_pairs(convex):
     two, matrices, index = scene(convex), placed(0.0, 1.5), np.zeros(2, np.int64)
@@ -124,7 +184,7 @@ def test_empty_meshes_never_touch():
     assert both.collides().pairs.tolist() == []
     assert both.distances().distances.tolist() == [np.inf]
     on_top = placed((0.5, 0.5, 0.5), 0.0)
-    collision_boxes(both, [empty, box()], on_top)
+    check_boxes(both, [empty, box()], on_top)
     assert both.collides(on_top).pairs.tolist() == []
 
 
@@ -153,7 +213,7 @@ def test_agrees_with_separating_axes(convex):
     count = 40
     matrices = placed(*rng.uniform(0, 3, (count, 3)), rotations=[rotation(rng) for _ in range(count)])
     cubes = scene(convex)
-    collision_boxes(cubes, [box()], matrices, np.zeros(count, np.int64))
+    check_boxes(cubes, [box()], matrices, np.zeros(count, np.int64))
     found = cubes.collides(matrices, np.zeros(count, np.int64)).pairs
     pairs = np.column_stack(np.triu_indices(count, 1)).astype(np.int64)
     touching = {tuple(row) for row in found.tolist()}
@@ -247,10 +307,6 @@ def test_instances_are_checked():
         one.collides(placed(0.0, 1.0), np.zeros(2, np.int64), pairs=np.array([[0, 2]], dtype=np.int64))
     with pytest.raises(ValueError, match="twice"):
         one.collides(placed(0.0, 1.0), np.zeros(2, np.int64), pairs=np.array([[1, 1]], dtype=np.int64))
-    with pytest.raises(ValueError, match="margin"):
-        one.collides(margin=-1.0)
-    with pytest.raises(ValueError, match="upper_bound"):
-        one.distances(upper_bound=0.0)
 
 
 def test_convex_scalar_is_every_mesh():
@@ -305,7 +361,7 @@ def test_shared_scene():
     matrices = placed(*rng.uniform(0, 4, (count, 3)), rotations=[rotation(rng) for _ in range(count)])
     index = rng.integers(0, 2, count)
     shared = scene([False, True], sphere(12, 24), sphere(12, 24))
-    collision_boxes(shared, [sphere(12, 24)] * 2, matrices, index)
+    check_boxes(shared, [sphere(12, 24)] * 2, matrices, index)
     expected = shared.distances(matrices, index)
     with ThreadPoolExecutor(8) as pool:
         results = list(pool.map(lambda _: shared.distances(matrices, index), range(16)))
@@ -360,7 +416,7 @@ def test_boxes_bound_tightly():
     beside[1, 3] = 3.0
     bars = scene(False, (turned, faces), (vertices, faces))
     matrices = np.stack([straighten, beside])
-    collision_boxes(bars, [(turned, faces), (vertices, faces)], matrices)
+    check_boxes(bars, [(turned, faces), (vertices, faces)], matrices)
     # the turned bar's box comes from its oriented box, so the two bars'
     # boxes don't meet, where its vertices' box, turned, reaches past y = 3
     turned_box, beside_box = bars.boxes(matrices).boxes()
@@ -449,7 +505,7 @@ def test_stacked_poses_are_one_call():
     one = np.array([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
     pairs = np.concatenate([one + count * pose for pose in range(poses)])
     index = np.tile(np.arange(count, dtype=np.int64), poses)
-    collision_boxes(chain, links, matrices, index)
+    check_boxes(chain, links, matrices, index)
     stacked = chain.distances(matrices, index, pairs=pairs)
     touching = chain.collides(matrices, index, pairs=pairs)
     alone = [chain.distances(matrices[count * pose : count * (pose + 1)], pairs=one) for pose in range(poses)]

@@ -54,7 +54,6 @@ def test_commands():
     assert (segments["kind_data"][:8] == 0).all()
 
 
-@pytest.mark.skipif(sys.byteorder != "little", reason="the golden bytes are little-endian")
 def test_layout_is_pinned():
     # one record per segment, meant to stay readable for decades: kind, seven
     # zero bytes, four int64 vertex indices, two float64 of kind_data
@@ -66,9 +65,15 @@ def test_layout_is_pinned():
     ]
     vertices, segments = X.svg_parse("M0 0 L1 0 Q1 1 2 1 C3 1 3 2 4 2 Z")
     golden = [(0, (0, -1, -1, 1)), (1, (1, 2, -1, 3)), (2, (3, 4, 5, 6)), (0, (6, -1, -1, 0))]
-    assert segments.tobytes() == b"".join(struct.pack("<B7x4q2d", k, *p, 0.0, 0.0) for k, p in golden)
     corners = [[0, 0], [1, 0], [1, 1], [2, 1], [3, 1], [3, 2], [4, 2]]
-    assert vertices.tobytes() == np.array(corners, "<f8").tobytes()
+    assert [
+        (k, tuple(p)) for k, p in zip(segments["kind"].tolist(), segments["points"].tolist(), strict=True)
+    ] == golden
+    assert vertices.tolist() == corners
+    # and the bytes themselves, which are this machine's order
+    if sys.byteorder == "little":
+        assert segments.tobytes() == b"".join(struct.pack("<B7x4q2d", k, *p, 0.0, 0.0) for k, p in golden)
+        assert vertices.tobytes() == np.array(corners, "<f8").tobytes()
     # an arc's kind_data is its center, a conic's its weight then 0
     _, arcs = X.svg_parse("M0 0 A1 1 0 0 1 1 1 A2 1 0 0 1 3 2")
     assert arcs["kind"].tolist() == [ARC, CONIC]
@@ -363,16 +368,10 @@ def test_string_hand_built():
     bad["kind"][1] = 9
     with pytest.raises(ValueError, match="segment 1: kind is not an SvgKind"):
         X.svg_string(vertices, bad)
-    with pytest.raises(ValueError, match="finite"):
-        X.svg_string(np.where(np.arange(4, dtype=np.int64)[:, None] == 3, np.nan, vertices), segments)
     bad = segments.copy()
     bad["points"][1, 3] = len(vertices)
     with pytest.raises(ValueError, match="segment 1: points names a vertex out of range"):
         X.svg_string(vertices, bad)
-    # float32 vertices cast safely: converted with a warning, the same path
-    with pytest.warns(UserWarning, match="vertices: float32 converted to float64"):
-        converted = X.svg_string(vertices.astype(np.float32), segments)
-    assert converted == X.svg_string(vertices, segments)
 
 
 def segment(kind: int, points, kind_data=(0.0, 0.0)) -> np.ndarray:
@@ -530,9 +529,11 @@ def test_string_reads_a_copy():
     thread.start()
     try:
         for _ in range(5):
-            # what it copied may already be scribbled on: refused, never misread
+            # what it copied may already be scribbled on: refused, never
+            # misread. Values only ever move to ones refused (a vertex to inf)
+            # or never read (an arc's center), so an answer is the first one
             with contextlib.suppress(ValueError):
-                X.svg_string(vertices, segments)
+                assert X.svg_string(vertices, segments) == expected
     finally:
         stop.set()
         thread.join()

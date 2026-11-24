@@ -23,7 +23,7 @@ int main() {
             }
         },
         trimkit::parallel::ItemCost::Coarse, 1, stop);
-    assert(!failure);  // a stop is the caller's to report (common.hpp's Interrupt), not a failure
+    assert(!failure);  // a stop is the caller's to report (gil.hpp's Interrupt), not a failure
     assert(caller_ranges <= 1);
     for (int i = 0; i < 3; i++) {
         assert(runs[i].load(std::memory_order_relaxed) <= 1);

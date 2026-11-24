@@ -3,14 +3,13 @@ import time
 
 import numpy as np
 import pytest
-from helpers import areas2d
+from helpers import areas2d, shoelace
 
 import trimkit
 
-
-def shoelace(ring: np.ndarray) -> float:
-    x, y = ring.T
-    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+CDT = trimkit.TriangulateEngine.CDT
+# every way to choose an engine: the default, then each one by name
+ENGINES = [None, *trimkit.TriangulateEngine]
 
 
 def star(n: int, radius: float, center=(0.0, 0.0), seed: int = 0) -> np.ndarray:
@@ -21,15 +20,16 @@ def star(n: int, radius: float, center=(0.0, 0.0), seed: int = 0) -> np.ndarray:
     return np.column_stack([r * np.cos(angle), r * np.sin(angle)]) + center
 
 
+@pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("seed", range(20))
-def test_area_and_winding(seed):
+def test_area_and_winding(seed, engine):
     shell = star(200, 10.0, seed=seed)
     # holes are small stars well inside the shell's minimum radius
     holes = [np.ascontiguousarray(star(30, 1.0, center=c, seed=seed + 100)[::-1]) for c in ((-3, 0), (3, 0))]
     # close the shell with a duplicate vertex like shapely does
     exterior = np.vstack([shell, shell[:1]])
 
-    vertices, faces = trimkit.triangulate(exterior, holes)
+    vertices, faces = trimkit.triangulate(exterior, holes, engine=engine)
     # the returned vertices are exactly the rings stacked in order
     assert np.array_equal(vertices, np.vstack([exterior, *holes]))
     areas = areas2d(vertices, faces)
@@ -41,18 +41,20 @@ def test_area_and_winding(seed):
     assert abs(areas.sum() - truth) < 1e-10 * truth
     assert faces.dtype == np.int64
     assert faces.min() >= 0
-    assert faces.max() < len(vertices)
+    # the closing duplicate is never used: faces index the first of equal vertices
+    assert faces.max() < len(vertices) and len(shell) not in faces
 
 
-def test_inputs_in_place_or_refused():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_inputs_in_place_or_refused(engine):
     shell = star(50, 1.0)
     hole = np.ascontiguousarray(star(10, 0.2)[::-1])
-    _, expected = trimkit.triangulate(shell, [hole])
+    _, expected = trimkit.triangulate(shell, [hole], engine=engine)
     # read-only arrays are used in place, and interiors may be any sequence
     frozen = shell.copy()
     frozen.flags.writeable = False
     for interiors in ([hole], (hole,)):
-        assert np.array_equal(trimkit.triangulate(frozen, interiors)[1], expected)
+        assert np.array_equal(trimkit.triangulate(frozen, interiors, engine=engine)[1], expected)
     # a ring of a dtype that casts safely, or a list, is converted with a
     # warning naming which one and tiles the same; anything else is refused
     # naming it (the exterior is covered with every other array in test_invariants)
@@ -61,22 +63,24 @@ def test_inputs_in_place_or_refused():
         ([hole.tolist()], r"interiors\[0\]: a list converted to float64"),
     ]:
         with pytest.warns(UserWarning, match=name):
-            assert np.array_equal(trimkit.triangulate(shell, interiors)[1], expected)
+            assert np.array_equal(trimkit.triangulate(shell, interiors, engine=engine)[1], expected)
     with pytest.raises(TypeError, match=r"interiors\[1\]"):
-        trimkit.triangulate(shell, [hole, "not a ring"])
+        trimkit.triangulate(shell, [hole, "not a ring"], engine=engine)
 
 
-def test_no_holes_and_empty_rings():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_no_holes_and_empty_rings(engine):
     square = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
-    vertices, faces = trimkit.triangulate(square)
+    vertices, faces = trimkit.triangulate(square, engine=engine)
     assert np.array_equal(vertices, square) and len(faces) == 2
     # an empty hole adds nothing, and an empty exterior has no triangles
-    assert np.array_equal(trimkit.triangulate(square, [np.zeros((0, 2))])[1], faces)
-    vertices, faces = trimkit.triangulate(np.zeros((0, 2)))
+    assert np.array_equal(trimkit.triangulate(square, [np.zeros((0, 2))], engine=engine)[1], faces)
+    vertices, faces = trimkit.triangulate(np.zeros((0, 2)), engine=engine)
     assert vertices.shape == (0, 2) and faces.shape == (0, 3)
 
 
-def test_many_holes():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_many_holes(engine):
     # a grid of square holes: every hole cut, and the area exact
     exterior = np.array([[0, 0], [41, 0], [41, 41], [0, 41]], dtype=float)
     holes = [
@@ -84,21 +88,72 @@ def test_many_holes():
         for x in range(1, 41, 2)
         for y in range(1, 41, 2)
     ]
-    vertices, faces = trimkit.triangulate(exterior, holes)
+    vertices, faces = trimkit.triangulate(exterior, holes, engine=engine)
     assert len(vertices) == 4 + 4 * len(holes)
     assert abs(areas2d(vertices, faces).sum() - (41 * 41 - len(holes))) < 1e-9
 
 
-def test_bad_rings():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_faces_index_the_first_of_equal_vertices(engine):
+    # a hole touching the shell at a corner, given twice (and as -0.0, which
+    # equals 0.0): faces index only the first copy, so the triangles share it
+    shell = np.array([[0, 0], [4, 0], [4, 4], [0, 4]], dtype=float)
+    hole = np.array([[-0.0, 0], [1, 2], [2, 1]], dtype=float)
+    vertices, faces = trimkit.triangulate(shell, [hole], engine=engine)
+    assert 4 not in faces and 0 in faces
+    areas = areas2d(vertices, faces)
+    assert np.all(areas > 0) and np.isclose(areas.sum(), 16 - 1.5, rtol=1e-14)
+
+
+def test_the_default_engine_is_earcut():
     square = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
-    with pytest.raises(TypeError):
-        trimkit.triangulate(square[:, :1])
-    with pytest.raises(TypeError, match=r"interiors\[1\]"):
-        trimkit.triangulate(square, [square * 0.5, "not a ring"])
-    with pytest.raises(ValueError, match="exterior"):
-        trimkit.triangulate(np.full((4, 2), np.nan))
-    with pytest.raises(ValueError, match=r"interiors\[0\]"):
-        trimkit.triangulate(square, [np.full((4, 2), np.inf)])
+    assert np.array_equal(
+        trimkit.triangulate(square)[1],
+        trimkit.triangulate(square, engine=trimkit.TriangulateEngine.EARCUT)[1],
+    )
+
+
+def test_cdt_refuses_crossing_edges():
+    # earcut fills a self-intersecting ring with something; CDT names the edges
+    bowtie = np.array([[0, 0], [1, 1], [1, 0], [0, 1]], dtype=float)
+    with pytest.raises(
+        ValueError, match=r"ring edges cross: the edge between vertices \(2, 3\) crosses \(0, 1\)"
+    ):
+        trimkit.triangulate(bowtie, engine=CDT)
+    # a hole poking out through the shell
+    square = np.array([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float)
+    with pytest.raises(ValueError, match="ring edges cross"):
+        trimkit.triangulate(square, [square + 1.0], engine=CDT)
+
+
+def test_cdt_any_winding_and_touching():
+    shell = star(100, 10.0, seed=3)
+    hole = np.ascontiguousarray(star(20, 1.0, seed=4))
+    truth = shoelace(shell) - shoelace(hole)
+    # holes are found by how many ring edges they sit behind, so either
+    # winding of either ring tiles the same area
+    for exterior in (shell, shell[::-1]):
+        for interior in (hole, hole[::-1]):
+            vertices, faces = trimkit.triangulate(
+                np.ascontiguousarray(exterior), [np.ascontiguousarray(interior)], engine=CDT
+            )
+            areas = areas2d(vertices, faces)
+            assert np.all(areas > 0) and np.isclose(areas.sum(), truth, rtol=1e-12)
+    # a hole vertex on the middle of a shell edge splits that edge, adding no vertex
+    square = np.array([[0, 0], [4, 0], [4, 4], [0, 4]], dtype=float)
+    vertices, faces = trimkit.triangulate(
+        square, [np.array([[2, 0], [3, 1], [1, 1]], dtype=float)], engine=CDT
+    )
+    areas = areas2d(vertices, faces)
+    assert len(vertices) == 7 and np.all(areas > 0) and np.isclose(areas.sum(), 15.0, rtol=1e-14)
+
+
+@pytest.mark.parametrize(
+    "ring", [[[0, 0]], [[0, 0], [1, 0]], [[0, 0], [1, 0], [2, 0]], [[0, 0], [1, 0], [0, 0]]]
+)
+def test_cdt_rings_without_area_have_no_faces(ring):
+    vertices, faces = trimkit.triangulate(np.array(ring, dtype=float), engine=CDT)
+    assert len(vertices) == len(ring) and faces.shape == (0, 3)
 
 
 def _degenerate(kind: str, n: int) -> np.ndarray:
@@ -108,35 +163,44 @@ def _degenerate(kind: str, n: int) -> np.ndarray:
         s = np.linspace(0, 1, n // 4, endpoint=False)
         z, o = np.zeros_like(s), np.ones_like(s)
         return np.vstack([np.column_stack(c) for c in ((s, z), (o, s), (1 - s, o), (z, 1 - s))])
+    if kind == "diagonal":
+        # a sliver along y = x, every vertex there but one: exactly where a
+        # hash of hash(x) ^ hash(y) collides, as CDT's FindDuplicates' does
+        s = np.linspace(0, 1, n - 1)
+        return np.vstack([np.column_stack([s, s]), [[1.0, 0.0]]])
     radius = 1.0 + 0.1 * (np.arange(n, dtype=np.int64) % 2) if kind == "gear" else np.ones(n)
     return np.column_stack([radius * np.cos(angle), radius * np.sin(angle)])
 
 
-@pytest.mark.parametrize("kind", ["circle", "gear", "square"])
-def test_degenerate_rings(kind):
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("kind", ["circle", "gear", "square", "diagonal"])
+def test_degenerate_rings(kind, engine):
     # exactly regular, cocircular and collinear rings are what trimesh makes
     # from arcs and sampled edges: they must tile exactly, use every vertex so
     # extrusions stay watertight, and not go quadratic (a 40k circle took 0.7 s
     # before vendor/patches/earcut-convex-ring.patch and takes milliseconds now)
-    vertices, faces = trimkit.triangulate(_degenerate(kind, 4000))
+    vertices, faces = trimkit.triangulate(_degenerate(kind, 4000), engine=engine)
     areas = areas2d(vertices, faces)
-    assert np.all(areas >= 0)
-    assert abs(areas.sum() - shoelace(vertices)) < 1e-10 * shoelace(vertices)
+    assert np.all(areas >= 0) if engine != CDT else np.all(areas > 0)
+    assert abs(areas.sum() - abs(shoelace(vertices))) < 1e-10 * abs(shoelace(vertices))
     assert len(np.unique(faces)) == len(vertices)
 
 
 @pytest.mark.timing
-def test_regular_rings_are_not_quadratic():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_regular_rings_are_not_quadratic(engine):
     big = _degenerate("circle", 100_000)
     tic = time.perf_counter()
-    trimkit.triangulate(big)
-    # 0.020 s release, 0.055 s under ASan, 5.1 s without
-    # earcut-convex-ring.patch (measured 2026-11-01, i7-12700K)
+    trimkit.triangulate(big, engine=engine)
+    # earcut 0.020 s release, 0.055 s under ASan, 5.1 s without
+    # earcut-convex-ring.patch (measured 2026-11-01, i7-12700K); CDT 0.08 s
+    # release (2026-11-23)
     assert time.perf_counter() - tic < 1.0
 
 
 @pytest.mark.timing
-def test_many_holes_are_not_quadratic():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_many_holes_are_not_quadratic(engine):
     # bridging holes walked every hole spliced in before (7.7 s for these
     # 10,000; vendor/patches/earcut-hole-bridge-blocks.patch makes it 0.3 s),
     # and the triangles still tile exactly the polygon minus its holes
@@ -150,16 +214,17 @@ def test_many_holes_are_not_quadratic():
         for j in range(side)
     ]
     tic = time.perf_counter()
-    vertices, faces = trimkit.triangulate(outer, holes)
-    # 0.34 s release (what CI runners run), 1.3 s under ASan, 7.7 s without
-    # earcut-hole-bridge-blocks.patch (measured 2026-11-01, i7-12700K): 4 s
-    # is ~12x release and still well under the regression
+    vertices, faces = trimkit.triangulate(outer, holes, engine=engine)
+    # earcut 0.34 s release (what CI runners run), 1.3 s under ASan, 7.7 s
+    # without earcut-hole-bridge-blocks.patch (measured 2026-11-01,
+    # i7-12700K); CDT 0.04 s release (2026-11-23): 4 s is ~12x earcut's
+    # release and still well under the regression
     assert time.perf_counter() - tic < 4.0
     expected = (side + 2.0) ** 2 - len(holes) * 0.36
     assert np.isclose(np.abs(areas2d(vertices, faces)).sum(), expected, rtol=1e-12)
 
 
-# found by check/fuzz/earcut.cpp: earcut 3.2.4 itself (pristine, without our patches)
+# found by check/fuzz/triangulate.cpp: earcut 3.2.4 itself (pristine, without our patches)
 # leaves out or overlaps area on these valid polygons with holes. Each is
 # (ring sizes, base64 little-endian float64 x, y pairs), exact to the bit
 UPSTREAM_HOLE_BUGS = {
@@ -217,21 +282,29 @@ UPSTREAM_HOLE_BUGS = {
 }
 
 
+def _upstream_bug(name):
+    sizes, text = UPSTREAM_HOLE_BUGS[name]
+    # stored little-endian, read as this machine's float64
+    points = np.frombuffer(base64.b64decode("".join(text)), dtype="<f8").astype(np.float64).reshape((-1, 2))
+    rings = np.split(points, np.cumsum(sizes)[:-1])
+    exterior, *holes = (np.ascontiguousarray(ring) for ring in rings)
+    return exterior, holes, abs(shoelace(exterior)) - sum(abs(shoelace(hole)) for hole in holes)
+
+
 @pytest.mark.parametrize("name", UPSTREAM_HOLE_BUGS)
 @pytest.mark.xfail(strict=True, reason="earcut 3.2.4 mis-tiles some polygons with holes (upstream)")
 def test_hole_tiling_upstream_bug(name):
     # strict: once upstream's fix is vendored this passes, and fails as an
-    # unexpected pass until this xfail goes and check/fuzz/earcut.cpp asserts exact
-    # tiling with many holes again
-    sizes, text = UPSTREAM_HOLE_BUGS[name]
-    points = np.frombuffer(base64.b64decode("".join(text)), dtype="<f8").reshape((-1, 2))
-    rings = np.split(points, np.cumsum(sizes)[:-1])
-    exterior, *holes = (np.ascontiguousarray(ring) for ring in rings)
+    # unexpected pass until this xfail goes and check/fuzz/triangulate.cpp asserts
+    # exact earcut tiling with many holes again
+    exterior, holes, expected = _upstream_bug(name)
     vertices, faces = trimkit.triangulate(exterior, holes)
-
-    def ring_area(ring):
-        x, y = ring[:, 0], ring[:, 1]
-        return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2
-
-    expected = ring_area(exterior) - sum(ring_area(hole) for hole in holes)
     assert np.isclose(np.abs(areas2d(vertices, faces)).sum(), expected, rtol=0, atol=1e-9)
+
+
+@pytest.mark.parametrize("name", UPSTREAM_HOLE_BUGS)
+def test_cdt_tiles_what_earcut_does_not(name):
+    exterior, holes, expected = _upstream_bug(name)
+    vertices, faces = trimkit.triangulate(exterior, holes, engine=CDT)
+    areas = areas2d(vertices, faces)
+    assert np.all(areas > 0) and np.isclose(areas.sum(), expected, rtol=0, atol=1e-15)

@@ -1,101 +1,94 @@
-// Property: any mesh built from the fuzz input encodes with either method and
-// decodes back with the same faces and points, and with sequential encoding
-// (what our binding uses) in exactly the same order, positions within one
-// quantization step and integers of any size exactly.
-#include <draco/compression/decode.h>
-#include <draco/compression/expert_encode.h>
+// Property: any mesh built from the fuzz input encodes as
+// `trimkit.exchange.draco_encode` does (src/draco.cpp, sequential, so the
+// order is kept) and decodes back with exactly the same faces, positions
+// within one quantization step, and integers of any range draco can hold
+// exactly. A range it can't hold is refused, never written wrong.
+#include "../../src/trimkit.hpp"
+
 #include <fuzzer/FuzzedDataProvider.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <vector>
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     FuzzedDataProvider in(data, size);
     const auto points = in.ConsumeIntegralInRange<std::uint32_t>(3, 300);
-    const auto faces = in.ConsumeIntegralInRange<std::uint32_t>(1, 600);
-    const bool edgebreaker = in.ConsumeBool();
+    const auto face_count = in.ConsumeIntegralInRange<std::uint32_t>(1, 600);
     const int bits = in.ConsumeIntegralInRange<int>(8, 24);
-
-    draco::Mesh mesh;
-    mesh.set_num_points(points);
-    for (std::uint32_t f = 0; f < faces; f++) {
-        draco::Mesh::Face face;
-        for (auto& v : face) {
-            v = draco::PointIndex(in.ConsumeIntegralInRange<std::uint32_t>(0, points - 1));
-        }
-        mesh.AddFace(face);
+    std::vector<std::uint32_t> triangles(3 * std::size_t{face_count});
+    for (std::uint32_t& v : triangles) {
+        v = in.ConsumeIntegralInRange<std::uint32_t>(0, points - 1);
     }
-    draco::GeometryAttribute g;
-    g.Init(draco::GeometryAttribute::POSITION, nullptr, 3, draco::DT_FLOAT32, false, 12, 0);
-    const int id = mesh.AddAttribute(g, true, points);
     std::vector<float> position(3 * std::size_t{points});
     for (float& p : position) {
         p = static_cast<float>(in.ConsumeFloatingPointInRange<double>(-1000.0, 1000.0));
     }
-    mesh.attribute(id)->buffer()->Update(position.data(), static_cast<std::int64_t>(position.size() * 4));
-    draco::GeometryAttribute g_integer;
-    g_integer.Init(draco::GeometryAttribute::GENERIC, nullptr, 1, draco::DT_INT32, false, 4, 0);
-    const int integer_id = mesh.AddAttribute(g_integer, true, points);
-    // the widest range draco can read back (src/draco.cpp refuses the rest), at
-    // either end of int32, and its ends too, which raw bytes would rarely reach
-    const std::int32_t lowest = in.ConsumeBool() ? std::numeric_limits<std::int32_t>::min() : 1;
-    const std::int32_t highest = lowest + (std::numeric_limits<std::int32_t>::max() - 1);
+    // the widest range draco can read back, at either end of int32, and its
+    // ends too, which raw bytes would rarely reach; one more and it refuses
+    const bool too_wide = in.ConsumeIntegralInRange<int>(0, 7) == 0;
+    // (a range one wider starts at int32's lowest, so its highest still fits)
+    const std::int32_t lowest = too_wide || in.ConsumeBool() ? std::numeric_limits<std::int32_t>::min() : 1;
+    const std::int32_t highest = lowest + (std::numeric_limits<std::int32_t>::max() - (too_wide ? 0 : 1));
     const std::int32_t ends[] = {lowest, highest};
     std::vector<std::int32_t> integer(points);
     for (std::int32_t& value : integer) {
         value = in.ConsumeBool() ? in.PickValueInArray(ends) : in.ConsumeIntegralInRange(lowest, highest);
     }
-    mesh.attribute(integer_id)->buffer()->Update(integer.data(), static_cast<std::int64_t>(integer.size() * 4));
-
-    draco::ExpertEncoder encoder(mesh);
-    encoder.SetAttributeQuantization(id, bits);
-    encoder.SetEncodingMethod(edgebreaker ? draco::MESH_EDGEBREAKER_ENCODING : draco::MESH_SEQUENTIAL_ENCODING);
-    draco::EncoderBuffer encoded;
-    if (!encoder.EncodeToBuffer(&encoded).ok()) {
-        return 0;  // e.g. edgebreaker refusing degenerate connectivity
+    integer[0] = lowest;
+    integer[1] = highest;
+    const std::vector<trimkit::DracoAttributeInput> attributes = {
+        {position.data(), trimkit::DracoComponent::FLOAT32, 3}, {integer.data(), trimkit::DracoComponent::INT32, 1}};
+    const std::vector<std::int64_t> kinds = {0, 4};  // POSITION, GENERIC
+    std::vector<char> encoded;
+    try {
+        encoded = trimkit::draco_encode_mesh(triangles, points, attributes, kinds, bits);
+    } catch (const std::invalid_argument&) {
+        if (!too_wide) {
+            __builtin_trap();
+        }
+        return 0;
     }
-    draco::DecoderBuffer buffer;
-    buffer.Init(encoded.data(), encoded.size());
-    draco::Decoder decoder;
-    auto decoded = decoder.DecodeMeshFromBuffer(&buffer);
-    if (!decoded.ok()) {
+    if (too_wide) {
+        __builtin_trap();  // a range draco can't hold must be refused
+    }
+    std::vector<std::int64_t> faces;
+    std::vector<trimkit::DracoAttributeOutput> decoded;
+    try {
+        trimkit::draco_decode_mesh(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size(), {0, 1},
+                                   &faces, &decoded);
+    } catch (const std::invalid_argument&) {
         __builtin_trap();  // draco must read back what it just wrote
     }
-    const auto out = std::move(decoded).value();
-    if (edgebreaker) {
-        return 0;  // edgebreaker may reorder and drop degenerate faces
-    }
-    if (out->num_faces() != faces || out->num_points() != points) {
+    if (faces.size() != triangles.size() || decoded.size() != 2 ||
+        decoded[0].values.size() != position.size() * sizeof(float) ||
+        decoded[1].values.size() != integer.size() * sizeof(std::int32_t)) {
         __builtin_trap();
     }
-    float lo = position[0], hi = position[0];
-    for (const float p : position) {
-        lo = std::min(lo, p);
-        hi = std::max(hi, p);
-    }
-    const double step = (double{hi} - lo) / ((1 << bits) - 1);
-    const draco::PointAttribute* a = out->GetNamedAttribute(draco::GeometryAttribute::POSITION);
-    const draco::PointAttribute* b = out->GetNamedAttribute(draco::GeometryAttribute::GENERIC);
-    for (std::uint32_t p = 0; p < points; p++) {
-        float xyz[3];
-        a->GetMappedValue(draco::PointIndex(p), xyz);
-        for (int c = 0; c < 3; c++) {
-            if (std::abs(double{xyz[c]} - position[(3 * p) + c]) > step + 1e-3) {
-                __builtin_trap();
-            }
-        }
-        std::int32_t value = 0;
-        b->GetMappedValue(draco::PointIndex(p), &value);
-        if (value != integer[p]) {
+    for (std::size_t i = 0; i < faces.size(); i++) {
+        if (faces[i] != triangles[i]) {
             __builtin_trap();
         }
     }
-    for (std::uint32_t f = 0; f < faces; f++) {
-        if (!(out->face(draco::FaceIndex(f)) == mesh.face(draco::FaceIndex(f)))) {
+    const auto [lo, hi] = std::minmax_element(position.begin(), position.end());
+    const double step = (double{*hi} - *lo) / ((1 << bits) - 1);
+    for (std::size_t i = 0; i < position.size(); i++) {
+        float value = 0.0F;
+        std::memcpy(&value, decoded[0].values.data() + (i * sizeof(float)), sizeof(float));
+        if (std::abs(double{value} - position[i]) > step + 1e-3) {
+            __builtin_trap();
+        }
+    }
+    for (std::size_t i = 0; i < integer.size(); i++) {
+        std::int32_t value = 0;
+        std::memcpy(&value, decoded[1].values.data() + (i * sizeof(std::int32_t)), sizeof(std::int32_t));
+        if (value != integer[i]) {
             __builtin_trap();
         }
     }

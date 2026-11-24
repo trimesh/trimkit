@@ -89,7 +89,8 @@ IN_PROCESS = """
     nextafter nextafterf pow round sin sinf sqrt sqrtf
     pthread_create pthread_attr_init pthread_attr_destroy pthread_attr_setdetachstate
     pthread_attr_setstacksize
-    pthread_self pthread_sigmask sigfillset sigdelset pthread_atfork __register_atfork __pthread_key_create
+    pthread_self pthread_setname_np pthread_sigmask sigfillset sigdelset pthread_atfork __register_atfork
+    __pthread_key_create
     pthread_once pthread_mutex_lock pthread_mutex_unlock pthread_cond_wait pthread_cond_broadcast
     sched_getaffinity __sched_cpualloc __sched_cpucount __sched_cpufree sysconf clock_gettime
 """
@@ -116,6 +117,9 @@ def elf_audit(data: bytes, wheel_name: str) -> list[str]:
     """
     if data[4] != 2:
         return ["a 32-bit ELF, which no wheel is"]
+    # every field below is read little-endian: a big-endian ELF would read as nonsense
+    if data[5] != 1:
+        return ["a big-endian ELF, which this reads as little-endian: read it with its own byte order first"]
     machine = struct.unpack_from("<H", data, 0x12)[0]
     phoff, shoff = struct.unpack_from("<QQ", data, 0x20)
     phentsize, phnum, shentsize, shnum = struct.unpack_from("<HHHH", data, 0x36)

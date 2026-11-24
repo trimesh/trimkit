@@ -1,35 +1,32 @@
 """
 Every function releases the GIL, so calls really do run at once: the same
-inputs must give bit-identical answers on 8 threads as they do serially.
+inputs must give bit-identical answers on 8 threads as they do serially. And
+the pool lives through any sequence of calls: sizes in any order, idle gaps
+around its idle exit, one to four callers, forks, Ctrl-C and the exit.
 """
 
+import json
+import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import leaves, run_python, runs_here, small_calls
-
-CASES = small_calls()
+from helpers import CASES, call, cpus_allowed, run_python, runs_here, same_answers
 
 
-def _flatten(result) -> list[np.ndarray]:
-    # every output as raw bytes, so equal means bit-identical
-    raw = [a.encode() if isinstance(a, str) else a for a in leaves(result)]
-    return [np.frombuffer(a if isinstance(a, bytes) else np.atleast_1d(a), np.uint8) for a in raw]
-
-
-@pytest.mark.parametrize("name", CASES)
+@pytest.mark.parametrize("name", sorted(CASES))
 def test_parallel_matches_serial(name):
+    # each public call's small forms, the same answer to the bit on 8 threads at once
     runs_here(name)
-    call = CASES[name]
-    expected = _flatten(call())
+    forms = CASES[name].arguments("small")
+    expected = [call(name, form) for form in forms]
     with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(lambda _: _flatten(call()), range(32)))
-    for result in results:
-        assert len(result) == len(expected)
-        assert all(np.array_equal(a, b) for a, b in zip(result, expected, strict=True))
+        results = list(pool.map(lambda k: call(name, forms[k % len(forms)]), range(32)))
+    for k, result in enumerate(results):
+        assert same_answers(result, expected[k % len(forms)])
 
 
 def test_free_threaded_stays_free():
@@ -49,12 +46,11 @@ def test_shared_scene():
     vertices, faces = sphere(30, 60)
     origins, directions = np.random.default_rng(0).normal(size=(2, 20_000, 3))
     scene = trimkit.RayScene([(vertices, faces)])
-    expected = _flatten(first_hits(scene, origins, directions))
+    expected = first_hits(scene, origins, directions)
     with ThreadPoolExecutor(4) as pool:
-        results = list(pool.map(lambda _: _flatten(first_hits(scene, origins, directions)), range(8)))
+        results = list(pool.map(lambda _: first_hits(scene, origins, directions), range(8)))
     del scene
-    for result in results:
-        assert all(np.array_equal(a, b) for a, b in zip(result, expected, strict=True))
+    assert all(same_answers(result, expected) for result in results)
 
 
 def test_scheduler_stress():
@@ -89,14 +85,11 @@ def test_scheduler_stress():
         lambda: solids.collides(matrices, index),
         lambda: solids.collides(matrices, index, return_distance=True, maximum_contacts=4),
     ]
-    expected = [_flatten(query()) for query in queries]
+    expected = [query() for query in queries]
 
     def mixed(seed: int) -> bool:
         order = np.random.default_rng(seed).permutation(len(queries) * 3) % len(queries)
-        return all(
-            all(np.array_equal(a, b) for a, b in zip(_flatten(queries[q]()), expected[q], strict=True))
-            for q in order
-        )
+        return all(same_answers(queries[q](), expected[q]) for q in order)
 
     with ThreadPoolExecutor(8) as pool:
         assert all(pool.map(mixed, range(16)))
@@ -117,7 +110,7 @@ def test_fork_while_threads_swap_placements():
     # gets the parent's answer, never stuck on a lock a vanished thread held
     import threading
 
-    from helpers import box, first_hits, sphere
+    from helpers import box, first_hits, forked_answer, sphere
 
     import trimkit
 
@@ -129,7 +122,9 @@ def test_fork_while_threads_swap_placements():
         matrices = np.tile(np.eye(4), (20, 1, 1))
         matrices[:, :3, 3] = rng.uniform(-10, 10, (20, 3))
         placements.append(matrices)
-    # few enough rays that a child answers on its own thread alone
+    # few rays, and a child on one CPU, so it answers on its own thread
+    # alone: the pool starts no worker there, at any speed (a sanitizer's
+    # included, which can't follow threads a forked child starts)
     origins = rng.uniform(-15, 15, (32, 3))
     directions = placements[0][rng.integers(0, 20, 32), :3, 3] - origins
     scene = trimkit.RayScene(meshes)
@@ -144,9 +139,13 @@ def test_fork_while_threads_swap_placements():
     for thread in threads:
         thread.start()
     try:
+
+        def child():
+            os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+            return first_hits(scene, origins, directions, placements[0], index)
+
         for _ in range(20):
-            child = lambda: first_hits(scene, origins, directions, placements[0], index)  # noqa: E731
-            answer = _forked_answer(child, expected)
+            answer = forked_answer(child, expected)
             assert answer == b"1", "the child hung" if answer == b"" else "the child answered differently"
     finally:
         stop.set()
@@ -154,161 +153,249 @@ def test_fork_while_threads_swap_placements():
             thread.join()
 
 
-def _forked_answer(query, expected, seconds: float = 30.0) -> bytes:
-    # b"1" if a forked child's `query` gives exactly `expected`, b"0" if not,
-    # b"" if it hangs (it is then killed)
-    import os
-    import select
-    import warnings
+# One sequence of calls in a fresh interpreter, ours alone: every order of
+# sizes, each step every caller at once and then an idle gap, the pool's
+# threads counted throughout. It fails the moment a pool thread starts after
+# one exited with no call since (helpers.PoolCensus), when they outlive twice
+# the idle period after the last call, or a call answers otherwise than alone.
+# Then a fork, Ctrl-C or the interpreter's exit lands inside a long call at
+# `fraction` of it.
+# Prints what it saw as JSON, and for an exit the moment it exits after.
+_SEQUENCE = """
+import _thread, json, os, signal, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+from helpers import CASES, PoolCensus, call, cpus_allowed, long_call, pool_threads, same_answers
 
-    read, write = os.pipe()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        pid = os.fork()
-    if pid == 0:
-        try:
-            same = all(a.tobytes() == b.tobytes() for a, b in zip(query(), expected, strict=True))
-            os.write(write, b"1" if same else b"0")
-        finally:
-            os._exit(0)
-    os.close(write)
+idle, gap, callers, slot = float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+disruption, fraction = sys.argv[6], float(sys.argv[7])
+ORDERS = {
+    "ascending": ["empty", "small", "big"],
+    "descending": ["big", "small", "empty"],
+    "big then small": ["big", "small"],
+    "alternating": ["small", "big", "small", "big"],
+}
+names = sorted(CASES)
+
+
+def arguments(name, size):
+    given = CASES[name].arguments(size)
+    return given[0] if size == "small" else given
+
+
+# each step one public name in turn, a different one in each slot, beside
+# the query that wakes every worker the cap allows when it is big
+steps, turn = [], slot * 7
+for order in ORDERS.values():
+    sizes = []
+    for size in order:
+        name = names[turn % len(names)]
+        turn += 1
+        chosen = [n for n in (name, "RayScene.intersect") if not isinstance(getattr(CASES[n], size), str)]
+        sizes.append([(n, size) for n in dict.fromkeys(chosen)])
+    steps.append(sizes)
+expected = {key: call(key[0], arguments(*key)) for order in steps for step in order for key in step}
+census, seen = PoolCensus(), set()
+
+
+def quiet(seconds):
+    # no call runs: no pool thread may start once one has exited
+    end = time.monotonic() + seconds
+    while True:
+        seen.update(census.between_calls())
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.1, left))
+
+
+def every_caller(step):
+    # every caller makes the step's calls at once, each answering as alone
+    given = [[arguments(*key) for key in step] for _ in range(callers)]
+    together = threading.Barrier(callers)
+    wrong = []
+
+    def caller(k):
+        together.wait()
+        for key, arguments_given in zip(step, given[k]):
+            if not same_answers(call(key[0], arguments_given), expected[key]):
+                wrong.append(key)
+
+    threads = [threading.Thread(target=caller, args=(k,)) for k in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not wrong, f"answered otherwise with {callers} callers: {wrong}"
+
+
+for order in steps:
+    for i, step in enumerate(order):
+        every_caller(step)
+        census.returned()
+        quiet(gap * idle if i + 1 < len(order) else 0.0)
+last = time.monotonic()
+while pool_threads():
+    quiet(0.1)
+    assert time.monotonic() - last < 2 * idle, "pool threads outlived twice the idle period"
+drained = time.monotonic() - last
+# the calls woke workers, or this tested nothing: none exist only on one CPU
+assert seen or cpus_allowed() == 1, "no pool thread was ever seen: still named trimkit?"
+
+# a second here, however many cores, so what lands at a fraction of it lands inside
+query, _ = long_call()
+answer = query()
+took = float("inf")
+for _ in range(2):
+    tic = time.perf_counter()
+    query()
+    took = min(took, time.perf_counter() - tic)
+report = {"drained": drained, "seen": len(seen), "disruption": disruption}
+if disruption == "ctrl-c":
+    # raised, or answered whole, and the next call is the same
+    timer = threading.Timer(fraction * took, _thread.interrupt_main)
+    inside = True
+    timer.start()
     try:
-        ready, _, _ = select.select([read], [], [], seconds)
-        if not ready:
-            os.kill(pid, 9)
-        return os.read(read, 1) if ready else b""
-    finally:
-        os.close(read)
-        os.waitpid(pid, 0)
+        assert same_answers(query(), answer), "Ctrl-C left part of an answer"
+        inside = False
+        # the call finished first: the interrupt lands here, between sleeps
+        for _ in range(1000):
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        report["landed"] = inside
+    timer.join()
+    assert same_answers(query(), answer), "the next call answered otherwise"
+elif disruption == "fork":
+    # a signal handler forks while the query polls for Ctrl-C, its workers
+    # mid-range: the child's query raises or answers whole, and its pool
+    # answers again; the parent's answer is the answer
+    forked, child = [], []
 
+    def fork(signum, frame):
+        if not forked:
+            forked.append(True)
+            if os.fork() == 0:
+                child.append(True)
 
-def test_exit_while_a_daemon_thread_queries():
-    # the interpreter exits while a daemon thread is inside a query big enough
-    # to be on the pool: the module's atexit handler stops it at its next
-    # poll, before CPython finalizes and ends a thread that takes the GIL
-    # (3.12 and 3.13 unwind it on glibc, and end it without unwinding on musl
-    # and Windows), so no worker is left inside a job on a vanished stack.
-    # Each run must exit cleanly, never crash or hang
-    import textwrap
-
-    script = textwrap.dedent(
-        """
-        import sys, threading, time
-        import numpy as np
-        sys.path.insert(0, sys.argv[1])
-        from helpers import sphere
-        import trimkit
-
-        scene = trimkit.RayScene([sphere(60, 120)])
-        origins, directions = np.random.default_rng(0).normal(size=(2, 400_000, 3))
-        started = threading.Event()
-
-        def query():
-            while True:
-                started.set()
-                scene.intersect(origins, directions)
-
-        threading.Thread(target=query, daemon=True).start()
-        started.wait()
-        print(time.monotonic(), flush=True)
-        """
-    )
-    import time
-
-    for _ in range(8):
-        done = run_python(
-            "-c",
-            script,
-            str(Path(__file__).parent),
-            timeout=60,
-        )
-        exited = time.monotonic()
-        assert done.returncode == 0, done.stderr.decode()[-2000:]
-        # from the script's last line to the process gone, finalization included:
-        # well under the 5 s limit the drain once waited out, with room for a
-        # sanitizer's slower finalization (1.6 s under ThreadSanitizer)
-        assert exited - float(done.stdout.split()[-1]) < 3.0, "the exit waited on the daemon's query"
-
-
-@runs_on_after_fork
-def test_fork_from_inside_a_query():
-    # a signal handler runs while a query polls for Ctrl-C, inside the pool
-    # with its workers mid-range, and forks: in the child those workers are
-    # gone with the items they held. The child's query must raise, never
-    # return an answer missing them, and the child's pool must still answer
-    import textwrap
-
-    script = textwrap.dedent(
-        """
-        import os, signal, sys, time
-        import numpy as np
-        sys.path.insert(0, sys.argv[1])
-        from helpers import sphere
-        import trimkit
-
-        scene = trimkit.RayScene([sphere(60, 120)])
-        origins, directions = np.random.default_rng(0).normal(size=(2, 2_000_000, 3))
-        query = lambda: scene.intersect(origins, directions)
-        same = lambda answer: all(a.tobytes() == b.tobytes() for a, b in zip(answer, expected, strict=True))
-        expected = query()
-        # how long a warm query takes: the first starts the workers and faults
-        # its pages in, so a fraction of it can land after a warm one returned
-        took = float("inf")
-        for _ in range(3):
-            tic = time.perf_counter()
-            query()
-            took = min(took, time.perf_counter() - tic)
-        forked, child = [], []
-
-        def fork(signum, frame):
-            if not forked:
-                forked.append(True)
-                if os.fork() == 0:
-                    child.append(True)
-
-        signal.signal(signal.SIGALRM, fork)
-        # the first fork at this fraction of the fastest query, with its workers
-        # inside; the timer repeats, so one lands inside a faster one too
-        signal.setitimer(signal.ITIMER_REAL, float(sys.argv[2]) * took, took / 20)
+    signal.signal(signal.SIGALRM, fork)
+    # the first fork at this fraction of the fastest query; the timer
+    # repeats, so one lands inside a faster one too, and a query the
+    # machine ran faster than it measured is tried again, sooner
+    for attempt in range(6):
+        signal.setitimer(signal.ITIMER_REAL, fraction * took / 2**attempt, took / 20)
         try:
-            outcome = "same" if same(query()) else "different"
+            outcome = "same" if same_answers(query(), answer) else "different"
         except RuntimeError:
             outcome = "raised"
         signal.setitimer(signal.ITIMER_REAL, 0)
-        if not child:
-            # the parent: its answer is the answer, and the child exited cleanly
-            assert forked, "the timer never fired inside the query"
-            assert outcome == "same", outcome
-            _, status = os.wait()
-            if status != 0:
-                # how it ended: an exit code, or minus the signal that killed it
-                sys.exit(f"the child ended with {os.waitstatus_to_exitcode(status)}")
-            sys.exit(0)
-        os.write(1, f"{outcome} {same(query())}".encode())
+        if forked:
+            break
+    if child:
+        os.write(1, json.dumps({"child": outcome, "again": same_answers(query(), answer)}).encode() + b"\\n")
         os._exit(0)
-        """
-    )
-    outcomes = []
-    for fraction in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6):
+    assert forked, "the timer never fired inside the query"
+    assert outcome == "same", outcome
+    _, status = os.wait()
+    assert status == 0, f"the child ended with {os.waitstatus_to_exitcode(status)}"
+print(json.dumps(report), flush=True)
+if disruption == "exit":
+    # the interpreter exits while a daemon thread is inside a query on the
+    # pool: the atexit handler stops it at its next poll, before CPython
+    # finalizes, so no worker is left inside a job on a vanished stack
+    started = threading.Event()
+
+    def forever():
+        while True:
+            started.set()
+            query()
+            os.write(1, b"answered\\n")
+
+    threading.Thread(target=forever, daemon=True).start()
+    started.wait()
+    time.sleep(fraction * took)
+    # at 10% to 50% of a query: one that answers after this line is one the
+    # exit waited for, however fast or slow this machine is
+    os.write(1, b"exiting\\n")
+"""
+
+
+def idle_exit_seconds() -> float:
+    """
+    How long a pool thread runs nothing before it exits: IDLE_EXIT_MS, as
+    src/parallel.hpp sets it.
+    """
+    source = (Path(__file__).parents[2] / "src" / "parallel.hpp").read_text()
+    milliseconds = re.search(r"IDLE_EXIT_MS\s*=[^;]*?([\d']+)\s*;", source)[1]
+    return int(milliseconds.replace("'", "")) / 1000
+
+
+@pytest.mark.timing
+@pytest.mark.skipif(sys.platform != "linux", reason="counts threads in /proc; forks inside a call (POSIX)")
+def test_sequences_of_calls():
+    # the product of every order of sizes, idle gaps either side of the
+    # pool's idle exit, and one to four callers at once, each a fresh
+    # interpreter, four at once: each peaks near 140 MB on 16 cores, beside a
+    # suite that may hold 1 GB (Mesa's Vulkan device, once a test opened it),
+    # within the gate's 2 GB.
+    # Then in each a fork, Ctrl-C or the exit lands in a long call at a
+    # fraction of it
+
+    idle = idle_exit_seconds()
+    runs = [(gap, callers) for gap in (1.05, 0.95, 0.5, 0.0) for callers in (1, 2, 3, 4)]
+    kinds = ("fork", "exit", "ctrl-c")
+
+    def one(slot: int):
+        gap, callers = runs[slot]
+        kind = kinds[slot % 3]
+        # an exit lands by half a query: a query that ran faster than the
+        # fastest measured, and finished in the moment between "exiting" and
+        # the exit's stop, would answer after it with nothing at fault
+        fraction = (slot % 8 + 1) / 10 if kind != "exit" else (slot % 5 + 1) / 10
         done = run_python(
             "-W",
             "ignore",
             "-c",
-            script,
+            _SEQUENCE,
             str(Path(__file__).parent),
+            str(idle),
+            str(gap),
+            str(callers),
+            str(slot),
+            kind,
             str(fraction),
-            timeout=120,
+            text=True,
+            timeout=300,
         )
-        assert done.returncode == 0, done.stderr.decode()[-2000:]
-        outcome, again = done.stdout.decode().split()
-        assert outcome in ("same", "raised"), "the child's query returned an answer missing items"
-        assert again == "True", "the child's pool answered differently afterwards"
-        outcomes.append(outcome)
-    # at least one fork landed inside a published job, or nothing here was tested
-    if (__import__("os").cpu_count() or 1) > 1:
-        assert "raised" in outcomes, f"no fork landed inside a published job: {outcomes}"
+        return done
+
+    with ThreadPoolExecutor(4) as pool:
+        finished = list(pool.map(one, range(len(runs))))
+    landed = {kind: [] for kind in kinds}
+    for slot, done in enumerate(finished):
+        assert done.returncode == 0, f"gap and callers {runs[slot]}:\n{done.stderr[-3000:]}"
+        lines = [json.loads(line) for line in done.stdout.splitlines() if line.startswith("{")]
+        report = next(line for line in lines if "disruption" in line)
+        children = [line for line in lines if "child" in line]
+        if report["disruption"] == "fork":
+            (child,) = children
+            assert child["child"] in ("same", "raised"), "the child's query returned an answer missing items"
+            assert child["again"], "the child's pool answered otherwise afterwards"
+            landed["fork"].append(child["child"] == "raised")
+        elif report["disruption"] == "exit":
+            # the daemon's query stopped, not finished: nothing answered once
+            # the exit began
+            after = done.stdout.split("exiting\n", 1)
+            assert len(after) == 2 and "answered" not in after[1], "the exit waited on the daemon's query"
+            landed["exit"].append(True)
+        else:
+            landed["ctrl-c"].append(report["landed"])
+    # at least one of each landed inside a call, or nothing here tested it
+    several = cpus_allowed() > 1
+    assert any(landed["ctrl-c"]) and landed["exit"], landed
+    assert any(landed["fork"]) or not several, f"no fork landed inside a published job: {landed['fork']}"
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="needs fork")
 def test_forked_child_exits_promptly():
     # a parent thread is inside a query when the main thread forks: the
@@ -322,18 +409,19 @@ def test_forked_child_exits_promptly():
         import os, sys, threading, time
         import numpy as np
         sys.path.insert(0, sys.argv[1])
-        from helpers import sphere
-        import trimkit
+        from helpers import long_call
 
-        scene = trimkit.RayScene([sphere(60, 120)])
-        origins, directions = np.random.default_rng(0).normal(size=(2, 400_000, 3))
+        # a second or more here, however many cores, so the forks below land
+        # inside the call that follows the first one
+        call, _ = long_call()
         busy = threading.Event()
         stop = threading.Event()
 
         def query():
+            call()
             while not stop.is_set():
                 busy.set()
-                scene.intersect(origins, directions)
+                call()
 
         thread = threading.Thread(target=query)
         thread.start()
@@ -374,7 +462,7 @@ def test_workers_follow_affinity_as_it_widens():
     # first call saw)
     import textwrap
 
-    if len(__import__("os").sched_getaffinity(0)) < 2:
+    if cpus_allowed() < 2:
         pytest.skip("needs two CPUs")
     script = textwrap.dedent(
         """

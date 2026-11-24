@@ -1,4 +1,4 @@
-// A RayScene on a Vulkan device, behind four functions: put a scene's meshes
+// A ray scene (bvh.cpp's RayMeshes) on a Vulkan device, behind four functions: put a scene's meshes
 // on it, put a top level beside them, trace rays against both, and free what
 // was put. src/bvh.cpp is the only caller and knows nothing else of Vulkan;
 // src/vulkan/vulkan.hpp is the device itself.
@@ -10,7 +10,7 @@
 // takes no lock at all (see `DeviceArrays`).
 #pragma once
 
-#include "../common.hpp"
+#include "../trimkit.hpp"
 #include "vulkan.hpp"
 
 #include <algorithm>
@@ -244,7 +244,8 @@ inline bool has_denormal(const float* values, std::size_t count) {
 // dtype decides, and nothing about one chunk decides another's. False for a
 // value no ray may hold: the one look these values get on their way to a
 // device (`count_beyond`, the scan every input gets, made as they are copied)
-inline bool fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::size_t count, std::uint32_t* stride) {
+inline bool fill_rows(const RayVectors& rays, void* chunk, std::size_t begin, std::size_t count,
+                      std::uint32_t* stride) {
     double* wide = static_cast<double*>(chunk);
     if (rays.one) {
         double row[3];
@@ -256,7 +257,7 @@ inline bool fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::siz
     if (!rays.is_float32) {
         *stride = STRIDE_WIDE;
         const double* given = static_cast<const double*>(rays.data) + (3 * begin);
-        in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
+        in_blocks(count, [&](std::size_t from, std::size_t to) {
             beyond.fetch_add(count_beyond(given + (3 * from), 3 * (to - from), COORDINATE_LIMIT, wide + (3 * from)),
                              std::memory_order_relaxed);
         });
@@ -266,7 +267,7 @@ inline bool fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::siz
     float* narrow = static_cast<float*>(chunk);
     std::atomic<bool> denormal{false};
     *stride = STRIDE_NARROW;
-    in_blocks_without_gil(count, [&](std::size_t from, std::size_t to) {
+    in_blocks(count, [&](std::size_t from, std::size_t to) {
         beyond.fetch_add(count_beyond(given + (3 * from), 3 * (to - from), COORDINATE_LIMIT, narrow + (3 * from)),
                          std::memory_order_relaxed);
         if (has_denormal(given + (3 * from), 3 * (to - from))) {
@@ -295,8 +296,8 @@ inline bool fill_rows(const Rays& rays, void* chunk, std::size_t begin, std::siz
 // running on the device either way. Called with the GIL released
 template <typename Consume>
 bool trace(const DeviceArrays& scene, const DeviceArrays* top, std::uint32_t mesh, double extent, bool occlusion,
-           std::size_t most, const Rays& origins, const Rays& directions, std::size_t count, const Consume& consume,
-           std::string* reason) {
+           std::size_t most, const RayVectors& origins, const RayVectors& directions, std::size_t count,
+           const Consume& consume, std::string* reason) {
     Query query;
     query.scene = &scene.arrays;
     query.top = top != nullptr ? &top->arrays : nullptr;

@@ -4,12 +4,24 @@ CPU answering with a warning when no device can.
 """
 
 import os
+import sys
 import textwrap
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
-from helpers import box, camera, cycloidal, device_scene, exploded, run_python, same, sphere, subdivided
+from helpers import (
+    box,
+    camera,
+    cycloidal,
+    device_scene,
+    exploded,
+    run_python,
+    same_answers,
+    sphere,
+    subdivided,
+)
 
 import trimkit
 
@@ -46,11 +58,11 @@ def test_device_answers_the_cpu_answers(mesh, device_required):
     for seed in range(3):
         origins, directions = rays(5000, seed)
         for maximum_hits in (None, 1, 3):
-            same(
+            assert same_answers(
                 cpu.intersect(origins, directions, maximum_hits=maximum_hits),
                 gpu.intersect(origins, directions, maximum_hits=maximum_hits),
             )
-        same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
+        assert same_answers(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
 
 
 def test_device_answers_through_instances(device_required):
@@ -61,16 +73,16 @@ def test_device_answers_through_instances(device_required):
     index = np.arange(30, dtype=np.int64) % 3
     origins, directions = rays(20000, 11)
     for maximum_hits in (None, 1, 2):
-        same(
+        assert same_answers(
             cpu.intersect(origins, directions, matrices, index, maximum_hits=maximum_hits),
             gpu.intersect(origins, directions, matrices, index, maximum_hits=maximum_hits),
         )
-    same(
+    assert same_answers(
         cpu.intersect_any(origins, directions, matrices, index),
         gpu.intersect_any(origins, directions, matrices, index),
     )
     # and the default placement, each mesh once
-    same(cpu.intersect(origins, directions), gpu.intersect(origins, directions))
+    assert same_answers(cpu.intersect(origins, directions), gpu.intersect(origins, directions))
 
 
 def adversarial_rays(vertices, faces):
@@ -110,17 +122,17 @@ def test_device_agrees_on_every_decision_boundary(mesh, device_required):
     gpu = device_scene([mesh], device_required)
     origins, directions = adversarial_rays(*mesh)
     for maximum_hits in (None, 1):
-        same(
+        assert same_answers(
             cpu.intersect(origins, directions, maximum_hits=maximum_hits),
             gpu.intersect(origins, directions, maximum_hits=maximum_hits),
         )
-    same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
+    assert same_answers(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
     # and through instances that move the boundaries by exact amounts
     matrices = np.tile(np.eye(4), (3, 1, 1))
     matrices[1, :3, 3] = [0.5, -0.25, 0.125]
     matrices[2, 0, 0] = 2.0
     index = np.zeros(3, dtype=np.int64)
-    same(
+    assert same_answers(
         cpu.intersect(origins, directions, matrices, index),
         gpu.intersect(origins, directions, matrices, index),
     )
@@ -144,10 +156,10 @@ def test_one_origin_or_direction_is_every_rays(device_required):
             expected = cpu.intersect(*repeated, maximum_hits=maximum_hits)
             assert len(expected[0]) > 0
             for scene in (cpu, gpu):
-                same(expected, scene.intersect(*one, maximum_hits=maximum_hits))
-                same(expected, scene.intersect(*repeated, maximum_hits=maximum_hits))
+                assert same_answers(expected, scene.intersect(*one, maximum_hits=maximum_hits))
+                assert same_answers(expected, scene.intersect(*repeated, maximum_hits=maximum_hits))
         for scene in (cpu, gpu):
-            same(cpu.intersect_any(*repeated), scene.intersect_any(*one))
+            assert same_answers(cpu.intersect_any(*repeated), scene.intersect_any(*one))
 
 
 def test_device_answers_many_crossings_per_ray(device_required):
@@ -166,7 +178,7 @@ def test_device_answers_many_crossings_per_ray(device_required):
     directions = rng.normal(size=(3000, 3)) * 0.01
     directions[:, 2] = 1.0
     for maximum_hits in (None, 2, 5):
-        same(
+        assert same_answers(
             cpu.intersect(origins, directions, matrices, index, maximum_hits=maximum_hits),
             gpu.intersect(origins, directions, matrices, index, maximum_hits=maximum_hits),
         )
@@ -196,7 +208,7 @@ def test_device_lays_out_crossings_at_group_edges(count, device_required):
     origins[-1, 0] = 7.0
     directions = np.array([0.0, 0.0, 1.0])
     cpu = trimkit.RayScene([mesh]).intersect(origins, directions)
-    same(cpu, device_scene([mesh], device_required).intersect(origins, directions))
+    assert same_answers(cpu, device_scene([mesh], device_required).intersect(origins, directions))
     assert np.array_equal(np.bincount(cpu[0]), [3] * (count - 1) + [4])
     assert np.array_equal(cpu[3][-4:], [1.0, 2.0, 3.0, 4.0])
 
@@ -213,8 +225,54 @@ def test_device_runs_a_chunk_again_when_its_log_is_too_small(device_required):
         expected = trimkit.RayScene([mesh]).intersect(origins, directions)
         assert len(expected[0]) == crossings * count
         gpu = device_scene([mesh], device_required)
-        same(expected, gpu.intersect(origins, directions))
-        same(expected, gpu.intersect(origins, directions))
+        assert same_answers(expected, gpu.intersect(origins, directions))
+        assert same_answers(expected, gpu.intersect(origins, directions))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads its memory from /proc")
+def test_a_grown_log_goes_back_after_its_query(device_required):
+    # a query of ten crossings a ray grows each chunk's log to about 125 MB;
+    # once it returns the logs go back to the size a device opens with, so
+    # the process holds no more than it did. In a child with one malloc arena
+    # and Mesa's device on one thread, so freed memory leaves no residue to
+    # mistake for a log kept. Under ASan, its allocator holds nothing back
+    # either: no quarantine, so a freed log is unmapped when it is freed
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        import numpy as np
+        import trimkit
+        from helpers import resident
+        from test_gpu import sheets
+        count = 300_003
+        origins = np.column_stack([np.linspace(-8, 8, count), np.full(count, 2.5), np.zeros(count)])
+        directions = np.array([0.0, 0.0, 1.0])
+        opened = trimkit.RayScene([sheets([(-9, 9)])], use_gpu=True)
+        opened.intersect(origins[:10], directions)
+        before = resident()
+        for crossings in (6, 10, 2):
+            scene = trimkit.RayScene([sheets([(-9, 9)] * crossings)], use_gpu=True)
+            answer = scene.intersect(origins, directions)
+            assert len(answer[0]) == crossings * count
+            del answer, scene
+        print(resident() - before)
+        """
+    )
+    environment = {
+        **os.environ,
+        "LP_NUM_THREADS": "0",
+        "GLIBC_TUNABLES": "glibc.malloc.tcache_count=0:glibc.malloc.arena_max=1",
+        "ASAN_OPTIONS": ":".join(
+            filter(
+                None,
+                [os.environ.get("ASAN_OPTIONS"), "quarantine_size_mb=0", "thread_local_quarantine_size_kb=0"],
+            )
+        ),
+    }
+    device_scene([box()], device_required)  # a skip, or a failure, without one
+    done = run_python("-W", "error", "-c", script, str(Path(__file__).parent), env=environment, check=True)
+    assert int(done.stdout) < 128 << 20, f"{int(done.stdout) >> 20} MB more after the query: a grown log kept"
 
 
 def test_device_orders_mixed_crossing_counts_across_chunks(device_required):
@@ -233,13 +291,13 @@ def test_device_orders_mixed_crossing_counts_across_chunks(device_required):
     gpu = device_scene([mesh], device_required)
     expected = cpu.intersect(origins, directions)
     assert np.array_equal(np.bincount(expected[0], minlength=count), wanted)
-    same(expected, gpu.intersect(origins, directions))
+    assert same_answers(expected, gpu.intersect(origins, directions))
     for maximum_hits in (1, 5, 40):
-        same(
+        assert same_answers(
             cpu.intersect(origins, directions, maximum_hits=maximum_hits),
             gpu.intersect(origins, directions, maximum_hits=maximum_hits),
         )
-    same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
+    assert same_answers(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
 
 
 @pytest.mark.parametrize("count", [5008, 300_016])
@@ -274,8 +332,8 @@ def test_device_holds_a_tree_built_with_splits(device_required):
     directions = middle - origins + rng.normal(size=(20000, 3)) * size * 0.2
     expected = cpu.intersect(origins, directions)
     assert len(expected[0]) > 20000
-    same(expected, gpu.intersect(origins, directions))
-    same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
+    assert same_answers(expected, gpu.intersect(origins, directions))
+    assert same_answers(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
 
 
 def test_device_answers_a_real_assembly(device_required):
@@ -293,14 +351,16 @@ def test_device_answers_a_real_assembly(device_required):
             directions = camera(position, middle, 200)
             expected = cpu.intersect(position, directions, placed, index)
             assert len(np.unique(expected[0])) > 1000 and np.bincount(expected[0]).max() > 4
-            same(expected, gpu.intersect(position, directions, placed, index))
+            assert same_answers(expected, gpu.intersect(position, directions, placed, index))
             # the rays that hit at all, by every query
             hit = np.unique(expected[0])
             blocked = cpu.intersect_any(position, directions, placed, index)
             assert np.array_equal(np.flatnonzero(blocked), hit)
-            same(blocked, gpu.intersect_any(position, directions, placed, index))
+            assert same_answers(blocked, gpu.intersect_any(position, directions, placed, index))
             for scene in (cpu, gpu):
-                same(hit, scene.intersect(position, directions, placed, index, maximum_hits=1)[0])
+                assert same_answers(
+                    hit, scene.intersect(position, directions, placed, index, maximum_hits=1)[0]
+                )
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, 1e31])
@@ -394,15 +454,15 @@ def test_device_agrees_on_axis_aligned_rays(mesh, device_required):
     origins, directions = axis_rays(mesh[0].min(axis=0), mesh[0].max(axis=0), 29)
     expected = cpu.intersect(origins, directions)
     assert len(np.unique(expected[0])) > 1000
-    same(expected, gpu.intersect(origins, directions))
+    assert same_answers(expected, gpu.intersect(origins, directions))
     nearest = cpu.intersect(origins, directions, maximum_hits=1)
-    same(nearest, gpu.intersect(origins, directions, maximum_hits=1))
-    same(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
+    assert same_answers(nearest, gpu.intersect(origins, directions, maximum_hits=1))
+    assert same_answers(cpu.intersect_any(origins, directions), gpu.intersect_any(origins, directions))
     # one direction for every ray: an orthographic view down each axis
     for axis in range(3):
         for down in ([0.0, 0.0], [-0.0, 0.0], [-0.0, -0.0]):
             direction = np.insert(down, axis, -1.0)
-            same(cpu.intersect(origins, direction), gpu.intersect(origins, direction))
+            assert same_answers(cpu.intersect(origins, direction), gpu.intersect(origins, direction))
 
 
 def test_device_agrees_on_axis_aligned_rays_through_instances(device_required):
@@ -422,9 +482,9 @@ def test_device_agrees_on_axis_aligned_rays_through_instances(device_required):
     origins, directions = axis_rays([-4, -4, -4], [5, 5, 5], 37)
     expected = cpu.intersect(origins, directions, matrices, index)
     assert len(np.unique(expected[0])) > 500
-    same(expected, gpu.intersect(origins, directions, matrices, index))
+    assert same_answers(expected, gpu.intersect(origins, directions, matrices, index))
     blocked = cpu.intersect_any(origins, directions, matrices, index)
-    same(blocked, gpu.intersect_any(origins, directions, matrices, index))
+    assert same_answers(blocked, gpu.intersect_any(origins, directions, matrices, index))
 
 
 def test_rays_are_float64_or_float32(device_required):
@@ -452,8 +512,8 @@ def test_rays_are_float64_or_float32(device_required):
                 expected = cpu.intersect(*wide)
                 assert len(expected[0]) > 100
                 for scene in (cpu, gpu):
-                    same(expected, scene.intersect(*given))
-                    same(cpu.intersect_any(*wide), scene.intersect_any(*given))
+                    assert same_answers(expected, scene.intersect(*given))
+                    assert same_answers(cpu.intersect_any(*wide), scene.intersect_any(*given))
 
 
 def test_device_widens_what_float32_cannot_hold(device_required):
@@ -471,18 +531,18 @@ def test_device_widens_what_float32_cannot_hold(device_required):
     for name, at, value in losses:
         given = {"origins": origins.copy(), "directions": directions.copy()}
         given[name][at, 1] = value
-        same(cpu.intersect(**given), gpu.intersect(**given))
+        assert same_answers(cpu.intersect(**given), gpu.intersect(**given))
     # float32 arrays with denormals and zeros of both signs in them
     narrow = {"origins": origins.astype(np.float32), "directions": directions.astype(np.float32)}
     narrow["origins"][::7, 0] = np.resize(np.float32([1e-40, -1e-40, 0.0, -0.0, 1e-45]), len(origins[::7]))
     narrow["directions"][3::11, 2] = np.float32(-0.0)
     expected = cpu.intersect(narrow["origins"].astype(np.float64), narrow["directions"].astype(np.float64))
     for scene in (cpu, gpu):
-        same(expected, scene.intersect(**narrow))
+        assert same_answers(expected, scene.intersect(**narrow))
     # and a query of each width after the other, in the same chunks
     wide = (origins + 0.1, directions)
     for given in ((origins, directions), wide, (narrow["origins"], narrow["directions"])):
-        same(cpu.intersect_any(*given), gpu.intersect_any(*given))
+        assert same_answers(cpu.intersect_any(*given), gpu.intersect_any(*given))
 
 
 def test_closed_mesh_is_watertight_on_the_device(device_required):
@@ -518,7 +578,7 @@ def test_threads_share_a_device_scene(device_required):
         t.join()
     assert not errors
     for result in results:
-        same(expected, result)
+        assert same_answers(expected, result)
 
 
 def test_threads_never_deadlock_on_the_device(device_required):
@@ -603,7 +663,9 @@ def test_without_a_device_the_cpu_answers_with_a_warning():
             hit = scene.intersect_any(origins, directions)
         assert len(caught) == 1, [str(w.message) for w in caught]
         message = str(caught[0].message)
-        assert message.startswith("use_gpu: no Vulkan"), message
+        # a big-endian machine never reaches the loader: its own reason first
+        reason = "no Vulkan" if sys.byteorder == "little" else "the device path reads 64-bit words"
+        assert message.startswith("use_gpu: " + reason), message
         assert "the CPU" in message, message
         cpu = trimkit.RayScene([mesh])
         for a, b in zip(answer, cpu.intersect(origins, directions), strict=True):

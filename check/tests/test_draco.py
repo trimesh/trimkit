@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 import pytest
-from helpers import LITTLE_ENDIAN, runs_here
+from helpers import LITTLE_ENDIAN
 
 import trimkit
 
@@ -77,6 +77,20 @@ MALFORMED = bytes.fromhex(
 )
 
 
+def test_attributes_in_the_other_byte_order_encode_the_same():
+    # an attribute takes any glTF component type as it is, and one in the
+    # other byte order is the same values: converted once, with the warning
+    # naming it, to the same buffer
+    faces, attributes, kinds, _ = primitive()
+    expected = trimkit.exchange.draco_encode(faces, attributes, kinds)
+    for i, value in enumerate(attributes):
+        if value.dtype.itemsize == 1:
+            continue
+        swapped = [*attributes[:i], value.astype(value.dtype.newbyteorder()), *attributes[i + 1 :]]
+        with pytest.warns(UserWarning, match=rf"attributes\[{i}\]: .* converted to"):
+            assert trimkit.exchange.draco_encode(faces, swapped, kinds) == expected
+
+
 def test_decode_refuses_an_attribute_that_names_values_it_does_not_hold():
     # once a segfault: every value read is now checked against what is held
     buffer = np.frombuffer(MALFORMED, dtype=np.uint8)
@@ -128,6 +142,7 @@ def test_corrupt_buffers_raise_not_crash():
     faces, attributes, kinds, _ = primitive(200)
     buffer = trimkit.exchange.draco_encode(faces, attributes, kinds)
     rng = np.random.default_rng(1)
+    decoded = refused = 0
     for i in range(300):
         if i % 2:
             corrupt = buffer[: rng.integers(0, len(buffer))]
@@ -139,9 +154,13 @@ def test_corrupt_buffers_raise_not_crash():
         try:
             decoded_faces, (position,) = trimkit.exchange.draco_decode(corrupt, np.array([0], dtype=np.int64))
         except ValueError:
+            refused += 1
             continue
+        decoded += 1
         # a buffer that still decodes must still be internally consistent
-        assert decoded_faces.max(initial=-1) < len(position)
+        assert decoded_faces.min(initial=0) >= 0 and decoded_faces.max(initial=-1) < len(position)
+    # both, or the loop checked only one side of it
+    assert decoded > 0 and refused > 0, (decoded, refused)
 
 
 def test_empty_primitive_refused():
@@ -166,7 +185,6 @@ def test_attribute_without_components_refused():
 def test_quantization_bits_bound_the_error(name, bits):
     # the one thing that decides how much precision survives: at any bits, no
     # value moves past half a step across the extent, and 0 keeps every bit
-    runs_here("exchange.draco_encode")
     kind = trimkit.exchange.DracoKind[name]
     value = np.random.default_rng(bits).random((500, 3)).astype(np.float32) * 10
     faces = np.arange(498, dtype=np.int64).reshape((-1, 3))
@@ -181,7 +199,6 @@ def test_quantization_bits_bound_the_error(name, bits):
 
 
 def test_quantization_bits_only_touch_floats():
-    runs_here("exchange.draco_encode")
     value = np.random.default_rng(0).integers(0, 200, (30, 3)).astype(np.uint8)
     faces = np.arange(30, dtype=np.int64).reshape((-1, 3))
     kind = np.array([trimkit.exchange.DracoKind.COLOR], np.int64)
@@ -200,7 +217,6 @@ def test_quantization_bits_only_touch_floats():
     ],
 )
 def test_integers_of_the_widest_range_round_trip(value):
-    runs_here("exchange.draco_encode")
     faces = np.arange(len(value), dtype=np.int64).reshape((-1, 3))
     kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
     buffer = trimkit.exchange.draco_encode(faces, [value], kind)
@@ -223,7 +239,6 @@ RANGE_TOO_WIDE = "attributes\\[0\\] has a range of integers over 2\\*\\*31 - 2"
     ],
 )
 def test_integers_draco_cannot_store_refused(value, message):
-    runs_here("exchange.draco_encode")
     faces = np.arange(6, dtype=np.int64).reshape((-1, 3))
     kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
     with pytest.raises(ValueError, match="draco failed to encode: " + message):
@@ -233,18 +248,9 @@ def test_integers_draco_cannot_store_refused(value, message):
 @pytest.mark.timing
 def test_wide_integers_cost_no_table():
     # 8 GiB and 3.6 s here, before draco-symbol-encoding.patch
-    runs_here("exchange.draco_encode")
     kind = np.array([trimkit.exchange.DracoKind.GENERIC], np.int64)
     value = np.random.default_rng(0).integers(0, 2**31 - 1, 498, dtype=np.int64).astype(np.uint32)
     faces = np.arange(498, dtype=np.int64).reshape((-1, 3))
     start = time.perf_counter()
     trimkit.exchange.draco_encode(faces, [value], kind)
     assert time.perf_counter() - start < 0.5
-
-
-@pytest.mark.parametrize("bad", [-1, 25, 30])
-def test_quantization_bits_refused(bad):
-    faces = np.zeros((1, 3), np.int64)
-    kind = np.array([trimkit.exchange.DracoKind.POSITION], np.int64)
-    with pytest.raises(ValueError, match="quantization_bits"):
-        trimkit.exchange.draco_encode(faces, [np.zeros((1, 3), np.float32)], kind, quantization_bits=bad)

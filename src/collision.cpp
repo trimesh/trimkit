@@ -1,8 +1,8 @@
 // Collision and distance queries between rigidly placed triangle meshes, with
-// coal-library/coal.
+// coal-library/coal. Python-free (trimkit.hpp).
 //
-// A `CollisionScene` builds each of its meshes once: an OBBRSS bounding volume
-// hierarchy over its triangles and, when it is declared convex, a coal
+// A `CollisionMeshes` builds each of its meshes once: an OBBRSS bounding
+// volume hierarchy over its triangles and, when it is declared convex, a coal
 // convex shape whose support walks the hull. It only holds meshes: every
 // query carries its own instances (which mesh, placed where), so nothing
 // about a scene ever changes after it is built, and threads may share one
@@ -15,7 +15,7 @@
 // `RelativeTransformationIsIdentity == 0` traversal nodes are used: the
 // default ones rewrite the shared mesh's vertices into the other's frame.
 
-#include "common.hpp"
+#include "trimkit.hpp"
 
 #include <coal/BVH/BVH_model.h>
 #include <coal/broadphase/broadphase_callbacks.h>
@@ -31,9 +31,6 @@
 // coal's sources/: collide and distance over a traversal node
 #include <collision_node.h>
 
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/variant.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -45,22 +42,14 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {
 
-// every mesh convex or none, or a mask of which
-using ConvexArg = std::variant<trimkit::Flag, trimkit::Array<bool, -1>>;
-using PairsArg = trimkit::Array<std::int64_t, -1, 2>;
 using Model = coal::BVHModel<coal::OBBRSS>;
 using Convex = coal::ConvexTpl<coal::Triangle32>;
 using MeshConvexCollision = coal::MeshShapeCollisionTraversalNode<coal::OBBRSS, coal::ConvexBase32, 0>;
 using MeshConvexDistance = coal::MeshShapeDistanceTraversalNodeOBBRSS<coal::ConvexBase32>;
-using FacesArg = trimkit::Array<std::int64_t, -1, 2>;
-using DistancesArg = trimkit::Array<double, -1>;
-using PointsArg = trimkit::Array<double, -1, 2, 3>;
-using NormalsArg = trimkit::Array<double, -1, 3>;
 
 // a dropped template argument would select the overloads that write to the
 // shared model, so pin the read-only ones here (the OBBRSS mesh/convex
@@ -69,50 +58,59 @@ static_assert(coal::MeshCollisionTraversalNodeOBBRSS::RTIsIdentity == 0, "collis
 static_assert(coal::MeshDistanceTraversalNodeOBBRSS::RTIsIdentity == 0, "distance must not move the model");
 static_assert(MeshConvexCollision::RTIsIdentity == 0, "collision must not move the model");
 
-// One mesh of a CollisionScene, built once however often its queries place it
-class CollisionMesh {
+}  // namespace
+
+// One mesh of a CollisionMeshes, built once however often its queries place it
+class trimkit::CollisionMesh {
 public:
-    CollisionMesh(const trimkit::Mesh<std::uint32_t>& mesh, bool convex, const std::string& name)
-        : face_count_(mesh.faces.size() / 3) {
-        // a convex mesh is taken at its word: coal measures it as a solid,
-        // walking its faces' edges to the vertex farthest along each
-        // direction, so it needs faces, but whether they bound a convex
-        // solid is the caller's promise to keep (an untrue one gives wrong
-        // distances, never a crash)
-        if (convex && face_count_ == 0) {
-            trimkit::value_error(name + " is convex, so it needs faces");
-        }
-        if (face_count_ > 0) {
-            const trimkit::GilReleased release;
-            build(mesh.vertices.data(), mesh.vertices.shape(0), mesh.faces, convex);
-        } else {
+    explicit CollisionMesh(const CollisionMeshInput& mesh) : face_count_(mesh.face_count) {
+        if (face_count_ == 0) {
             // no model holds them, so a pickle can still give them back
-            loose_vertices_.assign(mesh.vertices.data(), mesh.vertices.data() + (3 * mesh.vertices.shape(0)));
+            loose_vertices_.assign(mesh.vertices, mesh.vertices + (3 * mesh.vertex_count));
+            return;
+        }
+        // in coal's layout for addSubModel to copy into the model, which then
+        // holds the only copy kept: the convex shape shares the model's
+        std::vector<coal::Vec3s> vertices(mesh.vertex_count);
+        for (std::size_t v = 0; v < mesh.vertex_count; v++) {
+            vertices[v] = coal::Vec3s(mesh.vertices[3 * v], mesh.vertices[(3 * v) + 1], mesh.vertices[(3 * v) + 2]);
+        }
+        std::vector<coal::Triangle32> triangles(face_count_);
+        for (std::size_t f = 0; f < face_count_; f++) {
+            triangles[f] = coal::Triangle32(mesh.faces[3 * f], mesh.faces[(3 * f) + 1], mesh.faces[(3 * f) + 2]);
+        }
+        const PointBounds bounds = bounds_of(mesh.vertices, mesh.vertex_count);
+        center_half(bounds.lowest, bounds.highest, box_.data());
+        model_ = std::make_shared<Model>();
+        model_->beginModel(static_cast<unsigned int>(face_count_), static_cast<unsigned int>(mesh.vertex_count));
+        model_->addSubModel(vertices, triangles);
+        model_->endModel();
+        if (mesh.convex) {
+            convex_ = std::make_unique<Convex>(model_->vertices, static_cast<unsigned int>(mesh.vertex_count),
+                                               model_->tri_indices, static_cast<unsigned int>(face_count_));
+            convex_->computeLocalAABB();  // the center its GJK starts from
         }
     }
 
     // the mesh as it was given: the model's own copy, in the order given
-    nb::tuple as_given() const {
-        std::vector<double> vertices = loose_vertices_;
-        std::vector<std::int64_t> faces(3 * face_count_);
+    void as_given(std::vector<double>* vertices, std::vector<std::int64_t>* faces) const {
+        *vertices = loose_vertices_;
+        faces->assign(3 * face_count_, 0);
         if (model_) {
-            vertices.resize(3 * model_->vertices->size());
+            vertices->resize(3 * model_->vertices->size());
             for (std::size_t i = 0; i < model_->vertices->size(); i++) {
                 for (std::size_t axis = 0; axis < 3; axis++) {
-                    vertices[(3 * i) + axis] = (*model_->vertices)[i][static_cast<Eigen::Index>(axis)];
+                    (*vertices)[(3 * i) + axis] = (*model_->vertices)[i][static_cast<Eigen::Index>(axis)];
                 }
             }
             for (std::size_t f = 0; f < face_count_; f++) {
                 for (std::size_t corner = 0; corner < 3; corner++) {
-                    faces[(3 * f) + corner] = (*model_->tri_indices)[f][static_cast<std::uint32_t>(corner)];
+                    (*faces)[(3 * f) + corner] = (*model_->tri_indices)[f][static_cast<std::uint32_t>(corner)];
                 }
             }
         }
-        return nb::make_tuple(trimkit::to_numpy_rows(std::move(vertices), {3}),
-                              trimkit::to_numpy_rows(std::move(faces), {3}));
     }
 
-    std::size_t size() const { return face_count_; }
     bool empty() const { return face_count_ == 0; }
     const Model& model() const { return *model_; }
     const std::shared_ptr<Model>& shared_model() const { return model_; }
@@ -126,30 +124,6 @@ public:
     const std::array<double, 6>& box() const { return box_; }
 
 private:
-    void build(const double* points, std::size_t vertex_count, const std::vector<std::uint32_t>& faces, bool convex) {
-        // in coal's layout for addSubModel to copy into the model, which then
-        // holds the only copy kept: the convex shape shares the model's
-        std::vector<coal::Vec3s> vertices(vertex_count);
-        for (std::size_t v = 0; v < vertex_count; v++) {
-            vertices[v] = coal::Vec3s(points[3 * v], points[(3 * v) + 1], points[(3 * v) + 2]);
-        }
-        std::vector<coal::Triangle32> triangles(face_count_);
-        for (std::size_t f = 0; f < face_count_; f++) {
-            triangles[f] = coal::Triangle32(faces[3 * f], faces[(3 * f) + 1], faces[(3 * f) + 2]);
-        }
-        const trimkit::PointBounds bounds = trimkit::bounds_of(points, vertex_count);
-        trimkit::center_half(bounds.lowest, bounds.highest, box_.data());
-        model_ = std::make_shared<Model>();
-        model_->beginModel(static_cast<unsigned int>(face_count_), static_cast<unsigned int>(vertex_count));
-        model_->addSubModel(vertices, triangles);
-        model_->endModel();
-        if (convex) {
-            convex_ = std::make_unique<Convex>(model_->vertices, static_cast<unsigned int>(vertex_count),
-                                               model_->tri_indices, static_cast<unsigned int>(face_count_));
-            convex_->computeLocalAABB();  // the center its GJK starts from
-        }
-    }
-
     std::size_t face_count_ = 0;
     // the vertices of a mesh without faces, which no model holds
     std::vector<double> loose_vertices_;
@@ -157,6 +131,11 @@ private:
     std::shared_ptr<Model> model_;
     std::unique_ptr<Convex> convex_;
 };
+
+namespace {
+
+using trimkit::CollisionMesh;
+using trimkit::CollisionRow;
 
 // An instance as one query places it: its mesh, rigid transform and world
 // bounding box (center, half extent per axis)
@@ -166,11 +145,23 @@ struct Placed {
     std::array<double, 6> box{};
 };
 
-// the gap between two boxes' surfaces, or 0 when they touch or overlap
+// what a cull pads a placed box by: BOX_SLACK of its farthest coordinate,
+// so rounding in placing it never culls a pair coal's tests find touching
+double slack(const std::array<double, 6>& box) {
+    double farthest = 0.0;
+    for (std::size_t axis = 0; axis < 3; axis++) {
+        farthest = std::max(farthest, std::abs(box[axis]) + box[3 + axis]);
+    }
+    return trimkit::BOX_SLACK * farthest;
+}
+
+// a lower bound on the gap between two boxes' surfaces, each padded by its
+// slack, or 0 when they touch or overlap
 double box_gap(const std::array<double, 6>& a, const std::array<double, 6>& b) {
+    const double padded = slack(a) + slack(b);
     double squared = 0.0;
     for (std::size_t axis = 0; axis < 3; axis++) {
-        const double apart = std::abs(a[axis] - b[axis]) - a[3 + axis] - b[3 + axis];
+        const double apart = std::abs(a[axis] - b[axis]) - a[3 + axis] - b[3 + axis] - padded;
         squared += apart > 0.0 ? apart * apart : 0.0;
     }
     return std::sqrt(squared);
@@ -267,20 +258,8 @@ bool collide_pair(const Placed& a, const Placed& b, const coal::CollisionRequest
     return result.isCollision();
 }
 
-// One row of a CollisionResult: a pair of instances, or one contact of a
-// pair, with the face of each instance's mesh it is at (-1 for a convex
-// solid), its signed distance, the witness point on each instance, and the
-// unit direction from the first toward the second
-struct Row {
-    std::int64_t pair[2];
-    std::int64_t faces[2];
-    double distance;
-    double points[6];
-    double normal[3];
-};
-
 // a pair farther apart than asked about: infinitely far, nowhere
-void write_far(Row* row) {
+void write_far(CollisionRow* row) {
     constexpr double NOTHING = std::numeric_limits<double>::quiet_NaN();
     row->faces[0] = row->faces[1] = coal::Contact::NONE;
     row->distance = std::numeric_limits<double>::infinity();
@@ -293,7 +272,8 @@ void write_far(Row* row) {
 // a mesh b, whose surface goes first), so its faces and witness points trade
 // places and its normal, from its first shape toward its second, turns around
 void write_witness(bool swapped, std::int64_t first_face, std::int64_t second_face,
-                   const std::array<coal::Vec3s, 2>& witnesses, const coal::Vec3s& normal, double distance, Row* row) {
+                   const std::array<coal::Vec3s, 2>& witnesses, const coal::Vec3s& normal, double distance,
+                   CollisionRow* row) {
     row->faces[0] = swapped ? second_face : first_face;
     row->faces[1] = swapped ? first_face : second_face;
     row->distance = distance;
@@ -318,7 +298,7 @@ bool swapped_for(const Placed& a, const Placed& b) {
 // GJK by its own early stop, a hierarchy by never descending into boxes
 // farther than the closest distance so far, which starts at the bound.
 void distance_pair(const Placed& a, const Placed& b, const coal::DistanceRequest& request, double upper_bound,
-                   coal::GJKSolver& solver, coal::DistanceResult& result, Row* row) {
+                   coal::GJKSolver& solver, coal::DistanceResult& result, CollisionRow* row) {
     // just past the bound, so a pair exactly that far is still measured
     const double past = std::isinf(upper_bound) ? std::numeric_limits<double>::max()
                                                 : std::nextafter(upper_bound, std::numeric_limits<double>::infinity());
@@ -395,213 +375,187 @@ struct Candidates final : coal::CollisionCallBackBase {
     }
 };
 
-// an array argument, `rows` of it, copied: a row count other than the
-// pairs' is refused
-template <typename T, nb::ssize_t... Shape>
-trimkit::Out<T> copied_rows(const trimkit::Array<T, Shape...>& argument, const char* name, std::size_t rows) {
-    const trimkit::In<T, Shape...> given = trimkit::view(argument, name);
-    if (given.shape(0) != rows) {
-        trimkit::value_error(std::string(name) + " must have one row per pair");
-    }
-    std::vector<T> values(given.data(), given.data() + given.size());
-    if constexpr (sizeof...(Shape) == 1) {
-        return trimkit::to_numpy(std::move(values), {rows});
-    } else if constexpr (sizeof...(Shape) == 2) {
-        return trimkit::to_numpy(std::move(values), {rows, static_cast<std::size_t>(given.shape(1))});
-    } else {
-        return trimkit::to_numpy(std::move(values), {rows, static_cast<std::size_t>(given.shape(1)),
-                                                     static_cast<std::size_t>(given.shape(2))});
-    }
-}
-
-// the same for an optional one: None stays None
-template <typename T, nb::ssize_t... Shape>
-std::optional<trimkit::Out<T>> copied(const trimkit::Array<T, Shape...>& argument, const char* name, std::size_t rows) {
-    if (argument.is_none()) {
-        return std::nullopt;
-    }
-    return copied_rows(argument, name, rows);
-}
-
-// What a query found, one row per pair or per contact: which instances, and,
-// when the query measured them, the faces, signed distances, witness points
-// and normals, each None when it didn't
-class CollisionResult {
-public:
-    // from Python, as a pickle loads one: checked and copied like any input
-    CollisionResult(const PairsArg& pairs_argument, const FacesArg& faces_argument,
-                    const DistancesArg& distances_argument, const PointsArg& points_argument,
-                    const NormalsArg& normals_argument)
-        : pairs_(copied_rows(pairs_argument, "pairs", trimkit::view(pairs_argument, "pairs").shape(0))) {
-        const std::size_t rows = size();
-        faces_ = copied(faces_argument, "faces", rows);
-        distances_ = copied(distances_argument, "distances", rows);
-        points_ = copied(points_argument, "points", rows);
-        normals_ = copied(normals_argument, "normals", rows);
-    }
-
-    // from a query that found only pairs
-    explicit CollisionResult(trimkit::Out<std::int64_t> pairs) : pairs_(std::move(pairs)) {}
-
-    // from a query's rows, every field measured
-    explicit CollisionResult(const std::vector<trimkit::Unset<Row>>& rows) : pairs_(pairs_of(rows)) {
-        const std::size_t count = rows.size();
-        std::vector<std::int64_t> faces(2 * count);
-        std::vector<double> distances(count);
-        std::vector<double> points(6 * count);
-        std::vector<double> normals(3 * count);
-        for (std::size_t r = 0; r < count; r++) {
-            const Row& found = rows[r].value;
-            std::copy_n(found.faces, 2, &faces[2 * r]);
-            distances[r] = found.distance;
-            std::copy_n(found.points, 6, &points[6 * r]);
-            std::copy_n(found.normal, 3, &normals[3 * r]);
-        }
-        faces_ = trimkit::to_numpy_rows(std::move(faces), {2});
-        distances_ = trimkit::to_numpy(std::move(distances), {count});
-        points_ = trimkit::to_numpy_rows(std::move(points), {2, 3});
-        normals_ = trimkit::to_numpy_rows(std::move(normals), {3});
-    }
-
-    std::size_t size() const { return pairs_.shape(0); }
-    trimkit::Out<std::int64_t> pairs() const { return pairs_; }
-    std::optional<trimkit::Out<std::int64_t>> faces() const { return faces_; }
-    std::optional<trimkit::Out<double>> distances() const { return distances_; }
-    std::optional<trimkit::Out<double>> points() const { return points_; }
-    std::optional<trimkit::Out<double>> normals() const { return normals_; }
-
-    // pickled as its arrays, None where the query measured nothing
-    nb::dict constructor_arguments() const {
-        const nb::dict arguments;
-        arguments["pairs"] = pairs_;
-        arguments["faces"] = faces_;
-        arguments["distances"] = distances_;
-        arguments["points"] = points_;
-        arguments["normals"] = normals_;
-        return arguments;
-    }
-
-private:
-    static trimkit::Out<std::int64_t> pairs_of(const std::vector<trimkit::Unset<Row>>& rows) {
-        std::vector<std::int64_t> pairs(2 * rows.size());
-        for (std::size_t r = 0; r < rows.size(); r++) {
-            std::copy_n(rows[r].value.pair, 2, &pairs[2 * r]);
-        }
-        return trimkit::to_numpy_rows(std::move(pairs), {2});
-    }
-
-    trimkit::Out<std::int64_t> pairs_;
-    std::optional<trimkit::Out<std::int64_t>> faces_;
-    std::optional<trimkit::Out<double>> distances_;
-    std::optional<trimkit::Out<double>> points_;
-    std::optional<trimkit::Out<double>> normals_;
-};
-
-class CollisionScene {
-public:
-    // it owns its meshes (std::vector of std::unique_ptr claims to be
-    // copyable to nanobind's traits, so say it isn't)
-    CollisionScene(const CollisionScene&) = delete;
-    CollisionScene& operator=(const CollisionScene&) = delete;
-
-    CollisionScene(const trimkit::Meshes& meshes, const ConvexArg& convex_argument) {
-        const std::vector<trimkit::Mesh<std::uint32_t>> read = trimkit::read_meshes<std::uint32_t>(meshes);
-        std::vector<std::uint8_t> solid(read.size(), 0);
-        if (const trimkit::Flag* every = std::get_if<trimkit::Flag>(&convex_argument)) {
-            std::fill(solid.begin(), solid.end(), every->value ? 1 : 0);
-        } else {
-            const trimkit::In<bool, -1> convex = trimkit::read(std::get<1>(convex_argument), "convex");
-            if (convex.shape(0) != read.size()) {
-                trimkit::value_error("convex must have one row per mesh");
+// Where each instance places its mesh. Each box bounds the mesh twice,
+// carried into the scene by rotating each center and taking half extents
+// through the absolute values of the rotated axes (Arvo): from the vertices'
+// box, and from the hierarchy's root oriented box. Either bounds it, so
+// their overlap does: the oriented box is far tighter for a mesh lying
+// diagonally in its own frame, and looser for a cube, whose principal axes
+// are arbitrary
+std::vector<Placed> place(const std::vector<std::unique_ptr<CollisionMesh>>& meshes,
+                          const trimkit::Instances& instances) {
+    std::vector<Placed> placed(instances.count);
+    for (std::size_t i = 0; i < instances.count; i++) {
+        const double* m = instances.matrix(i);
+        const CollisionMesh* mesh = meshes[instances.mesh(i)].get();
+        coal::Matrix3s rotation;
+        coal::Vec3s translation;
+        for (Eigen::Index r = 0; r < 3; r++) {
+            for (Eigen::Index c = 0; c < 3; c++) {
+                rotation(r, c) = m[(4 * r) + c];
             }
-            std::copy_n(trimkit::mask_bytes(convex), read.size(), solid.begin());
+            translation[r] = m[(4 * r) + 3];
         }
-        meshes_.resize(read.size());
-        for (std::size_t i = 0; i < read.size(); i++) {
-            meshes_[i] = std::make_unique<CollisionMesh>(read[i], solid[i] != 0, "meshes[" + std::to_string(i) + "]");
+        // a mesh without faces never touches anything: a point where it is placed
+        std::array<double, 6> box{translation[0], translation[1], translation[2], 0.0, 0.0, 0.0};
+        if (!mesh->empty()) {
+            const coal::OBB& oriented = mesh->bounds();
+            const std::array<double, 6>& vertex_box = mesh->box();
+            const coal::Vec3s oriented_center = (rotation * oriented.To) + translation;
+            const coal::Matrix3s oriented_axes = rotation * oriented.axes;
+            const coal::Vec3s vertex_center =
+                (rotation * coal::Vec3s(vertex_box[0], vertex_box[1], vertex_box[2])) + translation;
+            const coal::Vec3s vertex_half(vertex_box[3], vertex_box[4], vertex_box[5]);
+            double lowest[3];
+            double highest[3];
+            for (Eigen::Index r = 0; r < 3; r++) {
+                const double oriented_half = oriented_axes.row(r).cwiseAbs().dot(oriented.extent);
+                const double vertex_extent = rotation.row(r).cwiseAbs().dot(vertex_half);
+                lowest[r] = std::max(oriented_center[r] - oriented_half, vertex_center[r] - vertex_extent);
+                highest[r] = std::min(oriented_center[r] + oriented_half, vertex_center[r] + vertex_extent);
+            }
+            trimkit::refuse_placed_beyond(lowest, highest, i);
+            trimkit::center_half(lowest, highest, box.data());
+        }
+        placed[i] = {mesh, coal::Transform3s(rotation, translation), box};
+    }
+    return placed;
+}
+
+// the instance pairs a query names, the caller's copy checked: each in
+// range before it is cast, so a 32-bit size_t never wraps one into it
+void check_pairs(const std::vector<std::int64_t>& pairs, std::size_t count) {
+    for (std::size_t p = 0; p < pairs.size() / 2; p++) {
+        const std::int64_t a = pairs[2 * p];
+        const std::int64_t b = pairs[(2 * p) + 1];
+        if (!trimkit::indexes(a, count) || !trimkit::indexes(b, count)) {
+            trimkit::refuse("pairs names an instance out of range at row " + std::to_string(p));
+        }
+        if (a == b) {
+            trimkit::refuse("pairs names one instance twice at row " + std::to_string(p));
         }
     }
+}
 
-    std::size_t size() const { return meshes_.size(); }
-
-    // pickled as its meshes as given and which of them are convex
-    nb::dict constructor_arguments() const {
-        nb::list meshes;
-        std::vector<std::uint8_t> convex(meshes_.size());
-        for (std::size_t i = 0; i < meshes_.size(); i++) {
-            meshes.append(meshes_[i]->as_given());
-            convex[i] = meshes_[i]->convex() != nullptr ? 1 : 0;
+// Every pair of instances whose boxes may come within `margin`, as ascending
+// (i < j) rows: coal's dynamic AABB tree, built for this query alone over
+// the placed boxes (each grown by half the margin and by its slack), so
+// nothing about the scene changes and threads never share it
+std::vector<std::int64_t> overlapping(const std::vector<Placed>& placed, double margin) {
+    std::vector<coal::CollisionObject> objects;
+    objects.reserve(placed.size());
+    // as many as there could be, written by index, then cut to those kept
+    std::vector<coal::CollisionObject*> registered(placed.size());
+    std::size_t kept = 0;
+    std::vector<std::int64_t> rows_of(placed.size());
+    std::iota(rows_of.begin(), rows_of.end(), std::int64_t{0});
+    for (std::size_t i = 0; i < placed.size(); i++) {
+        if (placed[i].mesh->empty()) {
+            continue;  // a mesh without faces never touches anything
         }
-        const std::size_t count = convex.size();
-        const nb::dict arguments;
-        arguments["meshes"] = meshes;
-        arguments["convex"] = trimkit::to_numpy<bool>(std::move(convex), {count});
-        return arguments;
+        // the geometry's own box is never computed: these are the boxes
+        coal::CollisionObject& object =
+            objects.emplace_back(placed[i].mesh->shared_model(), placed[i].transform, false);
+        object.setUserData(&rows_of[i]);
+        const std::array<double, 6>& box = placed[i].box;
+        for (Eigen::Index axis = 0; axis < 3; axis++) {
+            const double half = box[3 + static_cast<std::size_t>(axis)] + (margin / 2.0) + slack(box);
+            object.getAABB().min_[axis] = box[static_cast<std::size_t>(axis)] - half;
+            object.getAABB().max_[axis] = box[static_cast<std::size_t>(axis)] + half;
+        }
+        registered[kept++] = &object;
     }
+    registered.resize(kept);
+    Candidates candidates;
+    if (registered.size() > 1) {
+        coal::DynamicAABBTreeArrayCollisionManager tree;
+        tree.registerObjects(registered);
+        tree.setup();
+        tree.collide(&candidates);
+    }
+    // in ascending order, so answers never depend on the tree's shape.
+    // Each is a candidate only: `may_touch` holds it to the margin, as it
+    // holds the explicit pairs
+    std::sort(candidates.pairs.begin(), candidates.pairs.end());
+    std::vector<std::int64_t> rows(2 * candidates.pairs.size());
+    for (std::size_t p = 0; p < candidates.pairs.size(); p++) {
+        rows[2 * p] = candidates.pairs[p][0];
+        rows[(2 * p) + 1] = candidates.pairs[p][1];
+    }
+    return rows;
+}
 
-    CollisionResult collides(const trimkit::InstanceMatrices& matrices_argument,
-                             const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
-                             trimkit::Number<double> margin_argument, trimkit::Flag return_distance,
-                             trimkit::Number<std::int64_t> maximum_contacts_argument) const {
-        const double margin = margin_argument;
-        // NaN fails both comparisons, so it is refused too
-        if (margin < 0.0 || margin > trimkit::COORDINATE_LIMIT || std::isnan(margin)) {
-            trimkit::value_error(std::string("margin must be at least 0 and within ") + trimkit::COORDINATE_LIMIT_TEXT);
+}  // namespace
+
+trimkit::CollisionMeshes::CollisionMeshes(const std::vector<CollisionMeshInput>& meshes) {
+    meshes_.resize(meshes.size());
+    for (std::size_t i = 0; i < meshes.size(); i++) {
+        // a convex mesh is taken at its word: coal measures it as a solid,
+        // walking its faces' edges to the vertex farthest along each
+        // direction, so it needs faces, but whether they bound a convex
+        // solid is the caller's promise to keep (an untrue one gives wrong
+        // distances, never a crash)
+        if (meshes[i].convex && meshes[i].face_count == 0) {
+            refuse("meshes[" + std::to_string(i) + "] is convex, so it needs faces");
         }
-        const std::int64_t maximum_contacts = maximum_contacts_argument;
-        if (maximum_contacts < 1) {
-            trimkit::value_error("maximum_contacts must be at least 1");
+        meshes_[i] = std::make_unique<CollisionMesh>(meshes[i]);
+    }
+}
+
+trimkit::CollisionMeshes::~CollisionMeshes() = default;
+
+bool trimkit::CollisionMeshes::convex(std::size_t mesh) const { return meshes_[mesh]->convex() != nullptr; }
+
+void trimkit::CollisionMeshes::as_given(std::size_t mesh, std::vector<double>* vertices,
+                                        std::vector<std::int64_t>* faces) const {
+    meshes_[mesh]->as_given(vertices, faces);
+}
+
+std::vector<double> trimkit::CollisionMeshes::boxes(const Instances& instances) const {
+    const std::vector<Placed> placed = place(meshes_, instances);
+    std::vector<double> boxes(6 * placed.size());
+    for (std::size_t i = 0; i < placed.size(); i++) {
+        for (std::size_t axis = 0; axis < 3; axis++) {
+            boxes[(6 * i) + axis] = placed[i].box[axis] - placed[i].box[3 + axis];
+            boxes[(6 * i) + 3 + axis] = placed[i].box[axis] + placed[i].box[3 + axis];
         }
-        const std::vector<Placed> placed = place(matrices_argument, index_argument);
-        // the pairs to test: the given rows, or the boxes' candidates
-        std::vector<std::int64_t> pairs;
-        if (pairs_argument.is_none()) {
-            const trimkit::GilReleased release;
-            pairs = overlapping(placed, margin);
-        } else {
-            pairs = read_pairs(pairs_argument, placed.size());
-        }
-        const std::int64_t* rows = pairs.data();
-        const std::size_t pair_count = pairs.size() / 2;
-        if (return_distance.value) {
-            return CollisionResult(contacts(placed, rows, pair_count, margin, maximum_contacts));
-        }
-        coal::CollisionRequest request(coal::NO_REQUEST, 1);
+    }
+    return boxes;
+}
+
+void trimkit::CollisionMeshes::collides(const Instances& instances,
+                                        const std::optional<std::vector<std::int64_t>>& pairs, double margin,
+                                        std::int64_t maximum_contacts, const parallel::Stop& stop,
+                                        std::vector<Unset<std::int64_t>>* touching,
+                                        std::vector<Unset<CollisionRow>>* contacts) const {
+    // negated, so not a number is refused too
+    if (!(margin >= 0.0 && margin <= COORDINATE_LIMIT)) {
+        refuse(std::string("margin must be at least 0 and within ") + COORDINATE_LIMIT_TEXT);
+    }
+    if (maximum_contacts < 1) {
+        refuse("maximum_contacts must be at least 1");
+    }
+    const std::vector<Placed> placed = place(meshes_, instances);
+    // the pairs to test: the given rows, or the boxes' candidates
+    std::vector<std::int64_t> candidates;
+    if (pairs) {
+        check_pairs(*pairs, placed.size());
+    } else {
+        candidates = overlapping(placed, margin);
+    }
+    const std::int64_t* rows = pairs ? pairs->data() : candidates.data();
+    const std::size_t pair_count = (pairs ? pairs->size() : candidates.size()) / 2;
+    if (contacts != nullptr) {
+        // Every contact of each pair that touches, as many as
+        // `maximum_contacts` per pair, as coal's contact request finds them
+        // through the same cull and kernels: in pair order, each pair's in coal's
+        coal::CollisionRequest request(coal::CONTACT, at_most(maximum_contacts));
         request.security_margin = margin;
-        // GJK stops at the first plane that separates a pair by more than the
-        // margin (`set` raises this bound to it): coal's default bound is
-        // infinite, which measured every separated pair's distance in full
-        request.distance_upper_bound = 0;
-        // one pass: each pair culled, then tested, keeping those that touch
-        trimkit::Gathered<std::int64_t> touching;
-        trimkit::gather_in_parallel<std::int64_t>(
-            pair_count, &touching, [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& found) {
-                coal::GJKSolver solver;
-                coal::CollisionResult result;
-                for (std::size_t p = begin; p < end; p++) {
-                    const Placed& a = placed[static_cast<std::size_t>(rows[2 * p])];
-                    const Placed& b = placed[static_cast<std::size_t>(rows[(2 * p) + 1])];
-                    if (may_touch(a, b, request) && collide_pair(a, b, request, solver, result)) {
-                        found.push_back(rows[2 * p]);
-                        found.push_back(rows[(2 * p) + 1]);
-                    }
-                }
-            });
-        return CollisionResult(trimkit::to_numpy_rows<std::int64_t>(trimkit::gathered_rows(touching), {2}));
-    }
-
-    // Every contact of each pair that touches, as many as `maximum_contacts`
-    // per pair, as coal's contact request finds them through the same cull and
-    // kernels as `collides`: in pair order, each pair's in coal's
-    static std::vector<trimkit::Unset<Row>> contacts(const std::vector<Placed>& placed, const std::int64_t* rows,
-                                                     std::size_t pair_count, double margin,
-                                                     std::int64_t maximum_contacts) {
-        coal::CollisionRequest request(coal::CONTACT, static_cast<std::size_t>(maximum_contacts));
-        request.security_margin = margin;
-        request.distance_upper_bound = 0;  // as `collides`: separated pairs stop early
-        trimkit::Gathered<Row> found;
-        trimkit::gather_in_parallel<Row>(
-            pair_count, &found, [&](std::size_t begin, std::size_t end, std::vector<Row>& kept) {
+        request.distance_upper_bound = 0;  // as below: separated pairs stop early
+        Gathered<CollisionRow> found;
+        gather_in_parallel<CollisionRow>(
+            pair_count, &found,
+            [&](std::size_t begin, std::size_t end, std::vector<CollisionRow>& kept) {
                 coal::GJKSolver solver;
                 coal::CollisionResult result;
                 for (std::size_t p = begin; p < end; p++) {
@@ -612,48 +566,77 @@ public:
                     }
                     const bool swapped = swapped_for(a, b);
                     for (const coal::Contact& contact : result.getContacts()) {
-                        Row& row = kept.emplace_back();
+                        CollisionRow& row = kept.emplace_back();
                         row.pair[0] = rows[2 * p];
                         row.pair[1] = rows[(2 * p) + 1];
                         write_witness(swapped, contact.b1, contact.b2, contact.nearest_points, contact.normal,
                                       contact.penetration_depth, &row);
                     }
                 }
-            });
-        return trimkit::gathered_rows(found);
+            },
+            stop);
+        *contacts = gathered_rows(found);
+        return;
     }
-
-    CollisionResult distances(const trimkit::InstanceMatrices& matrices_argument,
-                              const trimkit::InstanceIndex& index_argument, const PairsArg& pairs_argument,
-                              trimkit::Number<double> upper_bound_argument) const {
-        const double upper_bound = upper_bound_argument;
-        if (!(upper_bound > 0.0)) {
-            trimkit::value_error("upper_bound must be positive");
-        }
-        const std::vector<Placed> placed = place(matrices_argument, index_argument);
-        // every pair is measured, so every pair is named: the given rows, or
-        // each i < j in numpy.triu_indices order, found from where each row
-        // of them starts rather than listed
-        const std::int64_t* rows = nullptr;
-        std::vector<std::size_t> starts(placed.size());
-        std::size_t pair_count = 0;
-        std::vector<std::int64_t> given;
-        if (pairs_argument.is_none()) {
-            for (std::size_t i = 0; i < placed.size(); i++) {
-                starts[i] = pair_count;
-                pair_count += placed.size() - 1 - i;
+    coal::CollisionRequest request(coal::NO_REQUEST, 1);
+    request.security_margin = margin;
+    // GJK stops at the first plane that separates a pair by more than the
+    // margin (`set` raises this bound to it): coal's default bound is
+    // infinite, which measured every separated pair's distance in full
+    request.distance_upper_bound = 0;
+    // one pass: each pair culled, then tested, keeping those that touch
+    Gathered<std::int64_t> found;
+    gather_in_parallel<std::int64_t>(
+        pair_count, &found,
+        [&](std::size_t begin, std::size_t end, std::vector<std::int64_t>& kept) {
+            coal::GJKSolver solver;
+            coal::CollisionResult result;
+            for (std::size_t p = begin; p < end; p++) {
+                const Placed& a = placed[static_cast<std::size_t>(rows[2 * p])];
+                const Placed& b = placed[static_cast<std::size_t>(rows[(2 * p) + 1])];
+                if (may_touch(a, b, request) && collide_pair(a, b, request, solver, result)) {
+                    kept.push_back(rows[2 * p]);
+                    kept.push_back(rows[(2 * p) + 1]);
+                }
             }
-        } else {
-            given = read_pairs(pairs_argument, placed.size());
-            rows = given.data();
-            pair_count = given.size() / 2;
+        },
+        stop);
+    *touching = gathered_rows(found);
+}
+
+std::vector<trimkit::Unset<trimkit::CollisionRow>> trimkit::CollisionMeshes::distances(
+    const Instances& instances, const std::optional<std::vector<std::int64_t>>& pairs, double upper_bound,
+    const parallel::Stop& stop) const {
+    if (!(upper_bound > 0.0)) {
+        refuse("upper_bound must be positive");
+    }
+    const std::vector<Placed> placed = place(meshes_, instances);
+    // every pair is measured, so every pair is named: the given rows, or
+    // each i < j in numpy.triu_indices order, found from where each row
+    // of them starts rather than listed
+    const std::int64_t* rows = nullptr;
+    std::vector<std::size_t> starts(placed.size());
+    std::size_t pair_count = 0;
+    if (pairs) {
+        check_pairs(*pairs, placed.size());
+        rows = pairs->data();
+        pair_count = pairs->size() / 2;
+    } else {
+        // k(k - 1) / 2 of them: counted first, so the sum below can't wrap
+        static_cast<void>(element_count(placed.size(), placed.empty() ? 0 : placed.size() - 1));
+        for (std::size_t i = 0; i < placed.size(); i++) {
+            starts[i] = pair_count;
+            pair_count += placed.size() - 1 - i;
         }
-        // every row written once, by its pair, so none is filled first
-        std::vector<trimkit::Unset<Row>> measured(pair_count);
-        Row* out = trimkit::elements(measured);
-        const coal::DistanceRequest request;
-        // one pass: each pair culled, then measured
-        trimkit::in_parallel(pair_count, [&](std::size_t begin, std::size_t end) {
+    }
+    // every row written once, by its pair, so none is filled first
+    std::vector<Unset<CollisionRow>> measured(pair_count);
+    CollisionRow* out = elements(measured);
+    const coal::DistanceRequest request;
+    // one pass: each pair culled, then measured
+    in_parallel(
+        pair_count,
+        [&](std::size_t begin, std::size_t end) {
             coal::GJKSolver solver;
             coal::DistanceResult result;
             for (std::size_t p = begin; p < end; p++) {
@@ -670,466 +653,7 @@ public:
                     write_far(&out[p]);
                 }
             }
-        });
-        return CollisionResult(measured);
-    }
-
-    // the box each instance is culled by, as these instances place it
-    trimkit::BoxesObject boxes(const trimkit::InstanceMatrices& matrices_argument,
-                               const trimkit::InstanceIndex& index_argument) const {
-        const std::vector<Placed> placed = place(matrices_argument, index_argument);
-        std::vector<double> boxes(6 * placed.size());
-        for (std::size_t i = 0; i < placed.size(); i++) {
-            for (std::size_t axis = 0; axis < 3; axis++) {
-                boxes[(6 * i) + axis] = placed[i].box[axis] - placed[i].box[3 + axis];
-                boxes[(6 * i) + 3 + axis] = placed[i].box[axis] + placed[i].box[3 + axis];
-            }
-        }
-        return trimkit::scene_boxes(boxes);
-    }
-
-private:
-    // Which mesh each instance places and where, checked: `instance_index`
-    // and `instance_matrices` may each be None, for one instance per mesh and
-    // the identity. Each box bounds the mesh twice, carried into the scene
-    // by rotating each center and taking half extents through the absolute
-    // values of the rotated axes (Arvo): from the vertices' box, and from the
-    // hierarchy's root oriented box. Either bounds it, so their overlap does:
-    // the oriented box is far tighter for a mesh lying diagonally in its own
-    // frame, and looser for a cube, whose principal axes are arbitrary
-    std::vector<Placed> place(const trimkit::InstanceMatrices& matrices_argument,
-                              const trimkit::InstanceIndex& index_argument) const {
-        // read and checked, rigid transforms only: the rest only places, and touches no Python
-        const trimkit::Instances instances = trimkit::read_instances(
-            trimkit::view_instances(index_argument, matrices_argument), meshes_.size(), /*rigid=*/true);
-        std::vector<Placed> placed(instances.count);
-        const trimkit::GilReleased release;
-        for (std::size_t i = 0; i < instances.count; i++) {
-            const double* m = instances.matrix(i);
-            const CollisionMesh* mesh = meshes_[instances.mesh(i)].get();
-            coal::Matrix3s rotation;
-            coal::Vec3s translation;
-            for (Eigen::Index r = 0; r < 3; r++) {
-                for (Eigen::Index c = 0; c < 3; c++) {
-                    rotation(r, c) = m[(4 * r) + c];
-                }
-                translation[r] = m[(4 * r) + 3];
-            }
-            // a mesh without faces never touches anything: a point where it is placed
-            std::array<double, 6> box{translation[0], translation[1], translation[2], 0.0, 0.0, 0.0};
-            if (!mesh->empty()) {
-                const coal::OBB& oriented = mesh->bounds();
-                const std::array<double, 6>& vertex_box = mesh->box();
-                const coal::Vec3s oriented_center = (rotation * oriented.To) + translation;
-                const coal::Matrix3s oriented_axes = rotation * oriented.axes;
-                const coal::Vec3s vertex_center =
-                    (rotation * coal::Vec3s(vertex_box[0], vertex_box[1], vertex_box[2])) + translation;
-                const coal::Vec3s vertex_half(vertex_box[3], vertex_box[4], vertex_box[5]);
-                double lowest[3];
-                double highest[3];
-                for (Eigen::Index r = 0; r < 3; r++) {
-                    const double oriented_half = oriented_axes.row(r).cwiseAbs().dot(oriented.extent);
-                    const double vertex_extent = rotation.row(r).cwiseAbs().dot(vertex_half);
-                    lowest[r] = std::max(oriented_center[r] - oriented_half, vertex_center[r] - vertex_extent);
-                    highest[r] = std::min(oriented_center[r] + oriented_half, vertex_center[r] + vertex_extent);
-                }
-                trimkit::center_half(lowest, highest, box.data());
-            }
-            placed[i] = {mesh, coal::Transform3s(rotation, translation), box};
-        }
-        return placed;
-    }
-
-    // the instance pairs a query names, copied and the copy checked, as faces
-    // are: what indexes our memory is never read from the caller's again
-    static std::vector<std::int64_t> read_pairs(const PairsArg& pairs_argument, std::size_t count) {
-        const trimkit::In<std::int64_t, -1, 2> given = trimkit::read(pairs_argument, "pairs");
-        std::vector<std::int64_t> pairs(given.data(), given.data() + (2 * given.shape(0)));
-        for (std::size_t p = 0; p < pairs.size() / 2; p++) {
-            const std::int64_t a = pairs[2 * p];
-            const std::int64_t b = pairs[(2 * p) + 1];
-            if (a < 0 || b < 0 || static_cast<std::size_t>(a) >= count || static_cast<std::size_t>(b) >= count) {
-                trimkit::value_error("pairs names an instance out of range at row " + std::to_string(p));
-            }
-            if (a == b) {
-                trimkit::value_error("pairs names one instance twice at row " + std::to_string(p));
-            }
-        }
-        return pairs;
-    }
-
-    // Every pair of instances whose boxes may come within `margin`, as ascending
-    // (i < j) rows: coal's dynamic AABB tree, built for this query alone over
-    // the placed boxes (each grown by half the margin), so nothing about the
-    // scene changes and threads never share it
-    static std::vector<std::int64_t> overlapping(const std::vector<Placed>& placed, double margin) {
-        std::vector<coal::CollisionObject> objects;
-        objects.reserve(placed.size());
-        // as many as there could be, written by index, then cut to those kept
-        std::vector<coal::CollisionObject*> registered(placed.size());
-        std::size_t kept = 0;
-        std::vector<std::int64_t> rows_of(placed.size());
-        std::iota(rows_of.begin(), rows_of.end(), std::int64_t{0});
-        for (std::size_t i = 0; i < placed.size(); i++) {
-            if (placed[i].mesh->empty()) {
-                continue;  // a mesh without faces never touches anything
-            }
-            // the geometry's own box is never computed: these are the boxes
-            coal::CollisionObject& object =
-                objects.emplace_back(placed[i].mesh->shared_model(), placed[i].transform, false);
-            object.setUserData(&rows_of[i]);
-            const std::array<double, 6>& box = placed[i].box;
-            for (Eigen::Index axis = 0; axis < 3; axis++) {
-                const double half = box[3 + static_cast<std::size_t>(axis)] + (margin / 2.0);
-                object.getAABB().min_[axis] = box[static_cast<std::size_t>(axis)] - half;
-                object.getAABB().max_[axis] = box[static_cast<std::size_t>(axis)] + half;
-            }
-            registered[kept++] = &object;
-        }
-        registered.resize(kept);
-        Candidates candidates;
-        if (registered.size() > 1) {
-            coal::DynamicAABBTreeArrayCollisionManager tree;
-            tree.registerObjects(registered);
-            tree.setup();
-            tree.collide(&candidates);
-        }
-        // in ascending order, so answers never depend on the tree's shape.
-        // Each is a candidate only: `may_touch` holds it to the margin, as it
-        // holds the explicit pairs
-        std::sort(candidates.pairs.begin(), candidates.pairs.end());
-        std::vector<std::int64_t> rows(2 * candidates.pairs.size());
-        for (std::size_t p = 0; p < candidates.pairs.size(); p++) {
-            rows[2 * p] = candidates.pairs[p][0];
-            rows[(2 * p) + 1] = candidates.pairs[p][1];
-        }
-        return rows;
-    }
-
-    std::vector<std::unique_ptr<CollisionMesh>> meshes_;
-};
-
-}  // namespace
-
-void bind_collision(nb::module_& m) {
-    trimkit::picklable_class<CollisionResult>(m, "CollisionResult",
-                                              R"(What a collision or distance query found: one row per pair of
-instances, or per contact of a pair, as `CollisionScene.collides` and
-`CollisionScene.distances` return it.
-
-Every row names its pair of instances. A query that measured them also
-fills each row's faces, signed distance, witness points and normal, and
-each of those is None when it didn't, as `collides` without
-`return_distance`: an answer not computed is never a placeholder.
-
-Parameters
-----------
-pairs : (c, 2) int64
-  The instances of each row.
-faces : (c, 2) int64, optional
-  The face of each instance's mesh the row is at, or -1 for a convex
-  solid, which has no face to name.
-distances : (c,) float64, optional
-  The signed distance between the pair at the row, negative by how deep
-  they overlap.
-points : (c, 2, 3) float64, optional
-  The witness point on each instance, in the scene: closest when apart,
-  deepest when overlapping.
-normals : (c, 3) float64, optional
-  The unit direction from the first instance toward the second along
-  which the distance is measured.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> result = trimkit.CollisionResult(np.array([[0, 1]], dtype=np.int64))
->>> len(result), result.distances is None
-(1, True))")
-        .def(nb::init<const PairsArg&, const FacesArg&, const DistancesArg&, const PointsArg&, const NormalsArg&>(),
-             nb::arg("pairs"), nb::arg("faces").none() = nb::none(), nb::arg("distances").none() = nb::none(),
-             nb::arg("points").none() = nb::none(), nb::arg("normals").none() = nb::none())
-        .def("__len__", &CollisionResult::size, R"(How many rows it holds.
-
-Returns
--------
-count : int
-  The number of rows it holds: pairs, or contacts.)")
-        .def_prop_ro("pairs", &CollisionResult::pairs, nb::rv_policy::move,
-                     R"(The instances of each row.
-
-Returns
--------
-pairs : (c, 2) int64
-  Each row's pair of instances, first then second.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
->>> pairs = result.pairs
->>> pairs.tolist()
-[[0, 1]])")
-        .def_prop_ro("faces", &CollisionResult::faces, nb::rv_policy::move,
-                     R"(The face of each instance's mesh each row is at, or None.
-
-Returns
--------
-faces : (c, 2) int64 or None
-  Each row's face of each instance's mesh, -1 for a convex solid; None
-  when the query measured nothing.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
->>> faces = result.faces
->>> faces.tolist()
-[[-1, -1]])")
-        .def_prop_ro("distances", &CollisionResult::distances, nb::rv_policy::move,
-                     R"(The signed distance of each row, or None.
-
-Returns
--------
-distances : (c,) float64 or None
-  Each row's signed distance, negative by how deep the pair overlaps;
-  None when the query measured nothing.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
->>> distances = result.distances
->>> bool(distances[0] < 0.0)
-True)")
-        .def_prop_ro("points", &CollisionResult::points, nb::rv_policy::move,
-                     R"(The witness point on each instance of each row, or None.
-
-Returns
--------
-points : (c, 2, 3) float64 or None
-  Each row's witness point on each instance, in the scene; None when
-  the query measured nothing.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
->>> points = result.points
->>> points.shape
-(1, 2, 3))")
-        .def_prop_ro("normals", &CollisionResult::normals, nb::rv_policy::move,
-                     R"(The unit normal of each row, or None.
-
-Returns
--------
-normals : (c, 3) float64 or None
-  Each row's unit direction from the first instance toward the second;
-  None when the query measured nothing.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, triangles)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64), return_distance=True)
->>> normals = result.normals
->>> bool(np.isclose(np.linalg.norm(normals[0]), 1.0))
-True)");
-
-    trimkit::picklable_class<CollisionScene>(m, "CollisionScene",
-                                             R"(Meshes to place and query against each other. A scene never changes:
-each query names its own instances, so threads may share one.
-
-Every query takes its instances (which mesh, placed where) and the pairs
-of them to test, all optional, so a bare `scene.collides()` asks about the
-scene as built: each mesh once, where it is, every pair. A robot passes its
-links' transforms and the pairs of links not joined to each other.
-
-`pairs` names exactly the pairs to test, which is how anything is left
-out: a robot's ignored links, obstacles against each other. A path is one
-query: N poses of L links are N * L instances, each pose's pairs named
-(`pairs=None` would pair a link with itself at another pose), and the
-pairs barely change from call to call, so build them once. Distances over
-every pair are O(k**2) in memory. For gradients, use convex meshes: two
-surfaces are 0 apart with no normal once they touch.
-
-A convex mesh is tested as a solid and any other mesh as a surface, in
-every pair: a mesh inside a convex one touches it, and a distance is
-negative only when a convex solid is penetrated.
-
-Parameters
-----------
-meshes : sequence of Mesh
-  The meshes to place, each a (vertices, faces) pair of (n, 3) float64
-  vertices and (m, 3) int64 triangle indices into them. Copied once
-  into coal's own storage, which the scene owns, so a mesh can never
-  change under the threads sharing the scene.
-convex : bool or (n,) bool, optional
-  Which meshes to measure as convex solids, such as convex hulls:
-  all of them or none, or a mask of which. Not checked: a mesh that
-  isn't convex gives wrong distances, never a crash. Defaults to
-  False.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
->>> len(scene)
-1)")
-        .def(nb::init<const trimkit::Meshes&, const ConvexArg&>(), nb::arg("meshes"),
-             nb::arg("convex") = trimkit::Flag{})
-        .def("__len__", &CollisionScene::size, R"(How many meshes the scene was built from.
-
-Returns
--------
-count : int
-  The number of meshes the scene was built from.)")
-        .def("boxes", &CollisionScene::boxes, nb::arg("instance_matrices").none() = nb::none(),
-             nb::arg("instance_index").none() = nb::none(),
-             R"(The box each instance is culled by, as a query with these instances
-places it: what the scene thinks it holds.
-
-Parameters
-----------
-instance_matrices : (k, 4, 4) float64, optional
-  Each instance's rigid transform from its mesh into the scene.
-  Defaults to the identity.
-instance_index : (k,) int64, optional
-  Which mesh each instance places. Defaults to each mesh once.
-
-Returns
--------
-boxes : Boxes
-  One 3D box per instance, in its order, holding every face it places
-  (an instance of a mesh without faces: a point at its translation).
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> boxes = scene.boxes()
->>> boxes.bounds.tolist()
-[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])")
-        .def("collides", &CollisionScene::collides, nb::arg("instance_matrices").none() = nb::none(),
-             nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),
-             nb::arg("margin") = 0.0, nb::arg("return_distance") = trimkit::Flag{}, nb::arg("maximum_contacts") = 1,
-             R"(The pairs of instances that touch, and optionally where.
-
-Parameters
-----------
-instance_matrices : (k, 4, 4) float64, optional
-  Each instance's rigid transform from its mesh into the scene.
-  Defaults to the identity.
-instance_index : (k,) int64, optional
-  Which mesh each instance places. Defaults to each mesh once.
-pairs : (p, 2) int64, optional
-  The pairs of instances to test. Defaults to every pair, found by
-  their bounding boxes.
-margin : float
-  Also count pairs closer than this.
-return_distance : bool
-  Also measure where each touching pair touches: one row per contact,
-  with its faces, signed distance, witness points and normal. Without
-  it only the pairs are found, as fast as the test allows.
-maximum_contacts : int
-  With `return_distance`, the most contacts to report per pair, which
-  bounds the work: 1 is the deepest a convex pair has, and a mesh's
-  first found. At least 1.
-
-Returns
--------
-result : CollisionResult
-  Each pair of instances that touches or overlaps: rows of `pairs` in
-  its order, or by default each touching i < j in ascending order, and
-  with `return_distance` one row per contact of each. Its other fields
-  are None without `return_distance`. Empty when nothing touches.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 0.5
->>> result = scene.collides(placed, np.zeros(2, dtype=np.int64))
->>> result.pairs.tolist(), result.distances is None
-([[0, 1]], True))")
-        .def("distances", &CollisionScene::distances, nb::arg("instance_matrices").none() = nb::none(),
-             nb::arg("instance_index").none() = nb::none(), nb::kw_only(), nb::arg("pairs").none() = nb::none(),
-             nb::arg("upper_bound") = std::numeric_limits<double>::infinity(),
-             R"(The distance between each pair of instances, and where it is.
-
-Parameters
-----------
-instance_matrices : (k, 4, 4) float64, optional
-  Each instance's rigid transform from its mesh into the scene.
-  Defaults to the identity.
-instance_index : (k,) int64, optional
-  Which mesh each instance places. Defaults to each mesh once.
-pairs : (p, 2) int64, optional
-  The pairs of instances to measure. Defaults to every pair, in the
-  order of `numpy.triu_indices(k, 1)`.
-upper_bound : float
-  Pairs farther apart than this are infinitely far, with no points or
-  normal, and are measured only as far as it takes to tell.
-
-Returns
--------
-result : CollisionResult
-  One row per pair, every field filled. A pair with a convex mesh has a
-  signed distance, negative by how deep it reaches into the solid; two
-  surfaces are 0 once their triangles touch, with a NaN normal. A pair
-  farther than `upper_bound` is infinitely far, with -1 faces and NaN
-  points and normal.
-
-Examples
---------
->>> import numpy as np
->>> import trimkit
->>> vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
->>> faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int64)
->>> scene = trimkit.CollisionScene([(vertices, faces)], convex=True)
->>> placed = np.tile(np.eye(4), (2, 1, 1))
->>> placed[1, 0, 3] = 2.0
->>> result = scene.distances(placed, np.zeros(2, dtype=np.int64))
->>> result.distances.tolist(), result.normals.tolist()
-([1.0], [[1.0, 0.0, 0.0]]))");
+        },
+        stop);
+    return measured;
 }

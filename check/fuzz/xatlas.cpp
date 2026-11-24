@@ -1,38 +1,27 @@
-// Property: any small mesh parameterizes, within libFuzzer's timeout, into an
-// atlas whose vertices map back to real input vertices and whose texture
-// coordinates fall inside the atlas.
-#include "../../src/parallel.hpp"
+// Property: any small mesh parameterizes as `trimkit.parametrize` does
+// (src/xatlas.cpp), on the real pool, within libFuzzer's timeout: valid
+// indices are never refused, every output vertex maps back to a real input
+// vertex, every face indexes the output, and every uv is in the unit square.
+// Positions span any scale, as the unit centers and scales them itself.
+#include "../../src/trimkit.hpp"
 
 #include <fuzzer/FuzzedDataProvider.h>
-#include <xatlas.h>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
-
-// xatlas's task groups on the real pool, Python-free (src/xatlas.cpp does the
-// same through common.hpp): so this fuzzes xatlas on the threads it ships on
-std::uint32_t xatlas::TrimkitThreadSlots() { return trimkit::parallel::thread_slots(); }
-std::uint32_t xatlas::TrimkitThreadIndex() { return trimkit::parallel::thread_index(); }
-void xatlas::TrimkitRunTasks(std::uint32_t count, void (*run)(void* context, std::uint32_t begin, std::uint32_t end),
-                             void* context) {
-    const trimkit::platform::Failure failure = trimkit::parallel::for_each_range(
-        count,
-        [&](std::size_t begin, std::size_t end) {
-            run(context, static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end));
-        },
-        trimkit::parallel::ItemCost::Coarse);
-    if (failure) {
-        std::rethrow_exception(failure);
-    }
-}
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     FuzzedDataProvider in(data, size);
     const auto n = in.ConsumeIntegralInRange<std::uint32_t>(3, 64);
     const auto m = in.ConsumeIntegralInRange<std::uint32_t>(1, 128);
-    std::vector<float> points(3 * std::size_t{n});
-    for (float& p : points) {
-        p = in.ConsumeFloatingPointInRange<float>(-10.0F, 10.0F);
+    const double scale = std::ldexp(1.0, in.ConsumeIntegralInRange<int>(0, 140) - 60);
+    const double offset = in.ConsumeFloatingPointInRange<double>(-1e20, 1e20);
+    std::vector<double> points(3 * std::size_t{n});
+    for (double& p : points) {
+        p = offset + (scale * in.ConsumeFloatingPointInRange<double>(-1.0, 1.0));
     }
     std::vector<std::uint32_t> indices(3 * std::size_t{m});
     if (in.ConsumeBool() && n >= 9) {
@@ -51,31 +40,31 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             i = in.ConsumeIntegralInRange<std::uint32_t>(0, n - 1);
         }
     }
-    xatlas::MeshDecl mesh;
-    mesh.vertexPositionData = points.data();
-    mesh.vertexPositionStride = 12;
-    mesh.vertexCount = n;
-    mesh.indexData = indices.data();
-    mesh.indexCount = static_cast<std::uint32_t>(indices.size());
-    mesh.indexFormat = xatlas::IndexFormat::UInt32;
-    xatlas::Atlas* atlas = xatlas::Create();
-    if (xatlas::AddMesh(atlas, mesh) == xatlas::AddMeshError::Success) {
-        // the options src/xatlas.cpp runs with; positions here are already
-        // near the origin, which is all its centering ensures
-        xatlas::PackOptions pack;
-        pack.maxChartSize = 4096;
-        xatlas::Generate(atlas, xatlas::ChartOptions(), pack);
-        for (std::uint32_t k = 0; k < atlas->meshCount; k++) {
-            const xatlas::Mesh& out = atlas->meshes[k];
-            for (std::uint32_t v = 0; v < out.vertexCount; v++) {
-                const auto& x = out.vertexArray[v];
-                if (x.xref >= n || x.uv[0] < 0 || x.uv[1] < 0 || x.uv[0] > static_cast<float>(atlas->width) ||
-                    x.uv[1] > static_cast<float>(atlas->height)) {
-                    __builtin_trap();
-                }
-            }
+    std::vector<std::int64_t> sources;
+    std::vector<std::int64_t> faces;
+    std::vector<double> uv;
+    try {
+        trimkit::parametrize_mesh(points.data(), n, indices, trimkit::parallel::Stop{}, &sources, &faces, &uv);
+    } catch (const std::invalid_argument&) {
+        __builtin_trap();  // every index is in range: nothing to refuse
+    }
+    if (uv.size() != 2 * sources.size() || faces.size() % 3 != 0) {
+        __builtin_trap();
+    }
+    for (const std::int64_t source : sources) {
+        if (source < 0 || source >= n) {
+            __builtin_trap();
         }
     }
-    xatlas::Destroy(atlas);
+    for (const std::int64_t index : faces) {
+        if (index < 0 || static_cast<std::size_t>(index) >= sources.size()) {
+            __builtin_trap();
+        }
+    }
+    for (const double value : uv) {
+        if (!(value >= 0.0 && value <= 1.0)) {
+            __builtin_trap();
+        }
+    }
     return 0;
 }

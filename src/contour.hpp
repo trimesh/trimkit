@@ -79,7 +79,7 @@ struct VoxelInput {
     const std::int64_t* rows = nullptr;
     std::size_t row_count = 0;
     const double* row_weights = nullptr;
-    const bool* occupancy = nullptr;
+    const std::uint8_t* occupancy = nullptr;  // numpy bool bytes, each tested != 0, never read as bool
     const double* volume_weights = nullptr;
     std::size_t volume_shape[3] = {0, 0, 0};
     double threshold = 0.5;
@@ -430,7 +430,7 @@ static const char* read_voxels(const VoxelInput& input, const Parallel& parallel
                               static_cast<std::int64_t>(begin), static_cast<std::int64_t>(end), weight,
                               static_cast<std::int64_t>(column * size_z));
         };
-        const bool* occupied = occupancy ? input.occupancy + (column * size_z) : nullptr;
+        const std::uint8_t* occupied = occupancy ? input.occupancy + (column * size_z) : nullptr;
         const double* self = occupancy ? nullptr : input.volume_weights + (column * size_z);
         // the four columns beside, or nothing beyond the volume's edge
         const double* const neighbors[4] = {
@@ -442,7 +442,7 @@ static const char* read_voxels(const VoxelInput& input, const Parallel& parallel
         for (std::size_t z = 0; z < size_z; z++) {
             double weight = 0.0;
             if (occupancy) {
-                weight = occupied[z] ? 1.0 : 0.0;
+                weight = occupied[z] != 0 ? 1.0 : 0.0;
             } else {
                 weight = self[z];
                 if (!(std::abs(weight) <= WEIGHT_LIMIT)) {

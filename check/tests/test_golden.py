@@ -125,7 +125,9 @@ def digest(arrays: list[np.ndarray]) -> dict:
     h = hashlib.sha256()
     for a in arrays:
         h.update(str(a.dtype).encode() + str(a.shape).encode())
-        h.update(np.ascontiguousarray(a).tobytes())
+        # little-endian bytes whatever the machine's, so a big-endian run
+        # compares the same values to the same digest
+        h.update(np.ascontiguousarray(a, dtype=a.dtype.newbyteorder("<")).tobytes())
     return {"arrays": [[str(a.dtype), list(a.shape)] for a in arrays], "sha256": h.hexdigest()}
 
 

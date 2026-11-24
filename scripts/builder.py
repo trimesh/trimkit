@@ -134,7 +134,9 @@ class Upstream:
 @dataclass(frozen=True)
 class Part:
     """
-    One `[part.NAME]`: src/NAME.cpp, whose `bind_NAME` adds to the module.
+    One `[part.NAME]`: its upstreams, its fuzz harnesses, and its own code,
+    Python-free, in src/NAME.cpp if it has any. src/trimkit.cpp binds every
+    part; one without a unit is a header of ours the module includes.
     """
 
     name: str
@@ -143,8 +145,9 @@ class Part:
     seeds: str = ""
 
     @property
-    def source(self) -> Path:
-        return ROOT / "src" / f"{self.name}.cpp"
+    def source(self) -> Path | None:
+        unit = ROOT / "src" / f"{self.name}.cpp"
+        return unit if unit.is_file() else None
 
 
 @dataclass(frozen=True)
@@ -172,7 +175,8 @@ class Manifest:
     @property
     def sources(self) -> list[Path]:
         # our C++ that compiles, held to our warnings
-        return sorted([ROOT / "src" / f"{EXTENSION}.cpp", *(part.source for part in self.parts.values())])
+        units = [part.source for part in self.parts.values() if part.source is not None]
+        return sorted([ROOT / "src" / f"{EXTENSION}.cpp", *units])
 
     @property
     def compiled_in(self) -> list[Upstream]:
@@ -1002,14 +1006,18 @@ def plan(manifest: Manifest, target: Target) -> str:
         ],
     )
 
-    # the one extension: every part, each with its own upstreams' headers and
-    # defines, and the module calling each part's bind_, linking them all;
+    # the one extension: the module (src/trimkit.cpp), which binds every part,
+    # and each part's Python-free unit, with its own upstreams' headers and
+    # defines, linking them all;
     # its docstring names what it was built from, a system upstream as the system's
     described = ", ".join(
         f"{u.name} (system)" if u.name in target.system else u.described for u in manifest.compiled_in
     )
     ours_values = [*common.compile, *ours.compile, *abi.compile, *system_python]
     module = ROOT / "src" / f"{EXTENSION}.cpp"
+    # a part with no unit of its own is a header the module includes, with
+    # its upstreams' headers and defines
+    headers_only = [u for part in manifest.parts.values() if part.source is None for u in part.upstreams]
     objects = [
         edge(
             "compile",
@@ -1017,14 +1025,23 @@ def plan(manifest: Manifest, target: Target) -> str:
             [str(module)],
             [
                 *ours_values,
+                *includes(tuple(headers_only)),
+                *defines(tuple(headers_only)),
                 f'-DTRIMKIT_UPSTREAM="{described}"',
                 f'-DTRIMKIT_VERSION="{pyproject()["project"]["version"]}"',
             ],
         )
     ]
+    # each part's unit, Python-free: built without Python's headers or the
+    # stable ABI, so one that reaches for nanobind fails to compile, and the
+    # fuzz harnesses link the very object the extension does
+    unit_objects = {}
     for part in manifest.parts.values():
-        values = [*ours_values, *includes(part.upstreams), *defines(part.upstreams)]
-        objects.append(edge("compile", object_for(part.source), [str(part.source)], values))
+        if part.source is None:
+            continue
+        values = [*common.compile, *ours.compile, *includes(part.upstreams), *defines(part.upstreams)]
+        unit_objects[part.name] = edge("compile", object_for(part.source), [str(part.source)], values)
+        objects.append(unit_objects[part.name])
     linked = [archives[u.name] for u in manifest.compiled_in if u.name in archives]
     link = [
         "-shared",
@@ -1043,6 +1060,7 @@ def plan(manifest: Manifest, target: Target) -> str:
             if part.seeds:
                 programs.append((part.seeds, part.seeds, ()))
             linked = [archives[u.name] for u in part.upstreams if u.name in archives]
+            linked += [unit_objects[part.name]] if part.name in unit_objects else []
             values = [*common.compile, *ours.compile, *includes(part.upstreams), *defines(part.upstreams)]
             for program, source_name, extra in programs:
                 source = CHECK / "fuzz" / f"{source_name}.cpp"
@@ -1113,7 +1131,9 @@ def check() -> None:
             if p not in tracked()
         ]
     errors += [
-        f"[part.{m.name}]: no src/{m.name}.cpp" for m in manifest.parts.values() if m.source not in tracked()
+        f"[part.{m.name}]: src/{m.name}.cpp isn't tracked"
+        for m in manifest.parts.values()
+        if m.source is not None and m.source not in tracked()
     ]
     # every platform and option plans, against every upstream that may come
     # from the system too, with none of its vendored copy left on a command line

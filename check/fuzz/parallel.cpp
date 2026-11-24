@@ -7,8 +7,10 @@
 // reports any later touch as a use after return (check/verify/tla checks the same
 // machine in every interleaving, and check/verify/genmc this header in every
 // execution, both at small sizes; this runs the real one at real sizes).
-// the pool's counters, so a check can say what it did (src/parallel.hpp)
+// the pool's counters, so a check can say what it did, and a short idle
+// exit, so workers exit while it runs (src/parallel.hpp)
 #define TRIMKIT_PARALLEL_COUNTERS 1
+#define TRIMKIT_IDLE_EXIT_MS 100
 #include "../../src/parallel.hpp"
 
 #include <fuzzer/FuzzedDataProvider.h>
@@ -171,6 +173,17 @@ void check_slots_free() {
 
 // -- fixed checks, run once before any fuzzing --------------------------------
 
+// whether this machine allows `count` workers: a check of what workers do
+// says so and passes on one that allows fewer, where its case can't arise
+bool allows_workers(std::uint32_t count, const char* check) {
+    if (trimkit::parallel::worker_cap() >= count) {
+        return true;
+    }
+    std::fprintf(stderr, "check/fuzz/parallel.cpp: %s needs %u workers, this machine allows %u\n", check, count,
+                 trimkit::parallel::worker_cap());
+    return false;
+}
+
 void expect(bool kept, const char* what) {
     if (!kept) {
         std::fprintf(stderr, "check/fuzz/parallel.cpp: %s\n", what);
@@ -332,6 +345,9 @@ int check_child_of_a_worker(trimkit::parallel::RangeJob* left) {
 }
 
 void check_fork_from_a_worker() {
+    if (!allows_workers(1, "forking from a worker")) {
+        return;
+    }
     struct Forked {
         std::atomic<bool> once{false};
         int status = -1;
@@ -362,6 +378,9 @@ void check_fork_from_a_worker() {
 // run, its return leaves every slot free, and the next call runs in full;
 // the parent's call is untouched
 void check_fork_from_a_poll() {
+    if (!allows_workers(1, "forking from a poll while shared")) {
+        return;
+    }
     struct Forking {
         std::uint32_t polls = 0;
         bool child = false;
@@ -411,6 +430,9 @@ void check_fork_from_a_poll() {
 // Sleeping workers are woken, not left to their timeouts: once every worker
 // has gone to sleep, a call worth sharing wakes some, as the system counts
 void check_sleepers_are_woken() {
+    if (!allows_workers(1, "waking sleepers")) {
+        return;
+    }
     const timespec asleep{0, 20'000'000};  // far past the spin (policy::spin_ns)
     nanosleep(&asleep, nullptr);
     expect(trimkit::parallel::pool.live.load() > 0, "no worker is live to wake");
@@ -423,6 +445,39 @@ void check_sleepers_are_woken() {
     trimkit::parallel::run_job(job);
     expect(spun.ran() == spun.count, "a call didn't run every item");
     expect(trimkit::parallel::counters.woken.load() > woken, "a call worth sharing woke no sleeping worker");
+}
+
+// P3 on real calls: an idle worker exits starting nothing. A call worth
+// sharing wakes every worker, then a smaller one wakes a few, leaving the
+// rest asleep on a wake that has moved; once the spawn chain either call
+// began is done, no thread starts while every worker goes idle and exits
+// (the idle-respawn the pool once had: each such worker, timing out, started
+// a replacement)
+void check_idle_workers_start_nothing() {
+    if (!allows_workers(2, "an idle exit")) {
+        return;
+    }
+    namespace parallel = trimkit::parallel;
+    auto none = [](std::size_t) {};
+    const timespec asleep{0, 20'000'000};  // far past the spin (policy::spin_ns)
+    for (const std::size_t count : {std::size_t{256}, std::size_t{2}}) {
+        Spun<decltype(none)> spun(count, 200'000, none);
+        parallel::RangeJob job;
+        spun.fill(job);
+        job.item_cost = parallel::ItemCost::Coarse;
+        parallel::run_job(job);
+        expect(spun.ran() == spun.count, "a call didn't run every item");
+        nanosleep(&asleep, nullptr);
+    }
+    expect(parallel::pool.live.load() > 1, "too few workers are live to go idle");
+    const std::uint64_t spawns = parallel::counters.spawns.load();
+    const std::int64_t deadline =
+        trimkit::platform::monotonic_ns() + (std::int64_t{50} * parallel::IDLE_EXIT_MS * 1'000'000);
+    while (parallel::pool.live.load() > 0 && trimkit::platform::monotonic_ns() < deadline) {
+        nanosleep(&asleep, nullptr);
+    }
+    expect(parallel::pool.live.load() == 0, "idle workers never exited");
+    expect(parallel::counters.spawns.load() == spawns, "P3: a thread started with no call running");
 }
 
 // The scheduling policy (src/parallel.hpp, namespace policy): pure functions,
@@ -498,8 +553,14 @@ void check_policy() {
                     for (const std::size_t min_range : {1UL, 5UL}) {
                         const std::size_t take = policy::claim_items(Ran{ns, 1, item_ns}, left, sharing, min_range);
                         expect(take >= min_range, "C1: a claim smaller than min_range");
-                        expect(take <= std::max<std::size_t>(min_range, left / (2 * std::max(1U, sharing))),
-                               "C1: a claim of more than half an even share of what is left");
+                        // half an even share, or MIN_CLAIM_NS of items while that many are left
+                        const double floor = item_ns > 0 && item_ns < inf
+                                                 ? std::min(static_cast<double>(left), policy::MIN_CLAIM_NS / item_ns)
+                                                 : 0.0;
+                        expect(static_cast<double>(take) <=
+                                   std::max({static_cast<double>(min_range),
+                                             static_cast<double>(left / (2 * std::max(1U, sharing))), floor}),
+                               "C1: a claim of more than half an even share of what is left, or its floor");
                         if (item_ns > 0 && item_ns < inf) {
                             expect(static_cast<double>(take) <=
                                        std::max(static_cast<double>(min_range), policy::MAX_CLAIM_NS / item_ns + 1),
@@ -632,6 +693,7 @@ extern "C" int LLVMFuzzerInitialize(int* /*argc*/, char*** /*argv*/) {
     check_fork_from_a_worker();
     check_fork_from_a_poll();
     check_sleepers_are_woken();
+    check_idle_workers_start_nothing();
     check_small_calls_wake_no_one();
     check_huge_min_range();
     check_too_many_items();

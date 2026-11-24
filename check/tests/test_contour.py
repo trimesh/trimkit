@@ -2,7 +2,7 @@ import threading
 
 import numpy as np
 import pytest
-from helpers import ball_runs, is_closed, volume
+from helpers import ball_runs, crossings, is_closed, volume
 
 import trimkit
 
@@ -13,22 +13,6 @@ BESIDE = np.concatenate([np.eye(3, dtype=np.int64), -np.eye(3, dtype=np.int64)])
 def dense_runs(dense: np.ndarray) -> np.ndarray:
     # each filled voxel as a row of its own
     return np.argwhere(dense).astype(np.int64)
-
-
-def crossings(dense: np.ndarray) -> np.ndarray:
-    """
-    The midpoint between every filled voxel and each empty voxel beside it,
-    sorted: where the surface of an unweighted grid must have its vertices.
-    """
-    padded = np.pad(dense.astype(bool), 1)
-    filled = np.argwhere(padded)
-    points = []
-    for step in BESIDE:
-        beside = filled + step
-        empty = ~padded[tuple(beside.T)]
-        points.append(filled[empty] + step / 2.0 - 1.0)
-    points = np.concatenate(points)
-    return points[np.lexsort(points.T)]
 
 
 def ordered(points: np.ndarray) -> np.ndarray:
@@ -50,7 +34,7 @@ def test_every_pair_of_cells_closes():
             vertices, faces, _ = trimkit.contour(dense_runs(dense))
             assert is_closed(faces), (axis, bits)
             assert volume(vertices, faces) > 0.0, (axis, bits)
-            assert np.array_equal(ordered(vertices), crossings(dense)), (axis, bits)
+            assert np.array_equal(ordered(vertices), crossings(dense)[0]), (axis, bits)
 
 
 def test_random_grids_close_with_a_vertex_per_crossing():
@@ -60,7 +44,7 @@ def test_random_grids_close_with_a_vertex_per_crossing():
             dense = rng.random((6, 7, 8)) < fill
             vertices, faces, vertex_sources = trimkit.contour(dense_runs(dense))
             assert is_closed(faces)
-            assert np.array_equal(ordered(vertices), crossings(dense))
+            assert np.array_equal(ordered(vertices), crossings(dense)[0])
             # the surface is inside the voxels' boxes and outside their centers
             assert 0.0 < volume(vertices, faces) < dense.sum()
             # each vertex is half a voxel from the voxel it came from
@@ -92,7 +76,7 @@ def test_runs_are_their_voxels_however_given():
     dense = rng.random((5, 6, 9)) < 0.6
     single = dense_runs(dense)
     expected = trimkit.contour(single)
-    assert np.array_equal(ordered(expected[0]), crossings(dense))
+    assert np.array_equal(ordered(expected[0]), crossings(dense)[0])
 
     def same_surface(result):
         assert np.array_equal(ordered(result[0]), ordered(expected[0]))
@@ -373,14 +357,15 @@ def test_threshold_moves_the_crossing():
 
 def test_a_volume_changed_during_the_call_is_survived():
     # A volume is read in place with the GIL released: a thread rewriting it
-    # meanwhile may change the answer or have it refused, but whatever was
-    # read is meshed whole, closed and indexing only what it made
+    # meanwhile may change the answer, but whatever was read is meshed whole,
+    # closed and indexing only what it made. Finite values only, so every call
+    # answers and every answer is checked; one NaN read is refused, below
     field = np.random.default_rng(6).random((48, 48, 48))
     stop = threading.Event()
 
     def scribble():
         rng = np.random.default_rng(7)
-        values = (np.nan, 0.0, 1.0, 0.75, -1.0)
+        values = (0.0, 1.0, 0.75, -1.0)
         while not stop.is_set():
             field[rng.integers(48)] = values[rng.integers(len(values))]
 
@@ -388,13 +373,13 @@ def test_a_volume_changed_during_the_call_is_survived():
     thread.start()
     try:
         for _ in range(10):
-            try:
-                vertices, faces, vertex_sources = trimkit.contour(field)
-            except ValueError:
-                continue
+            vertices, faces, vertex_sources = trimkit.contour(field)
             assert is_closed(faces)
             assert faces.min(initial=0) >= 0 and faces.max(initial=-1) < max(len(vertices), 1)
             assert vertex_sources.min(initial=0) >= 0 and vertex_sources.max(initial=-1) < field.size
     finally:
         stop.set()
         thread.join()
+    field[24, 24, 24] = np.nan
+    with pytest.raises(ValueError):
+        trimkit.contour(field)

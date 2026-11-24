@@ -6,7 +6,12 @@
 // contact at zero distance, where bounding-volume rounding may fall either
 // way; and it finds the same minimum distance. A bounding volume that
 // didn't contain its triangles, or a pruning test that wasn't conservative,
-// would differ.
+// would differ. And `trimkit.CollisionScene` (src/collision.cpp), given the
+// same two meshes as two instances in those poses, collides and measures
+// them exactly as the oracle allows the traversal to: what users run,
+// culls, warm starts and upper bounds included.
+#include "../../src/trimkit.hpp"
+
 #include <fuzzer/FuzzedDataProvider.h>
 
 #include <coal/BVH/BVH_model.h>
@@ -22,6 +27,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -192,6 +199,45 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         __builtin_trap();
     }
 
+    // the unit, as a scene of the two meshes placed by these poses: the same
+    // allowance for a collision, and for a distance
+    std::vector<std::uint32_t> first_faces;
+    std::vector<std::uint32_t> second_faces;
+    std::vector<double> first_vertices;
+    std::vector<double> second_vertices;
+    for (const auto& [mesh, faces, vertices] :
+         {std::tie(first, first_faces, first_vertices), std::tie(second, second_faces, second_vertices)}) {
+        for (const coal::Triangle32& face : mesh.faces) {
+            faces.insert(faces.end(), {face[0], face[1], face[2]});
+        }
+        for (const coal::Vec3s& vertex : mesh.vertices) {
+            vertices.insert(vertices.end(), {vertex[0], vertex[1], vertex[2]});
+        }
+    }
+    const trimkit::CollisionMeshes scene(
+        {{first_vertices.data(), first.vertices.size(), first_faces.data(), first.faces.size(), false},
+         {second_vertices.data(), second.vertices.size(), second_faces.data(), second.faces.size(), false}});
+    trimkit::Instances instances;
+    instances.count = 2;
+    instances.given_matrices = true;
+    for (const coal::Transform3s& pose : {first_pose, second_pose}) {
+        for (Eigen::Index r = 0; r < 3; r++) {
+            instances.matrices.insert(instances.matrices.end(), {pose.getRotation()(r, 0), pose.getRotation()(r, 1),
+                                                                 pose.getRotation()(r, 2), pose.getTranslation()[r]});
+        }
+        instances.matrices.insert(instances.matrices.end(), {0.0, 0.0, 0.0, 1.0});
+    }
+    std::vector<trimkit::Unset<std::int64_t>> collided;
+    scene.collides(instances, std::nullopt, 0.0, 1, trimkit::parallel::Stop{}, &collided, nullptr);
+    if (!collided.empty() != any_touch && (!touching || deepest > ROUNDING)) {
+        __builtin_trap();
+    }
+    std::vector<trimkit::Unset<trimkit::CollisionRow>> measured =
+        scene.distances(instances, std::nullopt, trimkit::COORDINATE_LIMIT, trimkit::parallel::Stop{});
+    if (measured.size() != 1) {
+        __builtin_trap();
+    }
+
     // The traversal measures each leaf exactly as above, so it differs only
     // by pruning a closer pair. It does, by up to ~1e-5, when the closest pair
     // has a triangle without area (a segment or a point): 5.5e-6 for two
@@ -199,6 +245,12 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     // (vendor/patches/coal-bvh-bvh-performance.patch). Collision is unaffected
     constexpr double DEGENERATE = 1e-5;
     if (std::abs(distance_result.min_distance - least) > (least_degenerate ? DEGENERATE : ROUNDING)) {
+        __builtin_trap();
+    }
+    // and the scene's, within the same, or touching where the oracle is
+    const double unit_distance = trimkit::elements(measured)[0].distance;
+    if (std::abs(unit_distance - least) > (least_degenerate ? DEGENERATE : ROUNDING) &&
+        !(touching && unit_distance <= ROUNDING)) {
         __builtin_trap();
     }
 

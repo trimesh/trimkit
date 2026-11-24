@@ -164,7 +164,7 @@ def _closure_inputs(pin: Upstream) -> tuple[list[Path], list[str]]:
     """
     What the scan starts from: the source files `keep` names and the sources of
     ours it compiles (src/tinybvh.cpp), and for every part compiling it in,
-    that part's binding, fuzz harnesses and seed writer plus the sources of its
+    that part's unit (or src/trimkit.cpp), fuzz harnesses and seed writer plus the sources of its
     other upstreams. The flags are those parts' include directories (`-I`,
     which `-MM` follows, where the build uses `-isystem`) and defines.
     """
@@ -176,7 +176,11 @@ def _closure_inputs(pin: Upstream) -> tuple[list[Path], list[str]]:
     for part in manifest.parts.values():
         if pin.name not in {u.name for u in part.upstreams}:
             continue
-        roots += [part.source, *(CHECK / "fuzz" / f"{h}.cpp" for h in part.fuzz)]
+        # a part's unit, or the module, which includes a part that has none
+        roots += [
+            part.source or ROOT / "src" / "trimkit.cpp",
+            *(CHECK / "fuzz" / f"{h}.cpp" for h in part.fuzz),
+        ]
         roots += [CHECK / "fuzz" / f"{part.seeds}.cpp"] if part.seeds else []
         for upstream in part.upstreams:
             if upstream.name != pin.name:

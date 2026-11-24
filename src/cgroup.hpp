@@ -92,6 +92,7 @@ static inline void own_directory(char* directory, std::size_t capacity) {
 }
 
 // `directory` cut to its parent: false once it is ROOT, which has no parent
+// cppcheck-suppress constParameterPointer ; it writes through what strrchr returns
 static inline bool ascend(char* directory) {
     if (std::strlen(directory) <= sizeof(ROOT) - 1) {
         return false;
