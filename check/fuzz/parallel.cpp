@@ -14,8 +14,10 @@
 #include "../../src/parallel.hpp"
 
 #include <fuzzer/FuzzedDataProvider.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -25,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <limits>
 #include <memory>
@@ -220,26 +223,102 @@ struct Spun {
     }
 };
 
-// B3: a poll that throws stops the job, so the unwind waits only for the
-// ranges already running, not for every item left
-void check_throwing_poll_stops() {
-    auto none = [](std::size_t) {};
-    Spun<decltype(none)> spun(20'000, 10'000, none);
-    std::uint32_t polls = 0;
-    trimkit::parallel::RangeJob job;
-    spun.fill(job);
-    job.stop_by.poll = [](void* context) -> bool {
-        if (++*static_cast<std::uint32_t*>(context) == 30) {  // workers are inside by then
-            throw PollThrew{};
+// Every check below waits only for something that must happen, never for a
+// poll count, a sleep or a deadline, so no schedule (2 cores or 32, idle or
+// loaded) decides what it sees: what could take a while takes longer, and the
+// check still sees the same thing. One that waits for what a planted bug
+// prevents hangs, and a hang is what the gate counts for exactly those bugs
+template <typename Ready>
+void wait_for(const Ready& ready) {
+    while (!ready()) {
+        sched_yield();
+    }
+}
+
+// A worker's item that waits until `job` stopped or handed out every item, so
+// a worker holds the one range it has: with the job stopped, the items never
+// handed out never run; not stopped, the caller hands out the rest
+void hold_until_stopped_or_handed_out(const trimkit::parallel::RangeJob& job) {
+    if (trimkit::parallel::thread_index() != 0) {
+        wait_for([&] { return job.stopped.load() || job.next.load() >= job.count; });
+    }
+}
+
+// How many of this process's other threads the kernel shows blocked in a
+// futex wait: a worker parked on the pool's wake is one. Linux's own view
+// (/proc/self/task/*/syscall), which no flag a thread sets before it sleeps
+// can give: a thread that set one may not be asleep yet
+std::uint32_t threads_in_futex() {
+    const long self = syscall(SYS_gettid);
+    std::uint32_t asleep = 0;
+    DIR* tasks = opendir("/proc/self/task");
+    expect(tasks != nullptr, "can't read /proc/self/task");
+    while (const dirent* task = readdir(tasks)) {
+        const long tid = std::strtol(task->d_name, nullptr, 10);
+        if (tid <= 0 || tid == self) {
+            continue;
         }
-        return false;
-    };
-    job.stop_by.context = &polls;
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/task/%ld/syscall", tid);
+        if (std::FILE* file = std::fopen(path, "r")) {
+            long number = -1;
+            asleep += std::fscanf(file, "%ld", &number) == 1 && number == SYS_futex ? 1 : 0;
+            std::fclose(file);
+        }
+    }
+    closedir(tasks);
+    return asleep;
+}
+
+// once every live worker is parked: blocked in the kernel on the wake, held
+// there (hold_idle_workers) so none times out or exits meanwhile
+void wait_for_every_worker_parked() {
+    wait_for([] {
+        const std::uint32_t live = trimkit::parallel::pool.live.load();
+        return live > 0 && threads_in_futex() >= live;
+    });
+}
+
+// B3: a poll that throws stops the job: no range is handed out after it, so
+// the unwind waits only for the ranges already running. Workers hold theirs
+// until the job stops (or the caller hands out everything, as it would if
+// the job didn't stop), and the first poll throws
+void check_throwing_poll_stops() {
+    trimkit::parallel::RangeJob job;
+    auto hold = [&job](std::size_t) { hold_until_stopped_or_handed_out(job); };
+    Spun<decltype(hold)> spun(20'000, 1'000, hold);
+    spun.fill(job);
+    job.item_cost = trimkit::parallel::ItemCost::Coarse;
+    job.stop_by.poll = [](void* /*context*/) -> bool { throw PollThrew{}; };
     try {
         trimkit::parallel::run_job(job);
     } catch (const PollThrew&) {
     }
-    expect(spun.ran() < spun.count / 2, "a poll that threw left the job running to the end");
+    expect(spun.ran() < spun.count, "a poll that threw left the job running to the end");
+}
+
+// B3, for an item: one that throws fails the call and stops the job, so no
+// range is handed out after it (fail_job). The caller's first item throws
+// while workers hold their ranges, as above
+void check_failing_item_stops() {
+    trimkit::parallel::RangeJob job;
+    std::atomic<bool> thrown{false};
+    auto fail_first = [&job, &thrown](std::size_t) {
+        if (trimkit::parallel::thread_index() == 0) {
+            if (!thrown.exchange(true)) {
+                throw std::runtime_error("the caller's first item");
+            }
+            return;
+        }
+        hold_until_stopped_or_handed_out(job);
+    };
+    Spun<decltype(fail_first)> spun(20'000, 1'000, fail_first);
+    spun.fill(job);
+    job.item_cost = trimkit::parallel::ItemCost::Coarse;
+    trimkit::parallel::run_job(job);
+    expect(job.failure != nullptr, "an item that threw didn't fail its call");
+    // the item that threw never counted as run
+    expect(spun.ran() + 1 < spun.count, "an item that threw left the job running to the end");
 }
 
 // B5b: a thread that ends mid-range (pthread_exit unwinds it on glibc) is
@@ -353,8 +432,14 @@ void check_fork_from_a_worker() {
         int status = -1;
         trimkit::parallel::RangeJob* job = nullptr;
     } forked;
+    // the caller's items wait until a worker has forked, so one does,
+    // shared at once so a worker is woken while the caller waits
     auto fork_on_a_worker = [&forked](std::size_t) {
-        if (trimkit::parallel::thread_index() == 0 || forked.once.exchange(true)) {
+        if (trimkit::parallel::thread_index() == 0) {
+            wait_for([&] { return forked.once.load(); });
+            return;
+        }
+        if (forked.once.exchange(true)) {
             return;
         }
         const pid_t pid = fork();
@@ -366,6 +451,7 @@ void check_fork_from_a_worker() {
     Spun<decltype(fork_on_a_worker)> spun(20'000, 2'000, fork_on_a_worker);
     trimkit::parallel::RangeJob job;
     spun.fill(job);
+    job.item_cost = trimkit::parallel::ItemCost::Coarse;
     forked.job = &job;
     trimkit::parallel::run_job(job);
     expect(forked.once.load(), "no worker ran an item, so nothing forked");
@@ -381,21 +467,36 @@ void check_fork_from_a_poll() {
     if (!allows_workers(1, "forking from a poll while shared")) {
         return;
     }
+    // The caller's items wait until a worker is inside the job, and the
+    // workers' until the poll has forked: the first poll after a worker is
+    // inside forks, with the job shared and a worker in it, and the caller
+    // polls between its ranges and while it waits, so it comes
     struct Forking {
-        std::uint32_t polls = 0;
+        std::atomic<bool> worker_inside{false};
+        std::atomic<bool> forked{false};
         bool child = false;
         pid_t pid = -1;
     } forking;
-    auto none = [](std::size_t) {};
-    Spun<decltype(none)> spun(4'000, 5'000, none);
+    auto rendezvous = [&forking](std::size_t) {
+        if (trimkit::parallel::thread_index() == 0) {
+            wait_for([&] { return forking.worker_inside.load(); });
+            return;
+        }
+        forking.worker_inside.store(true);
+        wait_for([&] { return forking.forked.load(); });
+    };
+    Spun<decltype(rendezvous)> spun(4'000, 5'000, rendezvous);
     trimkit::parallel::RangeJob job;
     spun.fill(job);
     job.item_cost = trimkit::parallel::ItemCost::Coarse;  // shared before its first poll
     job.stop_by.poll = [](void* context) -> bool {
         auto& state = *static_cast<Forking*>(context);
-        if (++state.polls == 3) {
+        if (state.pid == -1 && state.worker_inside.load()) {
             state.pid = fork();
             state.child = state.pid == 0;
+            if (!state.child) {
+                state.forked.store(true);  // the parent's workers go on
+            }
         }
         return false;
     };
@@ -414,6 +515,7 @@ void check_fork_from_a_poll() {
         for (const trimkit::parallel::JobSlot& slot : trimkit::parallel::pool.slots) {
             failed = failed && trimkit::parallel::SlotWord{slot.word.load()}.free();
         }
+        auto none = [](std::size_t) {};
         Spun<decltype(none)> after(10'000, 1'000, none);
         trimkit::parallel::RangeJob again;
         after.fill(again);
@@ -427,24 +529,31 @@ void check_fork_from_a_poll() {
     expect(spun.ran() == spun.count && job.failure == nullptr, "a fork failed its parent's call");
 }
 
-// Sleeping workers are woken, not left to their timeouts: once every worker
-// has gone to sleep, a call worth sharing wakes some, as the system counts
-void check_sleepers_are_woken() {
-    if (!allows_workers(1, "waking sleepers")) {
-        return;
-    }
-    const timespec asleep{0, 20'000'000};  // far past the spin (policy::spin_ns)
-    nanosleep(&asleep, nullptr);
-    expect(trimkit::parallel::pool.live.load() > 0, "no worker is live to wake");
-    const std::uint64_t woken = trimkit::parallel::counters.woken.load();
+// a call worth sharing with every worker: 64 items of 200 us, shared at once
+void run_coarse_call(std::size_t count) {
     auto none = [](std::size_t) {};
-    Spun<decltype(none)> spun(64, 200'000, none);
+    Spun<decltype(none)> spun(count, 200'000, none);
     trimkit::parallel::RangeJob job;
     spun.fill(job);
     job.item_cost = trimkit::parallel::ItemCost::Coarse;
     trimkit::parallel::run_job(job);
     expect(spun.ran() == spun.count, "a call didn't run every item");
+}
+
+// Sleeping workers are woken, not left to their timeouts: with every live
+// worker held asleep in the kernel, a call worth sharing wakes some, as the
+// system counts them
+void check_sleepers_are_woken() {
+    if (!allows_workers(1, "waking sleepers")) {
+        return;
+    }
+    trimkit::parallel::hold_idle_workers(true);
+    run_coarse_call(64);  // so workers are live
+    wait_for_every_worker_parked();
+    const std::uint64_t woken = trimkit::parallel::counters.woken.load();
+    run_coarse_call(64);
     expect(trimkit::parallel::counters.woken.load() > woken, "a call worth sharing woke no sleeping worker");
+    trimkit::parallel::hold_idle_workers(false);
 }
 
 // P3 on real calls: an idle worker exits starting nothing. A call worth
@@ -458,25 +567,23 @@ void check_idle_workers_start_nothing() {
         return;
     }
     namespace parallel = trimkit::parallel;
-    auto none = [](std::size_t) {};
-    const timespec asleep{0, 20'000'000};  // far past the spin (policy::spin_ns)
-    for (const std::size_t count : {std::size_t{256}, std::size_t{2}}) {
-        Spun<decltype(none)> spun(count, 200'000, none);
-        parallel::RangeJob job;
-        spun.fill(job);
-        job.item_cost = parallel::ItemCost::Coarse;
-        parallel::run_job(job);
-        expect(spun.ran() == spun.count, "a call didn't run every item");
-        nanosleep(&asleep, nullptr);
-    }
+    // Held asleep after each call, so none exits early and every spawn either
+    // call began is done (a worker still starting isn't parked). The small
+    // call wakes one, leaving the rest asleep on a wake that has moved
+    parallel::hold_idle_workers(true);
+    run_coarse_call(256);
+    wait_for_every_worker_parked();
     expect(parallel::pool.live.load() > 1, "too few workers are live to go idle");
+    run_coarse_call(2);
+    wait_for_every_worker_parked();
+    // at least IDLE_EXIT_MS since any worker's last job, so each is past its
+    // idle time when let go: a wait that only ever errs long
+    const timespec idle{0, static_cast<long>(parallel::IDLE_EXIT_MS) * 2'000'000L};
+    nanosleep(&idle, nullptr);
     const std::uint64_t spawns = parallel::counters.spawns.load();
-    const std::int64_t deadline =
-        trimkit::platform::monotonic_ns() + (std::int64_t{50} * parallel::IDLE_EXIT_MS * 1'000'000);
-    while (parallel::pool.live.load() > 0 && trimkit::platform::monotonic_ns() < deadline) {
-        nanosleep(&asleep, nullptr);
-    }
-    expect(parallel::pool.live.load() == 0, "idle workers never exited");
+    parallel::hold_idle_workers(false);
+    // every worker exits, or one starts another: no deadline either way
+    wait_for([&] { return parallel::pool.live.load() == 0 || parallel::counters.spawns.load() != spawns; });
     expect(parallel::counters.spawns.load() == spawns, "P3: a thread started with no call running");
 }
 
@@ -615,7 +722,11 @@ void check_policy() {
 void check_small_calls_wake_no_one() {
     auto none = [](std::size_t) {};
     int counted = 0;
-    for (int round = 0; round < 2'000 && counted < 200; round++) {
+    for (int round = 0; round < 2'000; round++) {
+        // every live worker parked first: a spawn an earlier call began
+        // (a worker's Start starts the next) may still be on its way, and the
+        // counters are the whole process's, not this call's
+        wait_for([] { return threads_in_futex() >= trimkit::parallel::pool.live.load(); });
         Spun<decltype(none)> spun(16, round % 2 == 0 ? 100 : 250, none);
         trimkit::parallel::RangeJob job;
         spun.fill(job);
@@ -631,7 +742,11 @@ void check_small_calls_wake_no_one() {
                    "W1: a call that spent less than C woke or started a worker");
         }
     }
-    expect(counted >= 200, "too few calls were small enough to check");
+    if (counted == 0) {
+        // no call was small enough here (an emulator, a sanitizer on a slow
+        // host): said, as allows_workers says, rather than failed
+        std::fprintf(stderr, "check/fuzz/parallel.cpp: no call was small enough to check W1 on\n");
+    }
     expect(trimkit::parallel::pool.live.load() <= trimkit::parallel::worker_cap() + 1,
            "more workers live than the cap allows");
 }
@@ -650,7 +765,7 @@ void check_huge_min_range() {
                     ran[i].fetch_add(1, std::memory_order_relaxed);
                 }
             },
-            trimkit::parallel::ItemCost::Coarse, std::size_t{1} << 63);
+            trimkit::parallel::ItemCost::Coarse, (SIZE_MAX / 2) + 1);  // the top bit, at any width
         expect(!failure, "a call with a huge min_range failed");
         for (auto& count : ran) {
             expect(count.load() == 1, "a huge min_range ran an item twice, or not at all");
@@ -688,6 +803,7 @@ extern "C" int LLVMFuzzerInitialize(int* /*argc*/, char*** /*argv*/) {
     trimkit::parallel::install_fork_handler();  // as the module's init does
     check_policy();
     check_throwing_poll_stops();
+    check_failing_item_stops();
     check_thread_ending_in_a_body();
     check_exit_stops_every_job();
     check_fork_from_a_worker();

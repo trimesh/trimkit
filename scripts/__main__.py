@@ -1302,7 +1302,16 @@ _TWO_JOBS = (
     "orders the last job's last leave before the next reservation of its slot: two jobs, which GenMC can't"
     " reach here (some 170 million executions). Argued only"
 )
+_COUNTED_ONLY = (
+    "holds idle workers for check/fuzz/parallel.cpp's checks, in counted builds alone, which GenMC never"
+    " builds. seq_cst because letting go is a store, then a bump of the wake, both before a worker's"
+    " seq_cst look at the wake and then at the hold: one order, so a worker woken by the bump sees the"
+    " hold let go, and never parks again without a timeout"
+)
 GENMC_MUTANTS_SURVIVING: dict[str, str] = {
+    "return idle_held.load(std::memory_order_seq_cst);  [seq_cst -> acquire]": _COUNTED_ONLY,
+    "idle_held.store(hold, std::memory_order_seq_cst);  [seq_cst -> release]": _COUNTED_ONLY,
+    "pool.wake.fetch_add(1, std::memory_order_seq_cst);  [seq_cst -> acq_rel]": _COUNTED_ONLY,
     "if ((held_indexes[index / 64].fetch_or(bit, std::memory_order_acquire) & bit) == 0) {  [acquire -> relaxed]": _TWO_HOLDERS,  # noqa: E501
     "held_indexes[index / 64].fetch_and(~(std::uint64_t{1} << (index % 64)), std::memory_order_release);  [release -> relaxed]": _TWO_HOLDERS,  # noqa: E501
     "std::memory_order_acquire, std::memory_order_relaxed)) {  [acquire -> relaxed]": _TWO_JOBS,
