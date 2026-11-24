@@ -92,6 +92,39 @@ static inline bool within(double value) {
     return std::abs(value) <= COORDINATE_LIMIT;  // false for NaN, too
 }
 
+// The cosine and sine of `degrees`, exact at every multiple of 90: reduced
+// first, exactly, to within 45 of the nearest quarter turn, which then only
+// swaps and negates. Radians of 90 degrees aren't a quarter turn in doubles
+// (their cosine is 6e-17), and an ellipse turned that way, with a short
+// radius near that, would be read as a different ellipse: one `format`
+// writes as 90 must come back as the one it wrote
+static inline void cos_sin_degrees(double degrees, double* cos_out, double* sin_out) {
+    const double turned = std::remainder(degrees, 360.0);  // exact, within [-180, 180]
+    const double quarters = std::nearbyint(turned / 90.0);
+    // exact: within a factor of two of the multiple of 90 it is reduced by
+    const double rest = (turned - (quarters * 90.0)) * PI / 180.0;
+    const double c = std::cos(rest);
+    const double s = std::sin(rest);
+    switch ((static_cast<int>(quarters) + 4) % 4) {
+        case 1:
+            *cos_out = -s;
+            *sin_out = c;
+            break;
+        case 2:
+            *cos_out = -c;
+            *sin_out = -s;
+            break;
+        case 3:
+            *cos_out = s;
+            *sin_out = -c;
+            break;
+        default:
+            *cos_out = c;
+            *sin_out = s;
+            break;
+    }
+}
+
 // Whether a radius `format` derives is one it can write, which `parse`
 // reads back. One within rounding of the bound is taken as the bound: an
 // arc `parse` made with a radius of exactly 1e30 comes back an ulp or so
@@ -419,9 +452,11 @@ static inline void add_arc(SvgPen* pen, double end_x, double end_y, double radiu
     }
     // a circle's rotation changes nothing, so it is taken as zero
     const bool circle = radius_x == radius_y;
-    const double angle = circle ? 0.0 : rotation * PI / 180.0;
-    const double cos_angle = circle ? 1.0 : std::cos(angle);
-    const double sin_angle = circle ? 0.0 : std::sin(angle);
+    double cos_angle = 1.0;
+    double sin_angle = 0.0;
+    if (!circle) {
+        cos_sin_degrees(rotation, &cos_angle, &sin_angle);
+    }
     const double half_x = (pen->x - end_x) / 2.0;
     const double half_y = (pen->y - end_y) / 2.0;
     double ratio_x = ((cos_angle * half_x) + (sin_angle * half_y)) / radius_x;
