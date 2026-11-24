@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <stdexcept>
 #include <thread>
 
 namespace nb = nanobind;
@@ -72,7 +73,7 @@ inline void exit_at_interpreter_exit() {
 // thread, for `raise_if_stopped` to raise
 class Interrupt {
 public:
-    static constexpr std::chrono::milliseconds POLL_PERIOD{50};
+    static constexpr std::chrono::milliseconds POLL_PERIOD{parallel::POLL_MS};
 
     Interrupt() = default;
     Interrupt(const Interrupt&) = delete;
@@ -139,11 +140,14 @@ auto with_pool(const Work& work) {
 }
 
 // What the module's init installs: the pool's fork handler (which resets the
-// exit gate too), and SystemExit for a call the interpreter's exit stopped
-// (parallel.hpp, StoppedAtExit), which no other exception translator knows:
-// SystemExit, which is what the exit is, which a thread's excepthook ignores
-// (printing a traceback from a daemon thread as the interpreter finalizes is
-// itself a fatal error), and which `except Exception` doesn't swallow
+// exit gate too), and two translations no other exception translator makes:
+// - SystemExit for a call the interpreter's exit stopped (parallel.hpp,
+//   StoppedAtExit): what the exit is, which a thread's excepthook ignores
+//   (printing a traceback from a daemon thread as the interpreter finalizes
+//   is itself a fatal error), and which `except Exception` doesn't swallow;
+// - MemoryError for std::length_error, which a container throws only for a
+//   size past its max_size, more than any memory holds. On 32 bits a vector
+//   of more than PTRDIFF_MAX bytes is one, and nanobind would say ValueError
 inline void install_fork_handler() {
     parallel::install_fork_handler();
     nb::register_exception_translator([](const std::exception_ptr& error, void* /*unused*/) {
@@ -151,6 +155,8 @@ inline void install_fork_handler() {
             std::rethrow_exception(error);
         } catch (const parallel::StoppedAtExit&) {
             PyErr_SetNone(PyExc_SystemExit);
+        } catch (const std::length_error& too_long) {
+            PyErr_SetString(PyExc_MemoryError, too_long.what());
         }
     });
 }

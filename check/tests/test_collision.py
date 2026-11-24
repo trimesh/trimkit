@@ -5,6 +5,7 @@ boxes, and agreement with an exact separating-axis test over random poses.
 """
 
 import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -121,6 +122,17 @@ def test_every_pair_past_memory_is_memory_error():
     # 300,000 instances have 4.5e10 pairs, more than any memory holds: a 32-bit
     # size_t wrapped their count, and gave too few rows back
     count = 300_000
+    scene = trimkit.CollisionScene([box()])
+    with pytest.raises(MemoryError):
+        scene.distances(np.tile(np.eye(4), (count, 1, 1)), np.zeros(count, np.int64))
+
+
+@pytest.mark.skipif(sys.maxsize > 2**32, reason="only a 32-bit vector's max_size is below these rows")
+def test_rows_past_a_vectors_size_are_memory_error():
+    # Found by review: 6,500 instances have 2.1e7 pairs, 2.2 GB of rows,
+    # more than a 32-bit vector's max_size of PTRDIFF_MAX bytes, whose
+    # std::length_error nanobind raised as ValueError
+    count = 6_500
     scene = trimkit.CollisionScene([box()])
     with pytest.raises(MemoryError):
         scene.distances(np.tile(np.eye(4), (count, 1, 1)), np.zeros(count, np.int64))
